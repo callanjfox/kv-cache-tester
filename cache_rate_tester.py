@@ -288,6 +288,7 @@ class AggregatedMetrics:
     """Aggregated metrics for a cache hit rate test"""
     context_size: int
     cache_hit_rate: int
+    model: str
     input_tokens_per_sec: float
     output_tokens_per_sec: float
     avg_ttft: float
@@ -1124,6 +1125,7 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
 async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
                                   working_set: WorkingSet, tokenizer: TokenizerManager,
                                   context_size: int, cache_hit_rate: int,
+                                  model: str,
                                   previous_peak: Optional[int] = None) -> Tuple[List[RequestMetrics], AggregatedMetrics, List[PhaseMetadata]]:
     """
     Run the complete cache hit rate test with concurrency ramp
@@ -1187,19 +1189,34 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
         all_phases.append(phase_metadata)
         iteration_count += 1
 
-        # Calculate throughput for this concurrency level
-        start_time = min(m.launch_time for m in metrics)
-        end_time = max(m.finish_time for m in metrics)
+        # Apply strict time window filter for ramp decision making if enabled
+        metrics_for_decision = metrics
+        if config.strict_time_window:
+            # Filter to only requests that completed within the ramp duration window
+            phase_start = min(m.launch_time for m in metrics)
+            duration_end = phase_start + ramp_duration
+            metrics_for_decision = [m for m in metrics
+                                   if m.launch_time < duration_end and m.finish_time <= duration_end]
+
+            if not metrics_for_decision:
+                logger.warning(f"      ⚠ Strict window filter removed all metrics for decision making, using all {len(metrics)} metrics")
+                metrics_for_decision = metrics
+            elif len(metrics_for_decision) < len(metrics):
+                logger.debug(f"      Strict window: using {len(metrics_for_decision)}/{len(metrics)} requests for ramp decision")
+
+        # Calculate throughput for this concurrency level (using filtered metrics if strict mode)
+        start_time = min(m.launch_time for m in metrics_for_decision)
+        end_time = max(m.finish_time for m in metrics_for_decision)
         test_duration = end_time - start_time
 
-        total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in metrics)
-        total_output_tokens = sum(m.output_tokens for m in metrics)
+        total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in metrics_for_decision)
+        total_output_tokens = sum(m.output_tokens for m in metrics_for_decision)
 
         input_tps = total_input_tokens / test_duration if test_duration > 0 else 0
         output_tps = total_output_tokens / test_duration if test_duration > 0 else 0
 
-        # Check if TTFT threshold exceeded
-        ttfts = [m.ttft for m in metrics if m.ttft > 0]
+        # Check if TTFT threshold exceeded (using filtered metrics if strict mode)
+        ttfts = [m.ttft for m in metrics_for_decision if m.ttft > 0]
         avg_ttft = np.mean(ttfts) if ttfts else 0
         max_ttft = np.max(ttfts) if ttfts else 0
         p95_ttft = np.percentile(ttfts, 95) if ttfts else 0
@@ -1215,14 +1232,14 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
             measured_ttft = p95_ttft
             metric_name = "P95 TTFT"
 
-        # Track this concurrency level's performance
+        # Track this concurrency level's performance (store decision metrics for consistency)
         tested_concurrency_levels.append({
             'concurrency': current_concurrency,
             'input_tps': input_tps,
             'output_tps': output_tps,
             'measured_ttft': measured_ttft,
             'p95_ttft': p95_ttft,
-            'metrics': metrics
+            'metrics': metrics_for_decision  # Use filtered metrics if strict mode
         })
 
         logger.info(f"      Avg TTFT: {avg_ttft:.3f}s, P95 TTFT: {p95_ttft:.3f}s, Max TTFT: {max_ttft:.3f}s ({metric_name}: {measured_ttft:.3f}s)")
@@ -1309,8 +1326,23 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
                     all_phases.append(refine_phase_metadata)
                     refinement_iterations += 1
 
-                    # Calculate TTFT metric for refinement
-                    refine_ttfts = [m.ttft for m in refine_metrics if m.ttft > 0]
+                    # Apply strict time window filter for refinement decision making if enabled
+                    refine_metrics_for_decision = refine_metrics
+                    if config.strict_time_window:
+                        refine_duration = min(config.ramp_duration, config.test_duration - (time.time() - test_start_time))
+                        refine_phase_start = min(m.launch_time for m in refine_metrics)
+                        refine_duration_end = refine_phase_start + refine_duration
+                        refine_metrics_for_decision = [m for m in refine_metrics
+                                                      if m.launch_time < refine_duration_end and m.finish_time <= refine_duration_end]
+
+                        if not refine_metrics_for_decision:
+                            logger.warning(f"        ⚠ Strict window filter removed all refinement metrics, using all {len(refine_metrics)} metrics")
+                            refine_metrics_for_decision = refine_metrics
+                        elif len(refine_metrics_for_decision) < len(refine_metrics):
+                            logger.debug(f"        Strict window: using {len(refine_metrics_for_decision)}/{len(refine_metrics)} requests for refinement decision")
+
+                    # Calculate TTFT metric for refinement (using filtered metrics if strict mode)
+                    refine_ttfts = [m.ttft for m in refine_metrics_for_decision if m.ttft > 0]
                     if config.ttft_metric == "max":
                         refine_measured_ttft = np.max(refine_ttfts) if refine_ttfts else 0
                     elif config.ttft_metric == "avg":
@@ -1320,21 +1352,21 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
 
                     refine_p95_ttft = np.percentile(refine_ttfts, 95) if refine_ttfts else 0
 
-                    # Calculate throughput for this refinement level
-                    refine_start_time = min(m.launch_time for m in refine_metrics)
-                    refine_end_time = max(m.finish_time for m in refine_metrics)
+                    # Calculate throughput for this refinement level (using filtered metrics if strict mode)
+                    refine_start_time = min(m.launch_time for m in refine_metrics_for_decision)
+                    refine_end_time = max(m.finish_time for m in refine_metrics_for_decision)
                     refine_test_duration = refine_end_time - refine_start_time
-                    refine_input_tps = sum(m.cached_tokens + m.unique_tokens for m in refine_metrics) / refine_test_duration if refine_test_duration > 0 else 0
-                    refine_output_tps = sum(m.output_tokens for m in refine_metrics) / refine_test_duration if refine_test_duration > 0 else 0
+                    refine_input_tps = sum(m.cached_tokens + m.unique_tokens for m in refine_metrics_for_decision) / refine_test_duration if refine_test_duration > 0 else 0
+                    refine_output_tps = sum(m.output_tokens for m in refine_metrics_for_decision) / refine_test_duration if refine_test_duration > 0 else 0
 
-                    # Track this refinement level's performance
+                    # Track this refinement level's performance (store decision metrics for consistency)
                     tested_concurrency_levels.append({
                         'concurrency': mid,
                         'input_tps': refine_input_tps,
                         'output_tps': refine_output_tps,
                         'measured_ttft': refine_measured_ttft,
                         'p95_ttft': refine_p95_ttft,
-                        'metrics': refine_metrics
+                        'metrics': refine_metrics_for_decision  # Use filtered metrics if strict mode
                     })
 
                     logger.info(f"        {metric_name}: {refine_measured_ttft:.3f}s, Input: {refine_input_tps:,.0f} tok/s")
@@ -1343,7 +1375,7 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
                         # This level is good
                         low = mid
                         best_concurrency = mid
-                        best_metrics = refine_metrics
+                        best_metrics = refine_metrics_for_decision  # Use filtered metrics if strict mode
                         logger.info(f"        ✓ Under threshold, new lower bound: {low}")
                     else:
                         # Too high
@@ -1530,7 +1562,7 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
 
     # Calculate aggregated metrics
     aggregated = calculate_aggregated_metrics(
-        all_metrics, context_size, cache_hit_rate, peak_concurrency, config
+        all_metrics, context_size, cache_hit_rate, peak_concurrency, config, model
     )
 
     return all_metrics, aggregated, all_phases
@@ -1538,7 +1570,7 @@ async def run_cache_hit_rate_test(config: TestConfig, api_client: APIClient,
 
 def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: int,
                                  cache_hit_rate: int, peak_concurrency: int,
-                                 config: TestConfig) -> AggregatedMetrics:
+                                 config: TestConfig, model: str) -> AggregatedMetrics:
     """
     Calculate aggregated metrics from detailed results
 
@@ -1569,6 +1601,36 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
 
     # Use peak_metrics instead of all metrics for calculations
     metrics = peak_metrics
+
+    # Apply strict time window filter BEFORE calculating throughput if enabled
+    if config.strict_time_window:
+        from collections import defaultdict
+        by_concurrency = defaultdict(list)
+        for m in metrics:
+            by_concurrency[m.concurrency_level].append(m)
+
+        filtered_metrics = []
+        for conc_level, level_metrics in by_concurrency.items():
+            # Find the time window for this concurrency level
+            level_start = min(m.launch_time for m in level_metrics)
+            # Assume duration is ramp_duration (most common case)
+            duration_end = level_start + config.ramp_duration
+
+            # Only include requests that launched before duration_end AND finished before duration_end
+            for m in level_metrics:
+                if m.launch_time < duration_end and m.finish_time <= duration_end:
+                    filtered_metrics.append(m)
+
+        if not filtered_metrics:
+            # If filtering removed all metrics, log warning and use original
+            logger.warning("⚠ Strict time window filtering removed all metrics, using all requests")
+            filtered_metrics = metrics
+        else:
+            excluded_count = len(metrics) - len(filtered_metrics)
+            if excluded_count > 0:
+                logger.info(f"  Strict time window: excluded {excluded_count} requests that didn't complete within duration window")
+
+        metrics = filtered_metrics
 
     # Calculate throughput per-phase and average (matching Retry Summary calculation)
     # Group by phase_id to calculate per-phase throughput
@@ -1681,8 +1743,9 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
     strict_input_tps = np.mean(strict_phase_throughputs['input']) if strict_phase_throughputs['input'] else 0
     strict_output_tps = np.mean(strict_phase_throughputs['output']) if strict_phase_throughputs['output'] else 0
 
-    # Log comparison if values differ significantly
-    if strict_input_tps > 0 and abs(strict_input_tps - input_tokens_per_sec) / input_tokens_per_sec > 0.02:
+    # Log comparison if values differ significantly (only when strict mode is NOT enabled)
+    # When strict mode is enabled, we've already filtered and calculated with that data
+    if not config.strict_time_window and strict_input_tps > 0 and abs(strict_input_tps - input_tokens_per_sec) / input_tokens_per_sec > 0.02:
         input_diff_pct = (strict_input_tps - input_tokens_per_sec) / input_tokens_per_sec * 100
         output_diff_pct = (strict_output_tps - output_tokens_per_sec) / output_tokens_per_sec * 100 if output_tokens_per_sec > 0 else 0
 
@@ -1691,49 +1754,6 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
         logger.info(f"      Strict:  Input={strict_input_tps:,.0f} tok/s ({input_diff_pct:+.1f}%), Output={strict_output_tps:,.0f} tok/s ({output_diff_pct:+.1f}%)")
         if input_diff_pct > 5:
             logger.info(f"      ⚠️  Strict window shows >5% higher throughput - may indicate cleanup overhead")
-
-    # If strict_time_window is enabled, filter to only requests that completed within duration windows
-    if config.strict_time_window:
-        # Group by concurrency level and filter each level's requests
-        filtered_metrics = []
-        for m in metrics:
-            # For strict mode: only include requests that both launched AND completed within their duration window
-            # We approximate the duration window by looking at the earliest launch time for this concurrency level
-            # and assuming a window based on ramp_duration
-            filtered_metrics.append(m)
-
-        # Actually, we need to be smarter - we need to know the actual duration_end_time per level
-        # Since we don't track that per-metric, we'll use a simpler approach:
-        # Filter out requests that finished significantly after the main batch
-        # by grouping by concurrency level and finding the duration window
-
-        from collections import defaultdict
-        by_concurrency = defaultdict(list)
-        for m in metrics:
-            by_concurrency[m.concurrency_level].append(m)
-
-        filtered_metrics = []
-        for conc_level, level_metrics in by_concurrency.items():
-            # Find the time window for this concurrency level
-            level_start = min(m.launch_time for m in level_metrics)
-            # Assume duration is ramp_duration (most common case)
-            duration_end = level_start + config.ramp_duration
-
-            # Only include requests that launched before duration_end AND finished before duration_end
-            for m in level_metrics:
-                if m.launch_time < duration_end and m.finish_time <= duration_end:
-                    filtered_metrics.append(m)
-
-        if not filtered_metrics:
-            # If filtering removed all metrics, log warning and use original
-            logger.warning("⚠ Strict time window filtering removed all metrics, using all requests")
-            filtered_metrics = metrics
-        else:
-            excluded_count = len(metrics) - len(filtered_metrics)
-            if excluded_count > 0:
-                logger.info(f"  Strict time window: excluded {excluded_count} requests that didn't complete within duration window")
-
-        metrics = filtered_metrics
 
     # Calculate average output tokens per second per request
     # For each request: output_tokens / generation_time = tokens/s for that request
@@ -1748,6 +1768,7 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
     return AggregatedMetrics(
         context_size=context_size,
         cache_hit_rate=cache_hit_rate,
+        model=model,
         input_tokens_per_sec=input_tokens_per_sec,
         output_tokens_per_sec=output_tokens_per_sec,
         avg_ttft=avg_ttft,
@@ -1835,6 +1856,7 @@ def load_existing_aggregated_results(output_dir: str) -> List[AggregatedMetrics]
             metrics.append(AggregatedMetrics(
                 context_size=int(row['context_size']),
                 cache_hit_rate=int(row['cache_hit_rate']),
+                model=str(row.get('model', 'unknown')),  # Default to 'unknown' for old CSV files
                 input_tokens_per_sec=float(row['input_tokens_per_sec']),
                 output_tokens_per_sec=float(row['output_tokens_per_sec']),
                 avg_ttft=float(row['avg_ttft']),
@@ -2169,7 +2191,7 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
     logger.debug(f"Generated ramp graph: {filename}")
 
 
-def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str):
+def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str, config: TestConfig):
     """Generate Plotly visualizations"""
     if not metrics:
         logger.warning("No metrics to visualize")
@@ -2179,6 +2201,10 @@ def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str):
     output_path.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame([m.to_dict() for m in metrics])
+
+    # Deduplicate: keep only the most recent entry for each (context_size, cache_hit_rate)
+    # This handles cases where tests were resumed and same configs run multiple times
+    df = df.drop_duplicates(subset=['context_size', 'cache_hit_rate'], keep='last')
 
     # Load phase metadata to calculate variability using exact phase boundaries
     phase_metadata_by_test = load_phase_metadata(output_dir)
@@ -2240,6 +2266,16 @@ def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str):
                     (detailed_df['cache_hit_rate'] == cache_rate) &
                     (detailed_df['concurrency_level'] == peak_conc)
                 ]
+
+                # Apply strict time window filter if enabled
+                if config.strict_time_window and len(phase_requests) > 0:
+                    # Filter to only requests that launched AND finished within the phase duration
+                    phase_start = phase_requests['launch_time'].min()
+                    duration_end = phase_start + phase.duration
+                    phase_requests = phase_requests[
+                        (phase_requests['launch_time'] < duration_end) &
+                        (phase_requests['finish_time'] <= duration_end)
+                    ]
 
                 if len(phase_requests) > 0:
                     # Use phase duration from metadata (more accurate than calculating from timestamps)
@@ -3000,6 +3036,21 @@ async def main():
     if all_aggregated_results:
         logger.info(f"Loaded {len(all_aggregated_results)} existing test results from previous run")
 
+        # Filter to ONLY include tests marked as completed in progress.json
+        # This removes partial results from crashed/interrupted runs
+        original_count = len(all_aggregated_results)
+        all_aggregated_results = [
+            m for m in all_aggregated_results
+            if progress.is_test_completed(m.context_size, m.cache_hit_rate)
+        ]
+
+        removed_count = original_count - len(all_aggregated_results)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} partial/incomplete results (not marked completed in progress.json)")
+            logger.info(f"Keeping {len(all_aggregated_results)} completed results")
+        else:
+            logger.info(f"All {len(all_aggregated_results)} loaded results are marked as completed")
+
     # Main test loop - iterate through context sizes
     all_detailed_results = []
 
@@ -3054,6 +3105,7 @@ async def main():
                     tokenizer=tokenizer,
                     context_size=context_size,
                     cache_hit_rate=cache_hit_rate,
+                    model=model,
                     previous_peak=previous_peak_concurrency
                 )
 
@@ -3097,7 +3149,7 @@ async def main():
         if not config.skip_graphs and all_aggregated_results:
             logger.info("")
             logger.info(f"{Colors.PHASE}Generating visualizations for completed tests...{Colors.ENDC}")
-            generate_graphs(all_aggregated_results, config.output_dir)
+            generate_graphs(all_aggregated_results, config.output_dir, config)
 
             # Generate index.html dashboard
             logger.info(f"{Colors.OKBLUE}Updating index.html dashboard...{Colors.ENDC}")
@@ -3117,7 +3169,7 @@ async def main():
         logger.info(f"{Colors.PHASE}{'='*80}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}Generating visualizations...{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}{'='*80}{Colors.ENDC}")
-        generate_graphs(all_aggregated_results, config.output_dir)
+        generate_graphs(all_aggregated_results, config.output_dir, config)
 
         # Generate index.html dashboard
         logger.info(f"{Colors.OKBLUE}Generating index.html dashboard...{Colors.ENDC}")
