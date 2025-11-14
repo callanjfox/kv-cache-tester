@@ -229,6 +229,8 @@ class TestConfig:
     seed: Optional[int] = None
     kv_cache_bytes: int = 2  # 1 or 2 bytes per element for KV cache calculation
     strict_time_window: bool = False  # Only include requests completed within duration window
+    mode: str = "adaptive"  # "adaptive" or "sustained"
+    assessment_period: int = 30  # For sustained mode: duration of each assessment period
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -310,6 +312,45 @@ class AggregatedMetrics:
     peak_concurrency: int
     total_requests: int
     test_duration: float
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary"""
+        return asdict(self)
+
+
+@dataclass
+class AssessmentPeriodMetrics:
+    """Metrics for a single assessment period in sustained mode"""
+    period_number: int
+    context_size: int
+    cache_hit_rate: int
+    working_set_size: int
+    start_time: float
+    end_time: float
+    duration: float
+    concurrency_level: int
+    num_requests_launched: int
+    num_requests_completed: int
+    total_input_tokens: int
+    total_output_tokens: int
+    input_tokens_per_sec: float
+    output_tokens_per_sec: float
+    avg_ttft: float
+    median_ttft: float
+    p95_ttft: float
+    p99_ttft: float
+    avg_ttlt: float
+    median_ttlt: float
+    p95_ttlt: float
+    p99_ttlt: float
+    avg_itl: float
+    median_itl: float
+    p95_itl: float
+    p99_itl: float
+    avg_output_tokens_per_request: float
+    measured_ttft: float  # The TTFT metric used for decision (p95/avg/max)
+    decision: str  # "RAMP_UP", "RAMP_DOWN", "STAY", "MAX_REACHED", "MIN_REACHED"
+    next_concurrency: int  # Concurrency for next period
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -743,6 +784,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--strict-time-window", action="store_true",
                        help="Calculate throughput using only requests that launched AND completed within the ramp-duration window. "
                             "Default behavior includes all requests in throughput calculation (including cleanup time).")
+    parser.add_argument("--mode", type=str, default="adaptive",
+                       choices=["adaptive", "sustained"],
+                       help="Test mode (default: adaptive). "
+                            "'sustained' = sustained load testing with continuous concurrency adjustment (recommended for production capacity planning), "
+                            "'adaptive' = burst testing to find peak concurrency with retry phases")
+    parser.add_argument("--assessment-period", type=int, default=30,
+                       help="Assessment period duration in seconds for sustained mode (default: 30, sustained mode only)")
 
     return parser.parse_args()
 
@@ -811,7 +859,9 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         chunk_size=args.chunk_size,
         seed=args.seed,
         kv_cache_bytes=args.kv_cache_quantization,
-        strict_time_window=args.strict_time_window
+        strict_time_window=args.strict_time_window,
+        mode=args.mode,
+        assessment_period=args.assessment_period
     )
 
 
@@ -1591,6 +1641,505 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
     return all_metrics, aggregated, all_phases
 
 
+def calculate_period_metrics_simple(all_requests, period_start, period_end):
+    """
+    Calculate period metrics using simplified completion-time-based approach.
+
+    Unlike cache_rate_tester.py's streaming approach, this filters requests that
+    COMPLETED during the assessment period (using finish_time).
+
+    Args:
+        all_requests: List of all RequestMetrics collected so far
+        period_start: Start timestamp of this period
+        period_end: End timestamp of this period
+
+    Returns:
+        dict with:
+            - completed_requests: List of RequestMetrics that finished in this period
+            - input_tokens: Total input tokens from completed requests
+            - output_tokens: Total output tokens from completed requests
+    """
+    # Filter to requests that completed during this period
+    # Use finish_time to determine if request completed in this window
+    completed_requests = [
+        r for r in all_requests
+        if period_start <= r.finish_time <= period_end
+    ]
+
+    # Calculate totals from completed requests
+    total_input = sum(r.cached_tokens + r.unique_tokens for r in completed_requests)
+    total_output = sum(r.output_tokens for r in completed_requests)
+
+    return {
+        'completed_requests': completed_requests,
+        'input_tokens': total_input,
+        'output_tokens': total_output
+    }
+
+
+async def run_continuous_mode(config: TestConfig, api_client: APIClient,
+                              working_set: WorkingSet, tokenizer: TokenizerManager,
+                              context_size: int, working_set_size: int,
+                              cache_hit_rate: int, model: str) -> List[AssessmentPeriodMetrics]:
+    """
+    Run sustained load testing mode - continuously adjust concurrency based on periodic measurements
+
+    Key differences from cache_rate_tester.py:
+    1. Uses simplified completion-time-based metrics (no streaming token tracking)
+    2. Includes working_set_size parameter
+    3. Supports working set growth during the test
+    4. Uses existing run_single_request() without streaming modifications
+
+    Returns: List of assessment period metrics
+    """
+    logger.info(f"{Colors.PHASE}  Sustained Mode: Assessing every {config.assessment_period}s for {config.test_duration}s{Colors.ENDC}")
+
+    all_periods = []
+    period_number = 0
+    test_start_time = time.time()
+    current_concurrency = config.start_concurrency
+
+    # Track all requests across all periods (for final detailed CSV)
+    all_requests = []
+
+    # Track throughput history for plateau detection
+    throughput_history = []  # List of (period_number, input_tps, output_tps)
+    peak_input_tps = 0
+    peak_output_tps = 0
+    peak_period = 0
+
+    # Working set growth tracking - scheduled at section boundaries
+    initial_num_prompts = len(working_set.prompts)
+    target_num_prompts = max(1, int(np.ceil(working_set_size / working_set.rounded_context_size)))
+    total_prompts_to_add = target_num_prompts - initial_num_prompts
+
+    # Calculate scheduled growth times
+    # Divide test into (increments + 1) sections, add at section boundaries (skip first and last)
+    # This leaves buffer time at start and end
+    num_sections = len(config.working_set_sizes) + 1  # Use working_set_increments concept
+    section_duration = config.test_duration / num_sections
+    num_growth_events = num_sections - 1  # Number of boundaries (skip adding at T=0 and T=end)
+
+    # Schedule growth times at section boundaries (excluding T=0)
+    scheduled_growth_times = [section_duration * i for i in range(1, num_sections)]
+
+    # Calculate prompts to add at each growth event
+    if num_growth_events > 0 and total_prompts_to_add > 0:
+        base_prompts_per_event = total_prompts_to_add // num_growth_events
+        extra_prompts = total_prompts_to_add % num_growth_events
+        # Distribute prompts: first 'extra_prompts' events get base+1, rest get base
+        prompts_per_event = [base_prompts_per_event + (1 if i < extra_prompts else 0)
+                            for i in range(num_growth_events)]
+    else:
+        prompts_per_event = []
+        scheduled_growth_times = []
+
+    logger.info(f"  Working set growth schedule:")
+    logger.info(f"    Initial: {initial_num_prompts} prompts ({initial_num_prompts * working_set.rounded_context_size:,} tokens)")
+    logger.info(f"    Target: {target_num_prompts} prompts ({working_set_size:,} tokens)")
+    logger.info(f"    Growth events: {num_growth_events} (at section boundaries)")
+    if scheduled_growth_times:
+        for i, (time_sec, num_prompts) in enumerate(zip(scheduled_growth_times, prompts_per_event)):
+            logger.info(f"      T={time_sec:.0f}s: Add {num_prompts} prompt(s)")
+
+    next_growth_index = 0  # Track which growth event is next
+
+    while time.time() - test_start_time < config.test_duration:
+        period_number += 1
+        period_start = time.time()
+
+        # Calculate remaining time
+        elapsed = period_start - test_start_time
+        remaining = config.test_duration - elapsed
+        period_duration = min(config.assessment_period, remaining)
+
+        if period_duration < 5:  # Not enough time for meaningful assessment
+            logger.info(f"  Period {period_number}: Skipping (only {period_duration:.1f}s remaining)")
+            break
+
+        logger.info(f"")
+        logger.info(f"{Colors.OKCYAN}  Period {period_number}: Running at concurrency {current_concurrency} for {period_duration:.1f}s{Colors.ENDC}")
+
+        # Run requests at current concurrency for the assessment period
+        active_tasks = []
+        request_counter = 0
+        num_launched = 0
+
+        # Track how many requests we've collected so far (to calculate new requests this period)
+        requests_before_period = len(all_requests)
+
+        try:
+            while time.time() - period_start < period_duration:
+                # Check if we should grow working set based on scheduled times
+                current_time = time.time()
+                elapsed = current_time - test_start_time
+
+                # Check if we've passed the next scheduled growth time
+                if (next_growth_index < len(scheduled_growth_times) and
+                    elapsed >= scheduled_growth_times[next_growth_index]):
+
+                    prompts_to_add = prompts_per_event[next_growth_index]
+
+                    if prompts_to_add > 0:
+                        # Generate new prompts (NOT initialized - these will be cache misses!)
+                        current_num_prompts = len(working_set.prompts)
+                        for i in range(prompts_to_add):
+                            prompt_idx = current_num_prompts + i
+                            prompt_seed = (working_set.seed + prompt_idx) if working_set.seed is not None else None
+                            tokens = tokenizer.generate_dummy_tokens(
+                                working_set.rounded_context_size,
+                                seed=prompt_seed,
+                                prompt_number=prompt_idx
+                            )
+                            working_set.prompts.append(tokens)
+
+                        # Update tracking
+                        new_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+
+                        # Log growth with OKGREEN color
+                        logger.info(f"")
+                        logger.info(f"{Colors.OKGREEN}  📈 Working Set Growth: Added {prompts_to_add} new prompt(s){Colors.ENDC}")
+                        logger.info(f"{Colors.OKGREEN}     Now: {len(working_set.prompts)} prompts ({new_ws_size:,} tokens){Colors.ENDC}")
+                        logger.info(f"")
+
+                    # Mark this growth event as complete
+                    next_growth_index += 1
+
+                # Launch requests up to concurrency limit
+                while len(active_tasks) < current_concurrency and time.time() - period_start < period_duration:
+                    request_id = f"P{period_number}_c{current_concurrency}_r{request_counter}"
+                    phase_id = f"SUSTAINED_P{period_number}"
+                    request_seed = (config.seed + request_counter) if config.seed is not None else None
+
+                    # Construct prompt
+                    prompt, cached_tok, unique_tok = construct_prompt(
+                        working_set, tokenizer, cache_hit_rate, context_size,
+                        config.random_selection, request_seed, question_index=request_counter
+                    )
+
+                    # Launch request using existing run_single_request (no streaming params)
+                    task = asyncio.create_task(
+                        run_single_request(
+                            api_client, prompt, config.output_tokens, working_set_size, cache_hit_rate,
+                            context_size, cached_tok, unique_tok, current_concurrency, request_id, phase_id,
+                            verbose=config.verbose
+                        )
+                    )
+                    active_tasks.append(task)
+                    request_counter += 1
+                    num_launched += 1
+
+                    # Small delay
+                    await asyncio.sleep(0.01)
+
+                # Wait for at least one task to complete
+                if active_tasks:
+                    done, pending = await asyncio.wait(
+                        active_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    active_tasks = list(pending)
+
+                    for task in done:
+                        try:
+                            result = await task
+                            all_requests.append(result)
+                        except Exception as e:
+                            logger.error(f"Task failed: {e}")
+
+            # Period duration ended - wait for remaining tasks to complete
+            period_end_time = period_start + period_duration
+
+            if active_tasks:
+                logger.debug(f"    Period {period_number}: Waiting for {len(active_tasks)} remaining tasks...")
+                remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
+
+                for result in remaining_results:
+                    if isinstance(result, RequestMetrics):
+                        # Add to all_requests for detailed CSV
+                        all_requests.append(result)
+                    elif isinstance(result, Exception):
+                        logger.error(f"Task failed: {result}")
+
+        except Exception as e:
+            logger.error(f"Error during period {period_number}: {e}")
+            # Cancel remaining tasks
+            for task in active_tasks:
+                task.cancel()
+            raise
+
+        # SIMPLIFIED METRICS: Calculate based on request completion times
+        # Filter to requests that completed during this period
+        period_metrics = calculate_period_metrics_simple(all_requests, period_start, period_end_time)
+
+        completed_requests = period_metrics['completed_requests']
+        total_input = period_metrics['input_tokens']
+        total_output = period_metrics['output_tokens']
+        num_completed = len(completed_requests)
+
+        logger.debug(f"    Period {period_number}: {num_launched} launched, {num_completed} completed ({len(all_requests) - requests_before_period} new requests total)")
+
+        # Calculate metrics for this period
+        if num_completed == 0:
+            logger.warning(f"    Period {period_number}: No requests completed! Staying at concurrency {current_concurrency}")
+            # Create empty period record
+            period_record = AssessmentPeriodMetrics(
+                period_number=period_number,
+                context_size=context_size,
+                cache_hit_rate=cache_hit_rate,
+                working_set_size=len(working_set.prompts) * working_set.rounded_context_size,  # Current WS size
+                start_time=period_start,
+                end_time=time.time(),
+                duration=period_duration,
+                concurrency_level=current_concurrency,
+                num_requests_launched=num_launched,
+                num_requests_completed=0,
+                total_input_tokens=0,
+                total_output_tokens=0,
+                input_tokens_per_sec=0,
+                output_tokens_per_sec=0,
+                avg_ttft=0,
+                median_ttft=0,
+                p95_ttft=0,
+                p99_ttft=0,
+                avg_ttlt=0,
+                median_ttlt=0,
+                p95_ttlt=0,
+                p99_ttlt=0,
+                avg_itl=0,
+                median_itl=0,
+                p95_itl=0,
+                p99_itl=0,
+                avg_output_tokens_per_request=0,
+                measured_ttft=0,
+                decision="STAY",
+                next_concurrency=current_concurrency
+            )
+            all_periods.append(period_record)
+            continue
+
+        # Calculate period throughput based on actual period duration
+        actual_period_duration = time.time() - period_start
+
+        input_tps = total_input / actual_period_duration if actual_period_duration > 0 else 0
+        output_tps = total_output / actual_period_duration if actual_period_duration > 0 else 0
+
+        # Calculate TTFT stats from completed requests
+        ttfts = [m.ttft for m in completed_requests if m.ttft > 0]
+        avg_ttft = np.mean(ttfts) if ttfts else 0
+        median_ttft = np.median(ttfts) if ttfts else 0
+        p95_ttft = np.percentile(ttfts, 95) if ttfts else 0
+        p99_ttft = np.percentile(ttfts, 99) if ttfts else 0
+        max_ttft = np.max(ttfts) if ttfts else 0
+
+        # Calculate TTLT stats from completed requests
+        ttlts = [m.ttlt for m in completed_requests if m.ttlt > 0]
+        avg_ttlt = np.mean(ttlts) if ttlts else 0
+        median_ttlt = np.median(ttlts) if ttlts else 0
+        p95_ttlt = np.percentile(ttlts, 95) if ttlts else 0
+        p99_ttlt = np.percentile(ttlts, 99) if ttlts else 0
+
+        # Calculate ITL stats from completed requests
+        itls = [m.itl for m in completed_requests if m.itl > 0]
+        avg_itl = np.mean(itls) if itls else 0
+        median_itl = np.median(itls) if itls else 0
+        p95_itl = np.percentile(itls, 95) if itls else 0
+        p99_itl = np.percentile(itls, 99) if itls else 0
+
+        # Calculate avg output tokens/s per request from completed requests
+        output_rates = [m.output_tokens / m.generation_time
+                       for m in completed_requests
+                       if m.generation_time > 0 and m.output_tokens > 0]
+        avg_output_per_request = np.mean(output_rates) if output_rates else 0
+
+        # Choose measured TTFT based on config
+        if config.ttft_metric == "max":
+            measured_ttft = max_ttft
+            ttft_metric_name = "Max TTFT"
+        elif config.ttft_metric == "avg":
+            measured_ttft = avg_ttft
+            ttft_metric_name = "Avg TTFT"
+        else:  # p95
+            measured_ttft = p95_ttft
+            ttft_metric_name = "P95 TTFT"
+
+        # Decide: RAMP_UP, RAMP_DOWN, or STAY
+        decision = "STAY"
+        next_concurrency = current_concurrency
+
+        # Check if TTFT threshold exceeded
+        ttft_exceeded = (config.max_ttft is not None) and (measured_ttft > config.max_ttft)
+
+        if ttft_exceeded:
+            # Over threshold - need to ramp down
+            if current_concurrency <= config.start_concurrency:
+                decision = "MIN_REACHED"
+                next_concurrency = current_concurrency
+                logger.warning(f"    Performance threshold exceeded BUT already at minimum concurrency {current_concurrency}")
+                logger.warning(f"      {ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s")
+            else:
+                # Ramp down by decrement
+                next_concurrency = max(config.start_concurrency, current_concurrency - config.concurrency_increment)
+                decision = "RAMP_DOWN"
+                logger.info(f"    Performance threshold exceeded -> RAMP DOWN: {current_concurrency} -> {next_concurrency}")
+                logger.info(f"      {ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s")
+        else:
+            # Under threshold - but should we ramp up?
+            if current_concurrency >= config.max_concurrency:
+                decision = "MAX_REACHED"
+                next_concurrency = current_concurrency
+                logger.info(f"    Performance thresholds OK BUT already at max concurrency {current_concurrency}")
+            else:
+                # Check for throughput plateau/decline before ramping up
+                # Track peak and check if we're significantly below it
+                should_ramp_up = True
+                plateau_reason = ""
+
+                # Update peak tracking
+                if input_tps > peak_input_tps:
+                    peak_input_tps = input_tps
+                    peak_output_tps = output_tps
+                    peak_period = period_number
+
+                # Check plateau if we have enough history (at least 2 periods after peak)
+                if len(throughput_history) >= 2 and period_number > peak_period + 1:
+                    # Calculate decline from peak (accounting for variance)
+                    decline_from_peak = ((peak_input_tps - input_tps) / peak_input_tps) * 100
+
+                    # If we've declined >15% from peak (beyond normal variance), ramp down to recover
+                    if decline_from_peak > 15:
+                        should_ramp_up = False
+                        decision = "PLATEAU_RAMP_DOWN"
+
+                        # Adaptive ramp down based on severity (less aggressive than ramp up)
+                        if decline_from_peak > 40:
+                            # Severe decline - ramp down more aggressively
+                            down_increment = config.concurrency_increment * 4
+                        elif decline_from_peak > 30:
+                            down_increment = config.concurrency_increment * 3
+                        elif decline_from_peak > 20:
+                            down_increment = config.concurrency_increment * 2
+                        else:
+                            down_increment = config.concurrency_increment
+
+                        next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
+                        plateau_reason = f"Throughput {decline_from_peak:.1f}% below peak ({peak_input_tps:,.0f} tok/s @ period {peak_period})"
+                        logger.warning(f"    {Colors.WARNING}Plateau detected: Current {input_tps:,.0f} tok/s is {decline_from_peak:.1f}% below peak -> RAMP DOWN: {current_concurrency} -> {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
+                        logger.info(f"    Peak was {peak_input_tps:,.0f} tok/s at period {peak_period}, attempting to recover by reducing concurrency")
+
+                    # Also check recent trend (last 3 periods)
+                    elif len(throughput_history) >= 3:
+                        recent_throughputs = [h[1] for h in throughput_history[-3:]]  # Last 3 input_tps values
+                        recent_avg = np.mean(recent_throughputs)
+
+                        # If current is >10% below recent average, ramp down
+                        if input_tps < recent_avg * 0.90:
+                            should_ramp_up = False
+                            decision = "TREND_RAMP_DOWN"
+                            decline_pct = ((recent_avg - input_tps) / recent_avg) * 100
+
+                            # Adaptive ramp down based on trend decline severity
+                            if decline_pct > 30:
+                                down_increment = config.concurrency_increment * 3
+                            elif decline_pct > 20:
+                                down_increment = config.concurrency_increment * 2
+                            else:
+                                down_increment = config.concurrency_increment
+
+                            next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
+                            plateau_reason = f"Throughput {decline_pct:.1f}% below recent avg ({recent_avg:,.0f} tok/s)"
+                            logger.warning(f"    {Colors.WARNING}Decline detected: Current {input_tps:,.0f} tok/s is below recent trend -> RAMP DOWN: {current_concurrency} -> {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
+
+                if should_ramp_up:
+                    # Calculate headroom based on TTFT threshold
+                    ttft_headroom = (config.max_ttft - measured_ttft) / config.max_ttft
+
+                    # Use headroom to determine increment (1x to 10x)
+                    if ttft_headroom > 0.7:
+                        adaptive_increment = config.concurrency_increment * 10
+                    elif ttft_headroom > 0.5:
+                        adaptive_increment = config.concurrency_increment * 5
+                    elif ttft_headroom > 0.3:
+                        adaptive_increment = config.concurrency_increment * 3
+                    elif ttft_headroom > 0.15:
+                        adaptive_increment = config.concurrency_increment * 2
+                    else:
+                        adaptive_increment = config.concurrency_increment
+
+                    next_concurrency = min(config.max_concurrency, current_concurrency + adaptive_increment)
+                    decision = "RAMP_UP"
+
+                    # Show peak info if we have it
+                    peak_info = f" (peak: {peak_input_tps:,.0f} tok/s @ P{peak_period})" if peak_input_tps > 0 else ""
+                    logger.info(f"    Performance thresholds OK (headroom: {ttft_headroom:.1%}) -> RAMP UP: {current_concurrency} -> {next_concurrency} (+{next_concurrency - current_concurrency}){peak_info}")
+
+        # Print period summary
+        logger.info(f"{Colors.METRIC}    Completed: {num_completed}, Launched: {num_launched}{Colors.ENDC}")
+        logger.info(f"{Colors.METRIC}    Input: {input_tps:,.0f} tok/s | Output: {output_tps:,.0f} tok/s{Colors.ENDC}")
+        logger.info(f"{Colors.METRIC}    Avg TTFT: {avg_ttft:.3f}s | P95 TTFT: {p95_ttft:.3f}s | P99 TTFT: {p99_ttft:.3f}s{Colors.ENDC}")
+        logger.info(f"{Colors.METRIC}    Avg ITL: {avg_itl*1000:.2f}ms | Avg Tokens/Req: {avg_output_per_request:.1f} tok/s{Colors.ENDC}")
+
+        # Create period record (include current working set size)
+        current_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+        period_record = AssessmentPeriodMetrics(
+            period_number=period_number,
+            context_size=context_size,
+            cache_hit_rate=cache_hit_rate,
+            working_set_size=current_ws_size,  # Track actual WS size at this point
+            start_time=period_start,
+            end_time=time.time(),
+            duration=actual_period_duration,
+            concurrency_level=current_concurrency,
+            num_requests_launched=num_launched,
+            num_requests_completed=num_completed,
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            input_tokens_per_sec=input_tps,
+            output_tokens_per_sec=output_tps,
+            avg_ttft=avg_ttft,
+            median_ttft=median_ttft,
+            p95_ttft=p95_ttft,
+            p99_ttft=p99_ttft,
+            avg_ttlt=avg_ttlt,
+            median_ttlt=median_ttlt,
+            p95_ttlt=p95_ttlt,
+            p99_ttlt=p99_ttlt,
+            avg_itl=avg_itl,
+            median_itl=median_itl,
+            p95_itl=p95_itl,
+            p99_itl=p99_itl,
+            avg_output_tokens_per_request=avg_output_per_request,
+            measured_ttft=measured_ttft,
+            decision=decision,
+            next_concurrency=next_concurrency
+        )
+
+        all_periods.append(period_record)
+
+        # Track throughput for next period's plateau detection
+        throughput_history.append((period_number, input_tps, output_tps))
+
+        # Update concurrency for next period
+        current_concurrency = next_concurrency
+
+    # Summary
+    total_elapsed = time.time() - test_start_time
+    final_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+    prompts_added = len(working_set.prompts) - initial_num_prompts
+
+    logger.info(f"")
+    logger.info(f"{Colors.SUCCESS}  Continuous mode complete: {period_number} periods in {total_elapsed:.1f}s{Colors.ENDC}")
+    logger.info(f"{Colors.METRIC}    Total requests: {len(all_requests)}{Colors.ENDC}")
+    logger.info(f"{Colors.METRIC}    Peak throughput: {peak_input_tps:,.0f} input tok/s at period {peak_period}{Colors.ENDC}")
+    logger.info(f"{Colors.METRIC}    Working set growth: {initial_num_prompts} -> {len(working_set.prompts)} prompts (+{prompts_added}){Colors.ENDC}")
+    logger.info(f"{Colors.METRIC}    Final working set size: {final_ws_size:,} tokens{Colors.ENDC}")
+
+    # Save all requests to detailed CSV
+    if all_requests:
+        save_detailed_results(all_requests, config.output_dir, context_size)
+
+    return all_periods
+
+
 def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: int,
                                  working_set_size: int, cache_hit_rate: int, peak_concurrency: int,
                                  config: TestConfig, model: str) -> AggregatedMetrics:
@@ -1860,6 +2409,23 @@ def save_phase_metadata(phases: List[PhaseMetadata], output_dir: str):
     df = pd.DataFrame([p.to_dict() for p in phases])
     df.to_csv(filename, index=False)
     logger.debug(f"Saved phase metadata to {filename}")
+
+
+def save_continuous_results(periods: List[AssessmentPeriodMetrics], output_dir: str,
+                           context_size: int, working_set_size: int, cache_hit_rate: int):
+    """Save continuous mode assessment period metrics to CSV"""
+    if not periods:
+        return
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = output_path / f"sustained_periods_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}_{timestamp}.csv"
+
+    df = pd.DataFrame([p.to_dict() for p in periods])
+    df.to_csv(filename, index=False)
+    logger.info(f"Saved sustained mode results to {filename}")
 
 
 def load_existing_aggregated_results(output_dir: str) -> List[AggregatedMetrics]:
@@ -3208,8 +3774,12 @@ async def main():
             # Track previous peak concurrency for adaptive starting points
             previous_peak_concurrency = None
 
+            # For sustained mode: only test the max working_set_size (growth happens inside test)
+            # For adaptive mode: test each working_set_size separately
+            working_set_sizes_to_test = [config.working_set_sizes[-1]] if config.mode == "sustained" else config.working_set_sizes
+
             # Test each working set size
-            for working_set_size in config.working_set_sizes:
+            for working_set_size in working_set_sizes_to_test:
                 # Check if already completed
                 if progress.is_test_completed(context_size, working_set_size, cache_hit_rate):
                     logger.info(f"    Skipping working set size {working_set_size:,} (already completed)")
@@ -3221,54 +3791,94 @@ async def main():
 
                 # Create working set for this size
                 working_set = WorkingSet(context_size, working_set_size, tokenizer, config.chunk_size, config.seed)
-                working_set.generate_prompts()
 
-                # Initialize working set with API (pre-warm cache)
+                # For sustained mode: only generate min-working-set-size prompts initially
+                # For adaptive mode: generate all prompts for the working_set_size
+                if config.mode == "sustained":
+                    # Start with minimum working set size (first increment)
+                    min_ws_size = config.working_set_sizes[0]  # Smallest working set size
+                    initial_num_prompts = max(1, int(np.ceil(min_ws_size / working_set.rounded_context_size)))
+                    logger.info(f"Sustained mode: Generating initial {initial_num_prompts} prompts ({min_ws_size:,} tokens)")
+                    logger.info(f"  Will grow to {working_set_size:,} tokens during test")
+
+                    # Generate only initial prompts
+                    working_set.prompts = []
+                    for i in range(initial_num_prompts):
+                        prompt_seed = (working_set.seed + i) if working_set.seed is not None else None
+                        tokens = tokenizer.generate_dummy_tokens(working_set.rounded_context_size, seed=prompt_seed, prompt_number=i)
+                        working_set.prompts.append(tokens)
+                    logger.info(f"  Generated {len(working_set.prompts)} initial prompts")
+                else:
+                    # Adaptive mode: generate all prompts for this working set size
+                    working_set.generate_prompts()
+
+                # Initialize working set with API (pre-warm cache) - only initial prompts for sustained
                 if config.reinit_strategy == "once" or config.reinit_strategy == "per_working_set":
                     await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
 
-                # Run the working set size test
+                # Run the working set size test - route to appropriate mode
                 try:
-                    detailed_metrics, aggregated, phase_metadata_list = await run_working_set_size_test(
-                        config=config,
-                        api_client=api_client,
-                        working_set=working_set,
-                        tokenizer=tokenizer,
-                        context_size=context_size,
-                        working_set_size=working_set_size,
-                        cache_hit_rate=cache_hit_rate,
-                        model=model,
-                        previous_peak=previous_peak_concurrency
-                    )
+                    if config.mode == "sustained":
+                        # Run continuous/sustained mode
+                        period_metrics = await run_continuous_mode(
+                            config=config,
+                            api_client=api_client,
+                            working_set=working_set,
+                            tokenizer=tokenizer,
+                            context_size=context_size,
+                            working_set_size=working_set_size,
+                            cache_hit_rate=cache_hit_rate,
+                            model=model
+                        )
 
-                    # Save results
-                    all_detailed_results.extend(detailed_metrics)
-                    all_aggregated_results.append(aggregated)
+                        # Save sustained mode results
+                        if period_metrics:
+                            save_continuous_results(period_metrics, config.output_dir, context_size, working_set_size, cache_hit_rate)
 
-                    # Update previous peak for next working set size
-                    previous_peak_concurrency = aggregated.peak_concurrency
+                        # Mark as completed
+                        progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
 
-                    # Mark as completed
-                    progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
+                    else:  # adaptive mode
+                        detailed_metrics, aggregated, phase_metadata_list = await run_working_set_size_test(
+                            config=config,
+                            api_client=api_client,
+                            working_set=working_set,
+                            tokenizer=tokenizer,
+                            context_size=context_size,
+                            working_set_size=working_set_size,
+                            cache_hit_rate=cache_hit_rate,
+                            model=model,
+                            previous_peak=previous_peak_concurrency
+                        )
 
-                    # Write incremental results
-                    save_detailed_results(all_detailed_results, config.output_dir, context_size)
-                    save_aggregated_results(all_aggregated_results, config.output_dir)
-                    save_phase_metadata(phase_metadata_list, config.output_dir)
+                        # Save results
+                        all_detailed_results.extend(detailed_metrics)
+                        all_aggregated_results.append(aggregated)
 
-                    # Generate ramp graph for this test
-                    if not config.skip_graphs:
-                        generate_ramp_graph(detailed_metrics, context_size, working_set_size, cache_hit_rate,
-                                           config.max_ttft, aggregated.peak_concurrency, config.output_dir)
+                        # Update previous peak for next working set size
+                        previous_peak_concurrency = aggregated.peak_concurrency
 
-                    logger.info(f"{Colors.SUCCESS}    ✓ Working set size {working_set_size:,} complete{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Peak concurrency: {aggregated.peak_concurrency}{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Avg ITL: {aggregated.avg_itl*1000:.2f}ms{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Avg output tok/s per req: {aggregated.avg_output_tokens:.1f}{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Input: {aggregated.input_tokens_per_sec:.1f} tok/s{Colors.ENDC}")
-                    logger.info(f"{Colors.METRIC}      Output: {aggregated.output_tokens_per_sec:.1f} tok/s{Colors.ENDC}")
+                        # Mark as completed
+                        progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
+
+                        # Write incremental results
+                        save_detailed_results(all_detailed_results, config.output_dir, context_size)
+                        save_aggregated_results(all_aggregated_results, config.output_dir)
+                        save_phase_metadata(phase_metadata_list, config.output_dir)
+
+                        # Generate ramp graph for this test
+                        if not config.skip_graphs:
+                            generate_ramp_graph(detailed_metrics, context_size, working_set_size, cache_hit_rate,
+                                               config.max_ttft, aggregated.peak_concurrency, config.output_dir)
+
+                        logger.info(f"{Colors.SUCCESS}    ✓ Working set size {working_set_size:,} complete{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Peak concurrency: {aggregated.peak_concurrency}{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Avg ITL: {aggregated.avg_itl*1000:.2f}ms{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Avg output tok/s per req: {aggregated.avg_output_tokens:.1f}{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Input: {aggregated.input_tokens_per_sec:.1f} tok/s{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Output: {aggregated.output_tokens_per_sec:.1f} tok/s{Colors.ENDC}")
 
                 except Exception as e:
                     logger.error(f"    ✗ Working set size {working_set_size:,} failed: {e}")
