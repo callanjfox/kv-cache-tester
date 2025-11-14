@@ -24,6 +24,8 @@ output/
 # Local configuration (contains machine-specific paths)
 config.yaml
 config.local.yaml
+launcher/config.yaml
+launcher/config.local.yaml
 .env
 
 # OS

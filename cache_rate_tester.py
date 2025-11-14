@@ -2940,7 +2940,7 @@ def save_run_command(args: argparse.Namespace, output_dir: str):
         command_parts.append(f"  --max-concurrency {args.max_concurrency}")
     # Only add cache-hit-rates if it's not the default
     default_rates = list(range(0, 101, 5))
-    if args.cache_hit_rates != default_rates:
+    if args.cache_hit_rates is not None and args.cache_hit_rates != default_rates:
         command_parts.append(f"  --cache-hit-rates {' '.join(map(str, args.cache_hit_rates))}")
     if args.skip_graphs:
         command_parts.append(f"  --skip-graphs")

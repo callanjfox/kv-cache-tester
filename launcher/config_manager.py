@@ -294,7 +294,7 @@ class ConfigManager:
         Returns:
             Expanded Path object
         """
-        # Map mode to config key
+        # Map mode to config key (replace hyphens with underscores)
         mode_key = mode.replace("-", "_")
         specific_dir = self.get_expanded_path(f"output.{mode_key}_dir")
         
@@ -302,9 +302,9 @@ class ConfigManager:
         if specific_dir:
             return specific_dir
         
-        # Otherwise, use base_dir/mode
+        # Otherwise, use base_dir/mode_with_underscores (e.g., single_prompt)
         base_dir = self.get_expanded_path("output.base_dir", "./results")
-        return base_dir / mode_key.replace("_", "-")
+        return base_dir / mode_key
     
     def to_dict(self) -> Dict:
         """Return the full configuration as a dictionary"""
