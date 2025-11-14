@@ -327,12 +327,23 @@ def generate_index_html(output_dir: str, version: str = "1.0"):
     <div class="card">
 """
 
-    # Group ramp analysis graphs by context size
+    # Group ramp and continuous analysis graphs by context size
     ramp_graphs_by_context = {}
+    continuous_graphs_by_context = {}
     comparison_graphs = []
 
     for graph_name in sorted(graph_files.keys()):
-        if 'ramp_' in graph_name:
+        if 'sustained_ctx' in graph_name:
+            # Handle continuous mode graphs: sustained_ctx{context}_cache{cache}.html
+            parts = graph_name.replace('sustained_ctx', '').replace('.html', '')
+            ctx, cache = parts.split('_cache')
+            if ctx not in continuous_graphs_by_context:
+                continuous_graphs_by_context[ctx] = []
+            continuous_graphs_by_context[ctx].append((f"Cache:{cache}", graph_name))
+        elif 'continuous_comparison' in graph_name:
+            # Handle continuous comparison graphs (add to comparison section)
+            comparison_graphs.append(graph_name)
+        elif 'ramp_' in graph_name:
             # Handle both naming schemes:
             # cache_rate_tester: ramp_ctx{context}_cache{cache}.html
             # working_set_tester: ramp_ctx{context}_ws{working_set}_cache{cache}.html
@@ -447,6 +458,31 @@ def generate_index_html(output_dir: str, version: str = "1.0"):
                 <a href="{graph_name}" class="graph-link" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); margin: 5px 0;">
                     <h4 style="margin: 0;">{label}</h4>
                     <p style="margin: 5px 0 0 0;">Throughput and TTFT vs concurrency level</p>
+                </a>
+"""
+            html_content += """
+            </div>
+        </details>
+"""
+
+    # Add grouped continuous mode analysis
+    if continuous_graphs_by_context:
+        html_content += """
+        <h3 style="margin-top: 30px; color: #34495e;">Sustained Mode Performance Over Time by Context Size</h3>
+"""
+        for ctx in sorted(continuous_graphs_by_context.keys(), key=lambda x: int(x)):
+            html_content += f"""
+        <details style="margin: 15px 0;">
+            <summary style="cursor: pointer; padding: 10px; background: #e8f5e9; border-radius: 5px; font-weight: bold;">
+                📊 Context: {ctx} tokens ({len(continuous_graphs_by_context[ctx])} tests)
+            </summary>
+            <div style="padding: 10px 0; padding-left: 20px;">
+"""
+            for label, graph_name in sorted(continuous_graphs_by_context[ctx]):
+                html_content += f"""
+                <a href="{graph_name}" class="graph-link" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); margin: 5px 0;">
+                    <h4 style="margin: 0;">{label}</h4>
+                    <p style="margin: 5px 0 0 0;">Performance evolution with adaptive concurrency adjustment</p>
                 </a>
 """
             html_content += """

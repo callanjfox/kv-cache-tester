@@ -233,12 +233,13 @@ python cache_rate_tester.py \
 ---
 
 ### working_set_tester.py
-**Purpose:** Test performance across varying working set sizes to understand memory tier transitions. Shows how throughput degrades as working set exceeds cache capacity.
+**Purpose:** Test performance across varying working set sizes to understand memory tier transitions. Shows how throughput degrades as working set exceeds cache capacity. Supports two modes: adaptive (default) and sustained.
 
 **What it does:**
-- Similar to cache_rate_tester.py but varies working set size instead of cache hit rate
+- **Adaptive Mode (default):** Tests multiple working set sizes sequentially with ramp-up/retry phases, similar to cache_rate_tester.py but varying working set size instead of cache hit rate
+- **Sustained Mode:** Single continuous test with dynamic working set growth during execution, enabling observation of cache tier effects (HBM → DRAM → SSD) over time
 - Useful for testing HBM → DRAM → SSD tier transitions
-- Can test multiple cache hit rates at each working set size
+- Can test multiple cache hit rates at each working set size (adaptive mode) or single rate (sustained mode)
 
 **Key Options:**
 **Required:**
@@ -248,13 +249,17 @@ python cache_rate_tester.py \
 - `--max-working-set-size`: Maximum working set in tokens (e.g., 5000000)
 - `--working-set-increments`: Number of size steps to test (e.g., 10)
 
+**Mode Selection:**
+- `--mode`: Test mode - `adaptive` (default) or `sustained`
+- `--assessment-period`: Seconds between assessments in sustained mode (default: 30)
+
 **Cache Behavior:**
 - `--cache-hit-rates`: Rates to test (default: [100])
 
 **Other options:** Similar to cache_rate_tester.py (TTFT, concurrency, output, etc.)
 
 **Special Options:**
-- `--ensure-working-set-coverage`: Guarantees working_set_size worth of input tokens sent (overrides --ramp-duration)
+- `--ensure-working-set-coverage`: Guarantees working_set_size worth of input tokens sent (overrides --ramp-duration, adaptive mode only)
 **Example Usage:**
 ```bash
 
@@ -277,7 +282,7 @@ python working_set_tester.py \
 --cache-hit-rates 0 50 100 \
 --output-dir multi_tier_test
 
-# Ensure full working set coverage
+# Ensure full working set coverage (adaptive mode)
 python working_set_tester.py \
 --api-endpoint http://localhost:8000 \
 --context-sizes 30000 \
@@ -287,11 +292,26 @@ python working_set_tester.py \
 --ensure-working-set-coverage \
 --output-dir coverage_test
 
+# Sustained mode: single test with dynamic growth
+python working_set_tester.py \
+--api-endpoint http://localhost:8000 \
+--context-sizes 10000 \
+--min-working-set-size 100000 \
+--max-working-set-size 2000000 \
+--working-set-increments 4 \
+--cache-hit-rates 90 \
+--mode sustained \
+--assessment-period 30 \
+--test-duration 600 \
+--max-ttft 5.0 \
+--output-dir sustained_test
+
 ```
 
 
 **Output:**
 
+**Adaptive Mode:**
 - `performance_vs_working_set_{context}.html`: Main graphs per context
 - `output_throughput_comparison.html`: Cross-context comparison
 - `output_metrics_comparison.html`: ITL and generation metrics
@@ -299,6 +319,11 @@ python working_set_tester.py \
 - `detailed_results_*.csv`: Per-request data
 - `phase_metadata_*.csv`: Timing data
 - `index.html`: Dashboard
+
+**Sustained Mode:**
+- `sustained_periods_ctx{context}_ws{ws_size}_cache{rate}_{timestamp}.csv`: Period-by-period metrics
+- `detailed_results_{context}_{timestamp}.csv`: Per-request data
+- (Note: Automatic graph generation not yet implemented for sustained mode)
 
   
 
