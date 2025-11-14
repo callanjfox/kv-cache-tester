@@ -1,0 +1,91 @@
+# KV Cache Tester Configuration Example
+# 
+# Copy this file to config.yaml or config.local.yaml and customize for your environment.
+# This example file contains generic defaults - you MUST customize paths for your setup.
+#
+# You can override these values with:
+# 1. Environment variables (KVTEST_*)
+# 2. Command-line arguments
+# 3. A local config file (config.yaml or config.local.yaml)
+
+# Output directories
+# IMPORTANT: Customize these paths for your environment
+output:
+  # Base directory for all results (REQUIRED - set to your preferred location)
+  base_dir: "./results"
+  # Subdirectories for each test type (optional, will be created under base_dir)
+  single_prompt_dir: null  # defaults to ${base_dir}/single_prompt
+  cache_rate_dir: null      # defaults to ${base_dir}/cache_rate
+  working_set_dir: null     # defaults to ${base_dir}/working_set
+  # Directory for server debug logs (null = disabled)
+  debug_logs_dir: null
+
+# Virtual environment paths
+# IMPORTANT: Set these to your actual venv locations
+venvs:
+  dynamo: null   # e.g., "/home/user/dynamo/venv" or "~/dynamo/venv"
+  lmcache: null  # e.g., "/home/user/lmcache/.venv" or "~/lmcache/.venv"
+
+# Cache paths and sizes
+cache:
+  # Dynamo cache configuration
+  dynamo:
+    cpu_cache_gb: 100
+    disk_cache_gb: 100
+  
+  # LMCache configuration
+  lmcache:
+    chunk_size: 256
+    weka_path: null          # e.g., "/mnt/weka/cache" - set if using WEKA/GDS
+    cufile_env_path: null    # e.g., "/path/to/cufile.json" - set if using GDS
+
+# Model and HuggingFace configuration
+model:
+  hf_home: null              # e.g., "/mnt/weka/hf_cache" or "~/.cache/huggingface"
+  default_model: "Qwen/Qwen2.5-7B"
+  
+# Server configuration
+server:
+  default_port: 8002
+  gpu_memory_utilization: 0.80
+  tensor_parallel_size: 1
+  startup_timeout: 600
+  shutdown_delay: 10
+
+# Test configuration defaults
+testing:
+  # Single prompt tester defaults
+  single_prompt:
+    min_tokens: 1000
+    max_tokens: null  # Will use model max if not specified
+    output_tokens: 256
+    num_iterations: 5
+  
+  # Cache rate tester defaults
+  cache_rate:
+    input_tokens: 32768
+    output_tokens: 256
+    num_iterations: 10
+    cache_hit_rates: [0, 25, 50, 75, 100]  # Increase granularity as needed
+  
+  # Working set tester defaults
+  working_set:
+    cache_hit_rate: 50
+    min_working_set_gb: 1
+    max_working_set_gb: 100
+    step_gb: 10
+    input_tokens: 32768
+    output_tokens: 256
+    num_iterations: 5
+
+# Backend configurations to test
+# You can enable/disable backends here or with --configs CLI flag
+backends:
+  enabled:
+    - dynamo-cpu
+    - dynamo-weka
+    - lmcache-dram
+    - lmcache-weka
+    - lmcache-nixl
+    - vanilla-nep
+    - vanilla-pc

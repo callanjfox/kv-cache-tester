@@ -21,6 +21,11 @@ ENV/
 output/
 *.log
 
+# Local configuration (contains machine-specific paths)
+config.yaml
+config.local.yaml
+.env
+
 # OS
 .DS_Store
 Thumbs.db
