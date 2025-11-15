@@ -2601,6 +2601,15 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
 
     df = pd.read_csv(csv_path)
 
+    # Calculate summary statistics for annotation
+    total_input_tokens = df['total_input_tokens'].sum()
+    total_output_tokens = df['total_output_tokens'].sum()
+    avg_input_tps = df['input_tokens_per_sec'].mean()
+    avg_output_tps = df['output_tokens_per_sec'].mean()
+    avg_ttft = df['avg_ttft'].mean()
+    avg_output_per_req = df['avg_output_tokens_per_request'].mean()
+    total_requests = df['num_requests_completed'].sum()
+
     # Create figure with multiple subplots
     fig = make_subplots(
         rows=6, cols=1,
@@ -2693,11 +2702,43 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
     fig.update_yaxes(title_text="Tokens/sec", row=5, col=1)
     fig.update_yaxes(title_text="Tokens", row=6, col=1)
 
+    # Create statistics summary text
+    stats_text = (
+        f"<b>Summary Statistics:</b><br>"
+        f"Total Input Tokens: {total_input_tokens:,} | "
+        f"Total Output Tokens: {total_output_tokens:,} | "
+        f"Total Requests: {total_requests:,}<br>"
+        f"Avg Input: {avg_input_tps:,.0f} tok/s | "
+        f"Avg Output: {avg_output_tps:,.0f} tok/s | "
+        f"Avg TTFT: {avg_ttft:.3f}s | "
+        f"Avg Tokens/Req: {avg_output_per_req:.1f} tok/s"
+    )
+
     # Update layout
     fig.update_layout(
-        height=1600,  # Increased height for 6 subplots
+        height=1700,  # Increased height for stats annotation
         showlegend=True,
-        title_text=f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%"
+        title={
+            'text': f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%",
+            'y': 0.99,
+            'x': 0.5,
+            'xanchor': 'center',
+            'yanchor': 'top'
+        },
+        annotations=[
+            dict(
+                text=stats_text,
+                xref="paper", yref="paper",
+                x=0.5, y=0.97,
+                xanchor='center', yanchor='top',
+                showarrow=False,
+                font=dict(size=12),
+                bgcolor="rgba(255, 255, 255, 0.9)",
+                bordercolor="rgba(0, 0, 0, 0.2)",
+                borderwidth=1,
+                borderpad=10
+            )
+        ]
     )
 
     # Save graph
