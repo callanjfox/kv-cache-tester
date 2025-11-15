@@ -2741,9 +2741,22 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
         ]
     )
 
-    # Save graph
+    # Save graph with timestamp from CSV filename
     output_path = Path(output_dir)
-    graph_filename = output_path / f"sustained_performance_ctx{context_size}_cache{cache_hit_rate}.html"
+    # Extract timestamp from CSV filename (e.g., sustained_periods_ctx30000_ws5000000_cache95_20251114_191042.csv)
+    # Timestamp is the last two parts: date_time
+    parts = csv_path.stem.split('_')
+    if len(parts) >= 2 and parts[-1].isdigit() and parts[-2].isdigit():
+        # Has full timestamp: YYYYMMDD_HHMMSS
+        timestamp = f"{parts[-2]}_{parts[-1]}"
+    elif len(parts) >= 1 and parts[-1].isdigit():
+        # Has only time part
+        timestamp = parts[-1]
+    else:
+        # No timestamp, generate one
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    graph_filename = output_path / f"sustained_performance_ctx{context_size}_cache{cache_hit_rate}_{timestamp}.html"
     fig.write_html(str(graph_filename))
     logger.info(f"Generated sustained mode graph: {graph_filename}")
 
@@ -2753,9 +2766,25 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
 def generate_sustained_index_html(csv_path: Path, output_dir: str, context_size: int,
                                   working_set_size: int, cache_hit_rate: int, config: TestConfig):
     """Generate index.html dashboard for sustained mode results"""
+    output_path = Path(output_dir)
+
+    # Find all sustained periods CSV files for this context size
+    all_csv_files = sorted(output_path.glob(f"sustained_periods_ctx{context_size}_*.csv"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # Find all sustained performance graphs (with timestamps)
+    all_graph_files = sorted(output_path.glob(f"sustained_performance_ctx{context_size}_cache*_*.html"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # Also include graphs without timestamps (legacy format) for backward compatibility
+    legacy_graphs = list(output_path.glob(f"sustained_performance_ctx{context_size}_cache*.html"))
+    legacy_graphs = [g for g in legacy_graphs if g not in all_graph_files]  # Avoid duplicates
+    all_graph_files.extend(sorted(legacy_graphs, key=lambda p: p.stat().st_mtime, reverse=True))
+
+    # Use the most recent CSV for summary stats (the one we just generated)
     df = pd.read_csv(csv_path)
 
-    # Calculate summary statistics
+    # Calculate summary statistics from most recent run
     total_periods = len(df)
     total_duration = df['duration'].sum() / 60  # minutes
     peak_input_tps = df['input_tokens_per_sec'].max()
@@ -2771,6 +2800,48 @@ def generate_sustained_index_html(csv_path: Path, output_dir: str, context_size:
     # Count decisions
     ramp_ups = len(df[df['decision'].str.contains('RAMP_UP', na=False)])
     ramp_downs = len(df[df['decision'].str.contains('RAMP_DOWN', na=False)])
+
+    # Build visualizations list
+    graphs_html = ""
+    if not all_graph_files:
+        graphs_html = '    <p>No performance graphs found.</p>\n'
+    else:
+        for i, graph_file in enumerate(all_graph_files):
+            # Extract info from filename (format: sustained_performance_ctx30000_cache95_20251114_191042.html)
+            stem = graph_file.stem  # e.g., sustained_performance_ctx30000_cache95_191042
+
+            # Extract cache rate
+            if 'cache' in stem:
+                cache_part = stem.split('cache')[1]  # e.g., 95_191042 or 95
+                cache_rate = cache_part.split('_')[0]  # e.g., 95
+            else:
+                cache_rate = "?"
+
+            # Check if has timestamp (last part is numeric and looks like HHMMSS)
+            parts = stem.split('_')
+            if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) == 6:
+                # Has timestamp: YYYYMMDD_HHMMSS format
+                date_part = parts[-2]
+                time_part = parts[-1]
+                # Format timestamp nicely: YYYY-MM-DD HH:MM:SS
+                timestamp_str = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} {time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                graphs_html += f'    <a href="{graph_file.name}" class="graph-link">📊 Cache {cache_rate}% - {timestamp_str}</a>\n'
+            else:
+                # No timestamp (legacy format or just cache rate)
+                graphs_html += f'    <a href="{graph_file.name}" class="graph-link">📊 Cache {cache_rate}%</a>\n'
+
+    # Build CSV files list
+    csv_list_html = ""
+    for csv_file in all_csv_files:
+        timestamp_str = csv_file.stem.split('_')[-1] if '_' in csv_file.stem else csv_file.name
+        csv_list_html += f'        <li><a href="{csv_file.name}">Sustained Periods CSV - {timestamp_str}</a></li>\n'
+
+    # Find detailed results CSV files
+    detailed_csv_files = sorted(output_path.glob(f"detailed_results_{context_size}_*.csv"),
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+    for detailed_file in detailed_csv_files:
+        timestamp_str = detailed_file.stem.split('_')[-1] if '_' in detailed_file.stem else detailed_file.name
+        csv_list_html += f'        <li><a href="{detailed_file.name}">Detailed Results CSV - {timestamp_str}</a></li>\n'
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -2910,9 +2981,9 @@ def generate_sustained_index_html(csv_path: Path, output_dir: str, context_size:
     </div>
 
     <h2>Visualizations</h2>
-    <a href="sustained_performance_ctx{context_size}_cache{cache_hit_rate}.html" class="graph-link">📊 View Performance Graphs</a>
+{graphs_html}
 
-    <h2>Test Configuration</h2>
+    <h2>Test Configuration (Most Recent Run)</h2>
     <div class="config-section">
         <div class="config-grid">
             <div class="config-item"><strong>Context Size:</strong> {context_size:,} tokens</div>
@@ -2927,11 +2998,10 @@ def generate_sustained_index_html(csv_path: Path, output_dir: str, context_size:
         </div>
     </div>
 
-    <h2>Data Files</h2>
+    <h2>Data Files (All Runs)</h2>
     <div class="config-section">
         <ul>
-            <li><a href="{csv_path.name}">Sustained Periods CSV</a></li>
-            <li><a href="detailed_results_{context_size}_{csv_path.stem.split('_')[-1]}.csv">Detailed Results CSV</a></li>
+{csv_list_html}
         </ul>
     </div>
 </body>
