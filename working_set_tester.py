@@ -2585,79 +2585,99 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
 
     # Create figure with multiple subplots
     fig = make_subplots(
-        rows=4, cols=1,
+        rows=6, cols=1,
         subplot_titles=(
-            f'Throughput Over Time (Context: {context_size:,}, Cache Rate: {cache_hit_rate}%)',
+            f'Input Throughput (Context: {context_size:,}, Cache Rate: {cache_hit_rate}%)',
+            'Output Throughput',
             'Concurrency Level Adjustments',
             'TTFT Metrics',
+            'Output Tokens per Request',
             'Working Set Size Growth'
         ),
-        vertical_spacing=0.08
+        vertical_spacing=0.06
     )
 
     # Calculate time in minutes from start
     df['time_min'] = (df['end_time'] - df['start_time'].iloc[0]) / 60
 
-    # Row 1: Throughput
+    # Row 1: Input Throughput
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['input_tokens_per_sec'],
                   mode='lines+markers', name='Input tok/s',
                   line=dict(color='blue')),
         row=1, col=1
     )
+
+    # Row 2: Output Throughput
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['output_tokens_per_sec'],
                   mode='lines+markers', name='Output tok/s',
                   line=dict(color='green')),
-        row=1, col=1
+        row=2, col=1
     )
 
-    # Row 2: Concurrency
+    # Row 3: Concurrency
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['concurrency_level'],
                   mode='lines+markers', name='Concurrency',
                   line=dict(color='purple')),
-        row=2, col=1
+        row=3, col=1
     )
 
-    # Row 3: TTFT
+    # Row 4: TTFT
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['avg_ttft'],
                   mode='lines+markers', name='Avg TTFT',
                   line=dict(color='orange')),
-        row=3, col=1
+        row=4, col=1
     )
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['p95_ttft'],
                   mode='lines+markers', name='P95 TTFT',
                   line=dict(color='red')),
-        row=3, col=1
+        row=4, col=1
     )
 
     # Add max TTFT threshold line if configured
     if config.max_ttft:
         fig.add_hline(y=config.max_ttft, line_dash="dash", line_color="red",
                      annotation_text=f"Max TTFT Threshold ({config.max_ttft}s)",
-                     row=3, col=1)
+                     row=4, col=1)
 
-    # Row 4: Working Set Size
+    # Row 5: Output Tokens per Request
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['avg_output_tokens_per_request'],
+                  mode='lines+markers', name='Avg Tokens/Req',
+                  line=dict(color='teal')),
+        row=5, col=1
+    )
+
+    # Add min tokens per request threshold line if configured
+    if config.min_tokens_per_req:
+        fig.add_hline(y=config.min_tokens_per_req, line_dash="dash", line_color="red",
+                     annotation_text=f"Min Threshold ({config.min_tokens_per_req} tok/s)",
+                     row=5, col=1)
+
+    # Row 6: Working Set Size
     fig.add_trace(
         go.Scatter(x=df['time_min'], y=df['working_set_size'],
                   mode='lines+markers', name='Working Set Size',
                   line=dict(color='brown'), fill='tozeroy'),
-        row=4, col=1
+        row=6, col=1
     )
 
     # Update axes labels
-    fig.update_xaxes(title_text="Time (minutes)", row=4, col=1)
+    fig.update_xaxes(title_text="Time (minutes)", row=6, col=1)
     fig.update_yaxes(title_text="Tokens/sec", row=1, col=1)
-    fig.update_yaxes(title_text="Concurrency", row=2, col=1)
-    fig.update_yaxes(title_text="Seconds", row=3, col=1)
-    fig.update_yaxes(title_text="Tokens", row=4, col=1)
+    fig.update_yaxes(title_text="Tokens/sec", row=2, col=1)
+    fig.update_yaxes(title_text="Concurrency", row=3, col=1)
+    fig.update_yaxes(title_text="Seconds", row=4, col=1)
+    fig.update_yaxes(title_text="Tokens/sec", row=5, col=1)
+    fig.update_yaxes(title_text="Tokens", row=6, col=1)
 
     # Update layout
     fig.update_layout(
-        height=1200,
+        height=1600,  # Increased height for 6 subplots
         showlegend=True,
         title_text=f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%"
     )
