@@ -61,23 +61,64 @@ class Colors:
 
 
 # Question bank to ensure long responses from the model
-# These questions are designed to prompt the model to generate lengthy responses
+# These questions are designed to prompt the model to generate lengthy, detailed responses
+# Focus on technical, coding-related topics that encourage comprehensive answers
 QUESTION_BANK = [
-    "Can you tell me a very long story with a happy ending?",
-    "Please write a detailed explanation of how computers work, including all the technical details you can think of.",
-    "Can you describe in great detail what you would do if you had a whole day free?",
-    "Please write a comprehensive guide on how to learn a new language from scratch.",
-    "Can you tell me an elaborate story about a journey through space?",
-    "Please explain in detail the history of human civilization from ancient times to today.",
-    "Can you write a long story about friendship and adventure?",
-    "Please describe in detail how you would plan the perfect vacation.",
-    "Can you tell me everything you know about the ocean and marine life?",
-    "Please write a detailed story about overcoming challenges and achieving success.",
-    "Can you explain in great detail how the human body works?",
-    "Please tell me a long and interesting story about time travel.",
-    "Can you describe in detail what life might be like 100 years from now?",
-    "Please write a comprehensive explanation of how weather works.",
-    "Can you tell me a very detailed story about exploring a mysterious island?",
+    # Algorithm analysis and explanations
+    "Please provide a comprehensive analysis of the QuickSort algorithm, including its implementation in Python, time complexity analysis, space complexity, best/worst/average cases, optimizations like 3-way partitioning, comparison with other sorting algorithms, and real-world applications. Include detailed code examples and explain each step thoroughly.",
+
+    "Explain in detail how hash tables work, including collision resolution strategies (chaining vs open addressing), load factor management, resizing mechanisms, hash function design principles, performance characteristics, and implementation details. Provide code examples demonstrating a complete hash table implementation from scratch.",
+
+    "Write a detailed tutorial on implementing a binary search tree, including insertion, deletion, searching, tree traversal algorithms (inorder, preorder, postorder, level-order), balancing concepts, and how self-balancing trees like AVL and Red-Black trees improve performance. Include complete code implementations with explanations.",
+
+    "Provide an in-depth explanation of dynamic programming, including the principles of optimal substructure and overlapping subproblems. Explain memoization vs tabulation approaches, and walk through detailed solutions to classic problems like longest common subsequence, knapsack problem, edit distance, and matrix chain multiplication with code and complexity analysis.",
+
+    "Explain comprehensively how graph algorithms work, including depth-first search, breadth-first search, Dijkstra's shortest path, Bellman-Ford, Floyd-Warshall, minimum spanning trees (Kruskal's and Prim's algorithms), and topological sorting. Provide implementations and discuss time/space complexity for each.",
+
+    # System design and architecture
+    "Design a detailed architecture for a distributed caching system like Redis or Memcached. Explain data partitioning strategies, replication mechanisms, consistency models, eviction policies, persistence options, client-server protocol design, and how to handle network partitions. Include detailed diagrams and code examples.",
+
+    "Explain in comprehensive detail how a modern web browser works, from parsing HTML/CSS/JavaScript to rendering the page. Cover the rendering engine, JavaScript engine, networking layer, security sandbox, memory management, and optimization techniques. Discuss how browsers handle concurrency and asynchronous operations.",
+
+    "Provide a detailed explanation of how database indexing works, including B-tree and B+tree structures, clustered vs non-clustered indexes, covering indexes, index selectivity, query optimization, index maintenance overhead, and when to use different index types. Include examples of creating and using indexes effectively.",
+
+    "Explain comprehensively how a garbage collector works in modern programming languages. Cover mark-and-sweep, generational collection, reference counting, tri-color marking, concurrent and parallel collection strategies, write barriers, and tuning parameters. Compare different GC implementations (Java, Python, Go).",
+
+    # Coding stories and scenarios
+    "Write a detailed story about a team of engineers debugging a critical production issue in a distributed system. Include their investigation process, the tools they used, how they traced the problem through multiple services, the root cause analysis, and the fix they implemented. Make it technically detailed with realistic debugging scenarios.",
+
+    "Tell an elaborate story about designing and implementing a real-time collaborative code editor like Google Docs but for programming. Explain the technical challenges of operational transformation or CRDTs, conflict resolution, presence awareness, syntax highlighting synchronization, and how the system handles network latency and disconnections.",
+
+    "Describe in detail the journey of building a high-performance API service from scratch, including choosing the tech stack, implementing rate limiting, caching strategies, database optimization, load balancing, monitoring and observability, CI/CD pipeline, and scaling from 100 to 10 million requests per day. Include code examples and architectural decisions.",
+
+    # Deep technical explanations
+    "Provide a comprehensive explanation of how modern CPUs execute instructions, including the instruction pipeline, branch prediction, speculative execution, out-of-order execution, register renaming, cache hierarchies (L1/L2/L3), memory barriers, and SIMD instructions. Explain how these concepts affect code performance.",
+
+    "Explain in detail how TCP/IP networking works, from the physical layer up through application protocols. Cover packet structure, three-way handshake, flow control, congestion control, sliding window protocol, retransmission strategies, and how modern optimizations like BBR congestion control improve performance.",
+
+    "Provide a detailed analysis of how compilers work, from lexical analysis and parsing through code generation and optimization. Explain the different phases, intermediate representations, optimization passes, register allocation, instruction selection, and how modern JIT compilers achieve high performance.",
+
+    "Explain comprehensively how modern machine learning inference works, including model architectures (transformers, CNNs), quantization techniques, batching strategies, KV-cache optimization for autoregressive generation, attention mechanisms, and hardware acceleration using GPUs and specialized chips.",
+
+    # Complex problem-solving
+    "Walk through a detailed solution to designing a URL shortening service like bit.ly at scale. Cover the hashing strategy, database schema, handling collisions, custom short URLs, analytics tracking, rate limiting, geographic distribution, caching, and how to handle billions of URLs with low latency.",
+
+    "Explain in detail how to implement a thread-safe LRU cache from scratch, including the data structures needed (hash map + doubly linked list), synchronization mechanisms, lock-free alternatives using atomic operations, memory management considerations, and performance optimization techniques. Include complete code with explanations.",
+
+    "Provide a comprehensive guide to implementing a search engine, covering web crawling strategies, inverted index construction, ranking algorithms (TF-IDF, PageRank), query processing, autocomplete, distributed searching, and scaling to billions of documents. Include detailed explanations of each component.",
+
+    "Explain how to build a real-time streaming data pipeline, covering message queue systems (Kafka, RabbitMQ), stream processing frameworks (Flink, Spark Streaming), windowing operations, state management, exactly-once semantics, backpressure handling, and monitoring. Include architecture diagrams and code examples.",
+
+    # Additional variety
+    "Write a detailed technical post-mortem of a hypothetical large-scale outage, explaining the cascade failure, how monitoring detected it, the incident response process, communication strategies, mitigation steps, root cause analysis, and the long-term architectural changes implemented to prevent recurrence.",
+
+    "Explain comprehensively how version control systems like Git work internally, including the object model (blobs, trees, commits), DAG structure, merging strategies, rebasing, conflict resolution, pack files, and distributed workflows. Discuss advanced topics like bisect, cherry-pick, and submodules.",
+
+    "Provide an in-depth explanation of how container orchestration systems like Kubernetes work, covering pods, services, deployments, scheduling algorithms, resource management, networking (CNI), storage (CSI), service mesh integration, and autoscaling mechanisms. Include practical deployment scenarios.",
+
+    "Explain in detail how modern databases achieve ACID properties, covering transaction isolation levels, two-phase locking, multi-version concurrency control (MVCC), write-ahead logging, recovery mechanisms, and distributed transaction protocols like 2PC and Paxos/Raft for consensus.",
+
+    "Write a comprehensive guide to optimizing Python code performance, covering profiling tools, algorithmic improvements, data structure selection, vectorization with NumPy, using Cython or PyPy, async/await for I/O-bound tasks, multiprocessing for CPU-bound work, and memory optimization techniques. Include before/after code examples.",
 ]
 
 
@@ -231,6 +272,7 @@ class TestConfig:
     strict_time_window: bool = False  # Only include requests completed within duration window
     mode: str = "adaptive"  # "adaptive" or "sustained"
     assessment_period: int = 30  # For sustained mode: duration of each assessment period
+    min_tokens_per_req: Optional[float] = None  # Minimum average output tokens/s per request threshold
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -738,6 +780,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ttft-metric", type=str, default="p95",
                        choices=["max", "avg", "p95"],
                        help="TTFT metric to use for threshold: max (maximum), avg (average), p95 (95th percentile). Default: p95")
+    parser.add_argument("--min-tokens-per-req", type=float, default=None,
+                       help="Minimum average output tokens/s per request (e.g., 30). Optional if --max-ttft is specified. "
+                            "Ensures good generation speed per request for user experience. "
+                            "Concurrency level is rejected if average output tokens/s per request falls below this value.")
     parser.add_argument("--output-dir", type=str, default="./output",
                        help="Output directory (default: ./output)")
     parser.add_argument("--tokenizer", type=str,
@@ -814,6 +860,10 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
     if args.test_duration < args.ramp_duration:
         raise ValueError(f"test-duration ({args.test_duration}) should be >= ramp-duration ({args.ramp_duration})")
 
+    # Validate min_tokens_per_req
+    if args.min_tokens_per_req is not None and args.min_tokens_per_req <= 0:
+        raise ValueError(f"--min-tokens-per-req must be > 0 (got {args.min_tokens_per_req})")
+
     # Generate working set sizes (linear interpolation)
     min_size = args.min_working_set_size
     max_size = args.max_working_set_size
@@ -861,7 +911,8 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         kv_cache_bytes=args.kv_cache_quantization,
         strict_time_window=args.strict_time_window,
         mode=args.mode,
-        assessment_period=args.assessment_period
+        assessment_period=args.assessment_period,
+        min_tokens_per_req=args.min_tokens_per_req
     )
 
 
@@ -1305,6 +1356,19 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
             measured_ttft = p95_ttft
             metric_name = "P95 TTFT"
 
+        # Calculate output tokens per request (tokens/s per request)
+        tokens_per_req_values = []
+        for m in metrics_for_decision:
+            if m.generation_time > 0:
+                tokens_per_req = m.output_tokens / m.generation_time
+                tokens_per_req_values.append(tokens_per_req)
+
+        avg_tokens_per_req = np.mean(tokens_per_req_values) if tokens_per_req_values else 0
+
+        # Use average tokens per request (matching cache_rate_tester behavior)
+        measured_tokens_per_req = avg_tokens_per_req
+        tokens_metric_name = "Avg Tokens/Req"
+
         # Track this concurrency level's performance (store decision metrics for consistency)
         tested_concurrency_levels.append({
             'concurrency': current_concurrency,
@@ -1312,26 +1376,41 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
             'output_tps': output_tps,
             'measured_ttft': measured_ttft,
             'p95_ttft': p95_ttft,
+            'measured_tokens_per_req': measured_tokens_per_req,
             'metrics': metrics_for_decision  # Use filtered metrics if strict mode
         })
 
         logger.info(f"      Avg TTFT: {avg_ttft:.3f}s, P95 TTFT: {p95_ttft:.3f}s, Max TTFT: {max_ttft:.3f}s ({metric_name}: {measured_ttft:.3f}s)")
         logger.info(f"      Throughput: Input={input_tps:,.0f} tok/s, Output={output_tps:,.0f} tok/s")
+        if tokens_per_req_values:
+            logger.info(f"      {tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s")
 
-        if measured_ttft > config.max_ttft:
-            # TTFT threshold exceeded
-            ttft_overshoot = (measured_ttft - config.max_ttft) / config.max_ttft
+        # Check thresholds
+        ttft_exceeded = measured_ttft > config.max_ttft
+        tokens_per_req_exceeded = (config.min_tokens_per_req is not None) and (measured_tokens_per_req < config.min_tokens_per_req)
+
+        if ttft_exceeded or tokens_per_req_exceeded:
+            # Threshold exceeded
+            exceeded_reasons = []
+            if ttft_exceeded:
+                ttft_overshoot = (measured_ttft - config.max_ttft) / config.max_ttft
+                exceeded_reasons.append(f"{metric_name} {measured_ttft:.3f}s > {config.max_ttft}s (+{ttft_overshoot:.1%})")
+            if tokens_per_req_exceeded:
+                tokens_shortfall = (config.min_tokens_per_req - measured_tokens_per_req) / config.min_tokens_per_req
+                exceeded_reasons.append(f"{tokens_metric_name} {measured_tokens_per_req:.1f} tok/s < {config.min_tokens_per_req} tok/s (-{tokens_shortfall:.1%})")
 
             # Smart backoff if we exceeded on the first iteration at adaptive start
             if iteration_count == 1 and start_concurrency > config.start_concurrency:
-                # We started at previous peak but it's too high for this cache hit rate
+                # We started at previous peak but it's too high for this working set size
                 # Back off to midpoint between start_concurrency and current
                 backoff_concurrency = (config.start_concurrency + start_concurrency) // 2
                 # Round to nearest increment
                 backoff_concurrency = (backoff_concurrency // config.concurrency_increment) * config.concurrency_increment
                 backoff_concurrency = max(config.start_concurrency, backoff_concurrency)
 
-                logger.warning(f"      ⚠ TTFT threshold exceeded on first test at adaptive start!")
+                logger.warning(f"      ⚠ Threshold(s) exceeded on first test at adaptive start!")
+                for reason in exceeded_reasons:
+                    logger.warning(f"        - {reason}")
                 logger.warning(f"      Backing off from {start_concurrency} to {backoff_concurrency} and retrying...")
 
                 # Reset and try again from backoff point
@@ -1344,8 +1423,13 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
 
             # Warn if we still exceeded on the first iteration after backoff
             if iteration_count == 1:
-                logger.warning(f"      ⚠ TTFT threshold exceeded on first test!")
-                logger.warning(f"      Consider increasing --max-ttft (current: {config.max_ttft}s, observed: {max_ttft:.3f}s)")
+                logger.warning(f"      ⚠ Threshold(s) exceeded on first test!")
+                for reason in exceeded_reasons:
+                    logger.warning(f"        - {reason}")
+                if ttft_exceeded:
+                    logger.warning(f"      Consider increasing --max-ttft (current: {config.max_ttft}s, observed: {max_ttft:.3f}s)")
+                if tokens_per_req_exceeded:
+                    logger.warning(f"      Consider decreasing --min-tokens-per-req (current: {config.min_tokens_per_req} tok/s, observed: {measured_tokens_per_req:.1f} tok/s)")
                 peak_concurrency = current_concurrency
                 peak_metrics = metrics
                 break
@@ -1353,7 +1437,9 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
             # Do binary search refinement if there's a gap to refine
             gap = current_concurrency - last_good_concurrency
             if gap > config.concurrency_increment:
-                logger.info(f"      TTFT overshoot detected ({ttft_overshoot:.1%}), gap of {gap}. Refining with binary search...")
+                logger.info(f"      Threshold overshoot detected, gap of {gap}. Refining with binary search...")
+                for reason in exceeded_reasons:
+                    logger.info(f"        - {reason}")
 
                 # Binary search between last_good and current
                 low = last_good_concurrency
@@ -1432,6 +1518,14 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
                     refine_input_tps = sum(m.cached_tokens + m.unique_tokens for m in refine_metrics_for_decision) / refine_test_duration if refine_test_duration > 0 else 0
                     refine_output_tps = sum(m.output_tokens for m in refine_metrics_for_decision) / refine_test_duration if refine_test_duration > 0 else 0
 
+                    # Calculate average tokens per request metric for refinement (using filtered metrics if strict mode)
+                    refine_tokens_per_req_values = []
+                    for m in refine_metrics_for_decision:
+                        if m.generation_time > 0:
+                            refine_tokens_per_req_values.append(m.output_tokens / m.generation_time)
+
+                    refine_measured_tokens_per_req = np.mean(refine_tokens_per_req_values) if refine_tokens_per_req_values else 0
+
                     # Track this refinement level's performance (store decision metrics for consistency)
                     tested_concurrency_levels.append({
                         'concurrency': mid,
@@ -1439,21 +1533,28 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
                         'output_tps': refine_output_tps,
                         'measured_ttft': refine_measured_ttft,
                         'p95_ttft': refine_p95_ttft,
+                        'measured_tokens_per_req': refine_measured_tokens_per_req,
                         'metrics': refine_metrics_for_decision  # Use filtered metrics if strict mode
                     })
 
                     logger.info(f"        {metric_name}: {refine_measured_ttft:.3f}s, Input: {refine_input_tps:,.0f} tok/s")
+                    if refine_tokens_per_req_values:
+                        logger.info(f"        {tokens_metric_name}: {refine_measured_tokens_per_req:.1f} tok/s")
 
-                    if refine_measured_ttft <= config.max_ttft:
+                    # Check if this refinement level meets thresholds
+                    refine_ttft_exceeded = refine_measured_ttft > config.max_ttft
+                    refine_tokens_exceeded = (config.min_tokens_per_req is not None) and (refine_measured_tokens_per_req < config.min_tokens_per_req)
+
+                    if not refine_ttft_exceeded and not refine_tokens_exceeded:
                         # This level is good
                         low = mid
                         best_concurrency = mid
                         best_metrics = refine_metrics_for_decision  # Use filtered metrics if strict mode
-                        logger.info(f"        ✓ Under threshold, new lower bound: {low}")
+                        logger.info(f"        ✓ Under threshold(s), new lower bound: {low}")
                     else:
                         # Too high
                         high = mid
-                        logger.info(f"        ✗ Over threshold, new upper bound: {high}")
+                        logger.info(f"        ✗ Over threshold(s), new upper bound: {high}")
 
                 peak_concurrency = best_concurrency
                 peak_metrics = best_metrics
@@ -1499,8 +1600,10 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
         peak_concurrency = start_concurrency
         peak_metrics = []
     else:
-        # Filter to concurrency levels that passed TTFT threshold
-        passed_levels = [level for level in tested_concurrency_levels if level['measured_ttft'] <= config.max_ttft]
+        # Filter to concurrency levels that passed all thresholds
+        passed_levels = [level for level in tested_concurrency_levels
+                        if level['measured_ttft'] <= config.max_ttft and
+                        (config.min_tokens_per_req is None or level['measured_tokens_per_req'] >= config.min_tokens_per_req)]
 
         if len(passed_levels) > 0:
             # Select the one with highest input throughput
@@ -1508,31 +1611,45 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
             peak_concurrency = best_level['concurrency']
             peak_metrics = best_level['metrics']
 
-            logger.info(f"    ✓ Found {len(passed_levels)} concurrency levels under TTFT threshold")
+            logger.info(f"    ✓ Found {len(passed_levels)} concurrency levels passing all thresholds")
             logger.info(f"    Selected concurrency {peak_concurrency} with best throughput: {best_level['input_tps']:,.0f} input tok/s")
 
             # Show top 3 candidates for context
             sorted_passed = sorted(passed_levels, key=lambda x: x['input_tps'], reverse=True)
-            logger.info(f"    Top candidates under threshold:")
+            logger.info(f"    Top candidates passing thresholds:")
             for i, level in enumerate(sorted_passed[:3]):
                 marker = "→" if level['concurrency'] == peak_concurrency else " "
-                logger.info(f"      {marker} Conc {level['concurrency']}: {level['input_tps']:,.0f} tok/s (TTFT: {level['measured_ttft']:.3f}s)")
+                tokens_info = f", Tokens/Req: {level['measured_tokens_per_req']:.1f} tok/s" if config.min_tokens_per_req else ""
+                logger.info(f"      {marker} Conc {level['concurrency']}: {level['input_tps']:,.0f} tok/s (TTFT: {level['measured_ttft']:.3f}s{tokens_info})")
         else:
-            # No levels passed threshold - pick the one with lowest TTFT
-            best_level = min(tested_concurrency_levels, key=lambda x: x['measured_ttft'])
+            # No levels passed thresholds - use a scoring system to pick best compromise
+            # Score based on both TTFT and tokens_per_req violations
+            def score_level(level):
+                ttft_score = level['measured_ttft'] / config.max_ttft  # Lower is better
+                tokens_score = 1.0
+                if config.min_tokens_per_req is not None and config.min_tokens_per_req > 0:
+                    tokens_score = config.min_tokens_per_req / max(level['measured_tokens_per_req'], 1)  # Lower is better
+                return max(ttft_score, tokens_score)  # Use worst violation
+
+            best_level = min(tested_concurrency_levels, key=score_level)
             peak_concurrency = best_level['concurrency']
             peak_metrics = best_level['metrics']
 
-            logger.warning(f"    ⚠️  No concurrency levels passed TTFT threshold of {config.max_ttft}s!")
-            logger.warning(f"    Selecting concurrency {peak_concurrency} with lowest TTFT: {best_level['measured_ttft']:.3f}s")
-            logger.warning(f"    Consider increasing --max-ttft or reducing load")
+            logger.warning(f"    ⚠️  No concurrency levels passed all thresholds!")
+            if config.max_ttft and config.min_tokens_per_req:
+                logger.warning(f"      TTFT threshold: {config.max_ttft}s, Tokens/Req threshold: {config.min_tokens_per_req} tok/s")
+            logger.warning(f"    Selecting concurrency {peak_concurrency} with best compromise: TTFT {best_level['measured_ttft']:.3f}s")
+            if config.min_tokens_per_req:
+                logger.warning(f"      Tokens/Req: {best_level['measured_tokens_per_req']:.1f} tok/s")
+            logger.warning(f"    Consider adjusting thresholds or reducing load")
 
             # Show all tested levels for debugging
-            sorted_all = sorted(tested_concurrency_levels, key=lambda x: x['measured_ttft'])
-            logger.info(f"    All tested levels (by TTFT):")
+            sorted_all = sorted(tested_concurrency_levels, key=score_level)
+            logger.info(f"    All tested levels (by compromise score):")
             for i, level in enumerate(sorted_all[:5]):
                 marker = "→" if level['concurrency'] == peak_concurrency else " "
-                logger.info(f"      {marker} Conc {level['concurrency']}: TTFT {level['measured_ttft']:.3f}s, {level['input_tps']:,.0f} tok/s")
+                tokens_info = f", Tokens/Req {level['measured_tokens_per_req']:.1f}" if config.min_tokens_per_req else ""
+                logger.info(f"      {marker} Conc {level['concurrency']}: TTFT {level['measured_ttft']:.3f}s, {level['input_tps']:,.0f} tok/s{tokens_info}")
 
     # Phase 2: Retry at peak concurrency
     logger.info(f"{Colors.PHASE}    Phase 2: Retrying at peak concurrency {peak_concurrency} ({config.num_retries} times){Colors.ENDC}")
@@ -1880,7 +1997,17 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
 
         # Calculate metrics for this period
         if num_completed == 0:
-            logger.warning(f"    Period {period_number}: No requests completed! Staying at concurrency {current_concurrency}")
+            # No requests completed - concurrency is too high, need to ramp down
+            if current_concurrency <= config.start_concurrency:
+                logger.warning(f"    Period {period_number}: No requests completed! Already at minimum concurrency {current_concurrency}")
+                decision = "MIN_REACHED"
+                next_concurrency = current_concurrency
+            else:
+                # Ramp down aggressively when no completions
+                next_concurrency = max(config.start_concurrency, current_concurrency - config.concurrency_increment * 2)
+                decision = "RAMP_DOWN"
+                logger.warning(f"    Period {period_number}: No requests completed! RAMP DOWN: {current_concurrency} -> {next_concurrency}")
+
             # Create empty period record
             period_record = AssessmentPeriodMetrics(
                 period_number=period_number,
@@ -1911,10 +2038,11 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                 p99_itl=0,
                 avg_output_tokens_per_request=0,
                 measured_ttft=0,
-                decision="STAY",
-                next_concurrency=current_concurrency
+                decision=decision,
+                next_concurrency=next_concurrency
             )
             all_periods.append(period_record)
+            current_concurrency = next_concurrency
             continue
 
         # Calculate period throughput based on actual period duration
@@ -1951,6 +2079,10 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                        if m.generation_time > 0 and m.output_tokens > 0]
         avg_output_per_request = np.mean(output_rates) if output_rates else 0
 
+        # Use average tokens per request (matching cache_rate_tester behavior)
+        measured_tokens_per_req = avg_output_per_request
+        tokens_metric_name = "Avg Tokens/Req"
+
         # Choose measured TTFT based on config
         if config.ttft_metric == "max":
             measured_ttft = max_ttft
@@ -1966,22 +2098,31 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
         decision = "STAY"
         next_concurrency = current_concurrency
 
-        # Check if TTFT threshold exceeded
+        # Check if thresholds exceeded
         ttft_exceeded = (config.max_ttft is not None) and (measured_ttft > config.max_ttft)
+        tokens_per_req_exceeded = (config.min_tokens_per_req is not None) and (measured_tokens_per_req < config.min_tokens_per_req)
 
-        if ttft_exceeded:
+        if ttft_exceeded or tokens_per_req_exceeded:
             # Over threshold - need to ramp down
+            exceeded_reasons = []
+            if ttft_exceeded:
+                exceeded_reasons.append(f"{ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s")
+            if tokens_per_req_exceeded:
+                exceeded_reasons.append(f"{tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s < {config.min_tokens_per_req} tok/s")
+
             if current_concurrency <= config.start_concurrency:
                 decision = "MIN_REACHED"
                 next_concurrency = current_concurrency
-                logger.warning(f"    Performance threshold exceeded BUT already at minimum concurrency {current_concurrency}")
-                logger.warning(f"      {ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s")
+                logger.warning(f"    Performance threshold(s) exceeded BUT already at minimum concurrency {current_concurrency}")
+                for reason in exceeded_reasons:
+                    logger.warning(f"      - {reason}")
             else:
                 # Ramp down by decrement
                 next_concurrency = max(config.start_concurrency, current_concurrency - config.concurrency_increment)
                 decision = "RAMP_DOWN"
-                logger.info(f"    Performance threshold exceeded -> RAMP DOWN: {current_concurrency} -> {next_concurrency}")
-                logger.info(f"      {ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s")
+                logger.info(f"    Performance threshold(s) exceeded -> RAMP DOWN: {current_concurrency} -> {next_concurrency}")
+                for reason in exceeded_reasons:
+                    logger.info(f"      - {reason}")
         else:
             # Under threshold - but should we ramp up?
             if current_concurrency >= config.max_concurrency:
@@ -2426,6 +2567,108 @@ def save_continuous_results(periods: List[AssessmentPeriodMetrics], output_dir: 
     df = pd.DataFrame([p.to_dict() for p in periods])
     df.to_csv(filename, index=False)
     logger.info(f"Saved sustained mode results to {filename}")
+
+    return filename  # Return filename for graph generation
+
+
+def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size: int,
+                                   working_set_size: int, cache_hit_rate: int, config: TestConfig):
+    """Generate graphs from sustained mode CSV results"""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        logger.warning("Plotly not installed - skipping graph generation")
+        return
+
+    df = pd.read_csv(csv_path)
+
+    # Create figure with multiple subplots
+    fig = make_subplots(
+        rows=4, cols=1,
+        subplot_titles=(
+            f'Throughput Over Time (Context: {context_size:,}, Cache Rate: {cache_hit_rate}%)',
+            'Concurrency Level Adjustments',
+            'TTFT Metrics',
+            'Working Set Size Growth'
+        ),
+        vertical_spacing=0.08
+    )
+
+    # Calculate time in minutes from start
+    df['time_min'] = (df['end_time'] - df['start_time'].iloc[0]) / 60
+
+    # Row 1: Throughput
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['input_tokens_per_sec'],
+                  mode='lines+markers', name='Input tok/s',
+                  line=dict(color='blue')),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['output_tokens_per_sec'],
+                  mode='lines+markers', name='Output tok/s',
+                  line=dict(color='green')),
+        row=1, col=1
+    )
+
+    # Row 2: Concurrency
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['concurrency_level'],
+                  mode='lines+markers', name='Concurrency',
+                  line=dict(color='purple')),
+        row=2, col=1
+    )
+
+    # Row 3: TTFT
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['avg_ttft'],
+                  mode='lines+markers', name='Avg TTFT',
+                  line=dict(color='orange')),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['p95_ttft'],
+                  mode='lines+markers', name='P95 TTFT',
+                  line=dict(color='red')),
+        row=3, col=1
+    )
+
+    # Add max TTFT threshold line if configured
+    if config.max_ttft:
+        fig.add_hline(y=config.max_ttft, line_dash="dash", line_color="red",
+                     annotation_text=f"Max TTFT Threshold ({config.max_ttft}s)",
+                     row=3, col=1)
+
+    # Row 4: Working Set Size
+    fig.add_trace(
+        go.Scatter(x=df['time_min'], y=df['working_set_size'],
+                  mode='lines+markers', name='Working Set Size',
+                  line=dict(color='brown'), fill='tozeroy'),
+        row=4, col=1
+    )
+
+    # Update axes labels
+    fig.update_xaxes(title_text="Time (minutes)", row=4, col=1)
+    fig.update_yaxes(title_text="Tokens/sec", row=1, col=1)
+    fig.update_yaxes(title_text="Concurrency", row=2, col=1)
+    fig.update_yaxes(title_text="Seconds", row=3, col=1)
+    fig.update_yaxes(title_text="Tokens", row=4, col=1)
+
+    # Update layout
+    fig.update_layout(
+        height=1200,
+        showlegend=True,
+        title_text=f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%"
+    )
+
+    # Save graph
+    output_path = Path(output_dir)
+    graph_filename = output_path / f"sustained_performance_ctx{context_size}_cache{cache_hit_rate}.html"
+    fig.write_html(str(graph_filename))
+    logger.info(f"Generated sustained mode graph: {graph_filename}")
+
+    return graph_filename
 
 
 def load_existing_aggregated_results(output_dir: str) -> List[AggregatedMetrics]:
@@ -3831,9 +4074,11 @@ async def main():
                             model=model
                         )
 
-                        # Save sustained mode results
+                        # Save sustained mode results and generate graphs
                         if period_metrics:
-                            save_continuous_results(period_metrics, config.output_dir, context_size, working_set_size, cache_hit_rate)
+                            csv_path = save_continuous_results(period_metrics, config.output_dir, context_size, working_set_size, cache_hit_rate)
+                            if csv_path:
+                                generate_sustained_mode_graphs(csv_path, config.output_dir, context_size, working_set_size, cache_hit_rate, config)
 
                         # Mark as completed
                         progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
