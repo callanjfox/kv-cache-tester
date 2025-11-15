@@ -2117,10 +2117,28 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                 for reason in exceeded_reasons:
                     logger.warning(f"      - {reason}")
             else:
-                # Ramp down by decrement
-                next_concurrency = max(config.start_concurrency, current_concurrency - config.concurrency_increment)
+                # Adaptive ramp down based on severity (conservative: max 2x increment)
+                # Calculate how badly thresholds are exceeded
+                ttft_overshoot = 0
+                tokens_shortfall = 0
+
+                if ttft_exceeded:
+                    ttft_overshoot = (measured_ttft - config.max_ttft) / config.max_ttft
+                if tokens_per_req_exceeded:
+                    tokens_shortfall = (config.min_tokens_per_req - measured_tokens_per_req) / config.min_tokens_per_req if config.min_tokens_per_req > 0 else 0
+
+                # Use the worst violation to determine ramp down severity
+                max_violation = max(ttft_overshoot, tokens_shortfall)
+
+                # Adaptive ramp down (conservative: 1x or 2x increment only)
+                if max_violation > 0.5:  # >50% violation - ramp down by 2x
+                    down_increment = config.concurrency_increment * 2
+                else:  # <=50% violation - ramp down by 1x
+                    down_increment = config.concurrency_increment
+
+                next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
                 decision = "RAMP_DOWN"
-                logger.info(f"    Performance threshold(s) exceeded -> RAMP DOWN: {current_concurrency} -> {next_concurrency}")
+                logger.info(f"    Performance threshold(s) exceeded -> RAMP DOWN: {current_concurrency} -> {next_concurrency} (-{current_concurrency - next_concurrency})")
                 for reason in exceeded_reasons:
                     logger.info(f"      - {reason}")
         else:
@@ -2689,6 +2707,203 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
     logger.info(f"Generated sustained mode graph: {graph_filename}")
 
     return graph_filename
+
+
+def generate_sustained_index_html(csv_path: Path, output_dir: str, context_size: int,
+                                  working_set_size: int, cache_hit_rate: int, config: TestConfig):
+    """Generate index.html dashboard for sustained mode results"""
+    df = pd.read_csv(csv_path)
+
+    # Calculate summary statistics
+    total_periods = len(df)
+    total_duration = df['duration'].sum() / 60  # minutes
+    peak_input_tps = df['input_tokens_per_sec'].max()
+    peak_output_tps = df['output_tokens_per_sec'].max()
+    avg_input_tps = df['input_tokens_per_sec'].mean()
+    avg_output_tps = df['output_tokens_per_sec'].mean()
+    peak_concurrency = df['concurrency_level'].max()
+    min_concurrency = df['concurrency_level'].min()
+    total_requests = df['num_requests_completed'].sum()
+    final_working_set = df['working_set_size'].iloc[-1]
+    initial_working_set = df['working_set_size'].iloc[0]
+
+    # Count decisions
+    ramp_ups = len(df[df['decision'].str.contains('RAMP_UP', na=False)])
+    ramp_downs = len(df[df['decision'].str.contains('RAMP_DOWN', na=False)])
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sustained Mode Results - Context {context_size:,}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }}
+        h1 {{ margin: 0; font-size: 2em; }}
+        h2 {{ color: #333; margin-top: 30px; }}
+        .timestamp {{ opacity: 0.9; margin-top: 10px; }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .stat-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }}
+        .stat-value {{
+            font-size: 1.8em;
+            font-weight: bold;
+            color: #333;
+        }}
+        .config-section {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .config-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }}
+        .config-item {{
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 4px;
+        }}
+        .graph-link {{
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 5px;
+            margin: 10px 10px 10px 0;
+            font-weight: bold;
+        }}
+        .graph-link:hover {{
+            background: #5568d3;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Sustained Mode Performance Test Results</h1>
+        <div class="timestamp">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+    </div>
+
+    <h2>Performance Summary</h2>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Total Duration</div>
+            <div class="stat-value">{total_duration:.1f} min</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total Periods</div>
+            <div class="stat-value">{total_periods}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total Requests</div>
+            <div class="stat-value">{total_requests:,}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Peak Input Throughput</div>
+            <div class="stat-value">{peak_input_tps:,.0f} tok/s</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Peak Output Throughput</div>
+            <div class="stat-value">{peak_output_tps:,.0f} tok/s</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Avg Input Throughput</div>
+            <div class="stat-value">{avg_input_tps:,.0f} tok/s</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Avg Output Throughput</div>
+            <div class="stat-value">{avg_output_tps:,.0f} tok/s</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Peak Concurrency</div>
+            <div class="stat-value">{peak_concurrency}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Concurrency Range</div>
+            <div class="stat-value">{min_concurrency}-{peak_concurrency}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Ramp Ups / Downs</div>
+            <div class="stat-value">{ramp_ups} / {ramp_downs}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Initial Working Set</div>
+            <div class="stat-value">{initial_working_set:,} tok</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Final Working Set</div>
+            <div class="stat-value">{final_working_set:,} tok</div>
+        </div>
+    </div>
+
+    <h2>Visualizations</h2>
+    <a href="sustained_performance_ctx{context_size}_cache{cache_hit_rate}.html" class="graph-link">📊 View Performance Graphs</a>
+
+    <h2>Test Configuration</h2>
+    <div class="config-section">
+        <div class="config-grid">
+            <div class="config-item"><strong>Context Size:</strong> {context_size:,} tokens</div>
+            <div class="config-item"><strong>Cache Hit Rate:</strong> {cache_hit_rate}%</div>
+            <div class="config-item"><strong>Assessment Period:</strong> {config.assessment_period}s</div>
+            <div class="config-item"><strong>Output Tokens:</strong> {config.output_tokens}</div>
+            <div class="config-item"><strong>Max TTFT:</strong> {config.max_ttft}s ({config.ttft_metric})</div>
+            <div class="config-item"><strong>Min Tokens/Req:</strong> {config.min_tokens_per_req if config.min_tokens_per_req else 'Not set'}</div>
+            <div class="config-item"><strong>Start Concurrency:</strong> {config.start_concurrency}</div>
+            <div class="config-item"><strong>Concurrency Increment:</strong> {config.concurrency_increment}</div>
+            <div class="config-item"><strong>Max Concurrency:</strong> {config.max_concurrency}</div>
+        </div>
+    </div>
+
+    <h2>Data Files</h2>
+    <div class="config-section">
+        <ul>
+            <li><a href="{csv_path.name}">Sustained Periods CSV</a></li>
+            <li><a href="detailed_results_{context_size}_{csv_path.stem.split('_')[-1]}.csv">Detailed Results CSV</a></li>
+        </ul>
+    </div>
+</body>
+</html>
+"""
+
+    output_path = Path(output_dir)
+    index_path = output_path / "index.html"
+    with open(index_path, 'w') as f:
+        f.write(html_content)
+
+    logger.info(f"Generated index.html: {index_path}")
+    return index_path
 
 
 def load_existing_aggregated_results(output_dir: str) -> List[AggregatedMetrics]:
@@ -4099,6 +4314,7 @@ async def main():
                             csv_path = save_continuous_results(period_metrics, config.output_dir, context_size, working_set_size, cache_hit_rate)
                             if csv_path:
                                 generate_sustained_mode_graphs(csv_path, config.output_dir, context_size, working_set_size, cache_hit_rate, config)
+                                generate_sustained_index_html(csv_path, config.output_dir, context_size, working_set_size, cache_hit_rate, config)
 
                         # Mark as completed
                         progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
