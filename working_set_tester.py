@@ -2668,31 +2668,19 @@ def generate_sustained_mode_graphs(csv_path: Path, output_dir: str, context_size
         f"Avg Tokens/Req: {avg_output_per_req:.1f} tok/s"
     )
 
-    # Update layout
+    # Update layout with top margin for stats annotation
     fig.update_layout(
         height=1700,  # Increased height for stats annotation
         showlegend=True,
+        margin=dict(t=120, b=50, l=80, r=80),  # Add top margin for annotation
         title={
-            'text': f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%",
-            'y': 0.99,
+            'text': f"Sustained Mode Performance - Context {context_size:,}, Cache {cache_hit_rate}%<br><sub>{stats_text}</sub>",
+            'y': 0.98,
             'x': 0.5,
             'xanchor': 'center',
-            'yanchor': 'top'
-        },
-        annotations=[
-            dict(
-                text=stats_text,
-                xref="paper", yref="paper",
-                x=0.5, y=0.97,
-                xanchor='center', yanchor='top',
-                showarrow=False,
-                font=dict(size=12),
-                bgcolor="rgba(255, 255, 255, 0.9)",
-                bordercolor="rgba(0, 0, 0, 0.2)",
-                borderwidth=1,
-                borderpad=10
-            )
-        ]
+            'yanchor': 'top',
+            'font': dict(size=16)
+        }
     )
 
     # Save graph with timestamp from CSV filename
