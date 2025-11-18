@@ -245,7 +245,7 @@ def validate_working_set_size(model_name: str, working_set_size: int,
 @dataclass
 class TestConfig:
     """Configuration for the entire test suite"""
-    api_endpoint: str
+    api_endpoints: List[str]  # Support multiple endpoints for load balancing
     context_sizes: List[int]
     working_set_sizes: List[int]  # List of working set sizes to test
     cache_hit_rates: List[int]  # List of cache hit rates to test
@@ -273,6 +273,7 @@ class TestConfig:
     mode: str = "adaptive"  # "adaptive" or "sustained"
     assessment_period: int = 30  # For sustained mode: duration of each assessment period
     min_tokens_per_req: Optional[float] = None  # Minimum average output tokens/s per request threshold
+    init_strategy: str = "min"  # "min" or "max" - for sustained mode: initialize min or max working set
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -638,6 +639,7 @@ class WorkingSet:
 
         self.prompts: List[List[int]] = []
         self.current_index = 0
+        self.num_prompts_in_rotation: int = 0  # For init=max mode: tracks how many prompts are active
 
     def generate_prompts(self):
         """Generate all working set prompts"""
@@ -658,36 +660,59 @@ class WorkingSet:
 
     def get_next_prompt(self, random_selection: bool = False) -> List[int]:
         """Get next prompt from working set"""
+        # Determine which prompts are active (for init=max mode with gradual rotation)
+        num_active = self.num_prompts_in_rotation if self.num_prompts_in_rotation > 0 else len(self.prompts)
+        active_prompts = self.prompts[:num_active]
+
         if random_selection:
             import random
-            return random.choice(self.prompts)
+            return random.choice(active_prompts)
         else:
-            # Cycle through deterministically
-            prompt = self.prompts[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.prompts)
+            # Cycle through deterministically (only through active prompts)
+            prompt = active_prompts[self.current_index % len(active_prompts)]
+            self.current_index = (self.current_index + 1) % len(active_prompts)
             return prompt
 
 
 class APIClient:
-    """Manages OpenAI API client and requests"""
+    """Manages OpenAI API client and requests with load balancing support"""
 
-    def __init__(self, api_endpoint: str, model: str):
-        self.api_endpoint = api_endpoint
+    def __init__(self, api_endpoints: List[str], model: str):
+        self.api_endpoints = api_endpoints
         self.model = model
-        # Ensure base_url ends with /v1 for OpenAI client
-        base_url = api_endpoint.rstrip('/')
-        if not base_url.endswith('/v1'):
-            base_url = base_url + '/v1'
-        self.client = openai.AsyncOpenAI(
-            api_key="EMPTY",
-            base_url=base_url
-        )
-        logger.info(f"API Client initialized: {api_endpoint} (base_url: {base_url})")
+        self.clients = []
+        self.current_index = 0
+
+        # Create a client for each endpoint
+        for endpoint in api_endpoints:
+            # Ensure base_url ends with /v1 for OpenAI client
+            base_url = endpoint.rstrip('/')
+            if not base_url.endswith('/v1'):
+                base_url = base_url + '/v1'
+            client = openai.AsyncOpenAI(
+                api_key="EMPTY",
+                base_url=base_url
+            )
+            self.clients.append({'endpoint': endpoint, 'base_url': base_url, 'client': client})
+
+        if len(api_endpoints) == 1:
+            logger.info(f"API Client initialized: {api_endpoints[0]} (base_url: {self.clients[0]['base_url']})")
+        else:
+            logger.info(f"API Client initialized with {len(api_endpoints)} endpoints:")
+            for i, client_info in enumerate(self.clients):
+                logger.info(f"  [{i+1}] {client_info['endpoint']} (base_url: {client_info['base_url']})")
+
+    def get_next_client(self):
+        """Get next client using round-robin load balancing"""
+        client_info = self.clients[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.clients)
+        return client_info
 
     async def detect_model(self) -> str:
-        """Auto-detect model from API"""
+        """Auto-detect model from API (uses first endpoint)"""
         try:
-            models_url = self.api_endpoint.rstrip('/') + '/v1/models'
+            first_endpoint = self.api_endpoints[0]
+            models_url = first_endpoint.rstrip('/') + '/v1/models'
             logger.info(f"Auto-detecting model from {models_url}")
 
             # Use synchronous client for model detection
@@ -704,11 +729,12 @@ class APIClient:
                 raise ValueError("No models found in API response")
         except Exception as e:
             logger.error(f"Failed to auto-detect model: {e}")
-            raise ValueError(f"Could not detect model from {self.api_endpoint}/v1/models")
+            raise ValueError(f"Could not detect model from {self.api_endpoints[0]}/v1/models")
 
     async def send_request(self, prompt: str, max_tokens: int) -> Tuple[str, float, float, float, int, int]:
         """
         Send a single request and return metrics
+        Uses round-robin load balancing across multiple endpoints if configured.
         Returns: (response_text, ttft, ttlt, generation_time, prompt_tokens, completion_tokens)
         """
         start_time = time.time()
@@ -716,8 +742,11 @@ class APIClient:
         last_token_time = None
         response_text = ""
 
+        # Get next client using round-robin load balancing
+        client_info = self.get_next_client()
+
         try:
-            response = await self.client.chat.completions.create(
+            response = await client_info['client'].chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
@@ -761,8 +790,8 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     # Required arguments
-    parser.add_argument("--api-endpoint", type=str, required=True,
-                       help="OpenAI-compatible API endpoint (e.g., http://localhost:8125)")
+    parser.add_argument("--api-endpoint", type=str, nargs='+', required=True,
+                       help="OpenAI-compatible API endpoint(s). Can specify multiple for load balancing (e.g., http://localhost:8125 http://localhost:8126)")
     parser.add_argument("--context-sizes", type=int, nargs='+', required=True,
                        help="Context lengths to test (e.g., 8000 32000 64000)")
     parser.add_argument("--min-working-set-size", type=int, required=True,
@@ -837,6 +866,11 @@ def parse_arguments() -> argparse.Namespace:
                             "'adaptive' = burst testing to find peak concurrency with retry phases")
     parser.add_argument("--assessment-period", type=int, default=30,
                        help="Assessment period duration in seconds for sustained mode (default: 30, sustained mode only)")
+    parser.add_argument("--init-strategy", type=str, default="min",
+                       choices=["min", "max"],
+                       help="Initialization strategy for sustained mode (default: min). "
+                            "'min' = initialize only min working set, add new prompts at growth (cache misses), "
+                            "'max' = initialize all prompts upfront, add pre-warmed prompts at growth (no cache misses)")
 
     return parser.parse_args()
 
@@ -884,8 +918,11 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
 
     cache_hit_rates = sorted(args.cache_hit_rates)
 
+    # Handle api_endpoint as list
+    api_endpoints = args.api_endpoint if isinstance(args.api_endpoint, list) else [args.api_endpoint]
+
     return TestConfig(
-        api_endpoint=args.api_endpoint,
+        api_endpoints=api_endpoints,
         context_sizes=sorted(args.context_sizes),
         working_set_sizes=working_set_sizes,
         output_tokens=args.output_tokens,
@@ -912,7 +949,8 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         strict_time_window=args.strict_time_window,
         mode=args.mode,
         assessment_period=args.assessment_period,
-        min_tokens_per_req=args.min_tokens_per_req
+        min_tokens_per_req=args.min_tokens_per_req,
+        init_strategy=args.init_strategy
     )
 
 
@@ -978,7 +1016,7 @@ async def initialize_working_set(api_client: APIClient, working_set: WorkingSet,
     Args:
         api_client: API client
         working_set: Working set to initialize
-        output_tokens: Output tokens per request
+        output_tokens: Output tokens per request (typically 1 for fast initialization)
         max_concurrency: Maximum concurrent initialization requests (default: 16)
     """
     num_prompts = len(working_set.prompts)
@@ -1302,7 +1340,7 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
 
         # Reinitialize if per_test strategy
         if config.reinit_strategy == "per_test":
-            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+            await initialize_working_set(api_client, working_set, 1, config.init_concurrency)  # Use 1 token for fast init
 
         metrics, phase_metadata = await run_concurrency_level(
             api_client, working_set, tokenizer, config, context_size, working_set_size,
@@ -1473,7 +1511,7 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
                     logger.info(f"      Refining: testing concurrency {mid} (iteration {refinement_iterations + 1}, range: {low}-{high}, phase: {refine_phase_id})...")
 
                     if config.reinit_strategy == "per_test":
-                        await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+                        await initialize_working_set(api_client, working_set, 1, config.init_concurrency)  # Use 1 token for fast init
 
                     refine_metrics, refine_phase_metadata = await run_concurrency_level(
                         api_client, working_set, tokenizer, config, context_size, working_set_size,
@@ -1685,7 +1723,7 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
 
         # Reinitialize if per_test strategy
         if config.reinit_strategy == "per_test":
-            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+            await initialize_working_set(api_client, working_set, 1, config.init_concurrency)  # Use 1 token for fast init
 
         metrics, retry_phase_metadata = await run_concurrency_level(
             api_client, working_set, tokenizer, config, context_size, working_set_size,
@@ -1826,7 +1864,12 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
     peak_period = 0
 
     # Working set growth tracking - scheduled at section boundaries
-    initial_num_prompts = len(working_set.prompts)
+    # For init=max mode, use num_prompts_in_rotation as initial (not total prompts)
+    if working_set.num_prompts_in_rotation > 0:
+        initial_num_prompts = working_set.num_prompts_in_rotation
+    else:
+        initial_num_prompts = len(working_set.prompts)
+
     target_num_prompts = max(1, int(np.ceil(working_set_size / working_set.rounded_context_size)))
     total_prompts_to_add = target_num_prompts - initial_num_prompts
 
@@ -1898,26 +1941,42 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     prompts_to_add = prompts_per_event[next_growth_index]
 
                     if prompts_to_add > 0:
-                        # Generate new prompts (NOT initialized - these will be cache misses!)
-                        current_num_prompts = len(working_set.prompts)
-                        for i in range(prompts_to_add):
-                            prompt_idx = current_num_prompts + i
-                            prompt_seed = (working_set.seed + prompt_idx) if working_set.seed is not None else None
-                            tokens = tokenizer.generate_dummy_tokens(
-                                working_set.rounded_context_size,
-                                seed=prompt_seed,
-                                prompt_number=prompt_idx
+                        if config.init_strategy == "max":
+                            # init=max: Prompts already generated and initialized
+                            # Just increase the number in rotation
+                            old_num_in_rotation = working_set.num_prompts_in_rotation
+                            working_set.num_prompts_in_rotation = min(
+                                len(working_set.prompts),
+                                working_set.num_prompts_in_rotation + prompts_to_add
                             )
-                            working_set.prompts.append(tokens)
+                            actual_added = working_set.num_prompts_in_rotation - old_num_in_rotation
+                            new_ws_size = working_set.num_prompts_in_rotation * working_set.rounded_context_size
 
-                        # Update tracking
-                        new_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+                            logger.info(f"")
+                            logger.info(f"{Colors.OKGREEN}  📈 Working Set Growth: Activated {actual_added} pre-warmed prompt(s){Colors.ENDC}")
+                            logger.info(f"{Colors.OKGREEN}     Now: {working_set.num_prompts_in_rotation}/{len(working_set.prompts)} prompts in rotation ({new_ws_size:,} tokens){Colors.ENDC}")
+                            logger.info(f"")
+                        else:
+                            # init=min: Generate new prompts on-the-fly (NOT initialized - cache misses!)
+                            current_num_prompts = len(working_set.prompts)
+                            for i in range(prompts_to_add):
+                                prompt_idx = current_num_prompts + i
+                                prompt_seed = (working_set.seed + prompt_idx) if working_set.seed is not None else None
+                                tokens = tokenizer.generate_dummy_tokens(
+                                    working_set.rounded_context_size,
+                                    seed=prompt_seed,
+                                    prompt_number=prompt_idx
+                                )
+                                working_set.prompts.append(tokens)
 
-                        # Log growth with OKGREEN color
-                        logger.info(f"")
-                        logger.info(f"{Colors.OKGREEN}  📈 Working Set Growth: Added {prompts_to_add} new prompt(s){Colors.ENDC}")
-                        logger.info(f"{Colors.OKGREEN}     Now: {len(working_set.prompts)} prompts ({new_ws_size:,} tokens){Colors.ENDC}")
-                        logger.info(f"")
+                            # Update tracking
+                            new_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+
+                            # Log growth with OKGREEN color
+                            logger.info(f"")
+                            logger.info(f"{Colors.OKGREEN}  📈 Working Set Growth: Added {prompts_to_add} new prompt(s) (cache misses){Colors.ENDC}")
+                            logger.info(f"{Colors.OKGREEN}     Now: {len(working_set.prompts)} prompts ({new_ws_size:,} tokens){Colors.ENDC}")
+                            logger.info(f"")
 
                     # Mark this growth event as complete
                     next_growth_index += 1
@@ -2009,11 +2068,14 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                 logger.warning(f"    Period {period_number}: No requests completed! RAMP DOWN: {current_concurrency} -> {next_concurrency}")
 
             # Create empty period record
+            # Use num_prompts_in_rotation if set (init=max mode), otherwise use total prompts
+            active_prompts = working_set.num_prompts_in_rotation if working_set.num_prompts_in_rotation > 0 else len(working_set.prompts)
+            empty_ws_size = active_prompts * working_set.rounded_context_size
             period_record = AssessmentPeriodMetrics(
                 period_number=period_number,
                 context_size=context_size,
                 cache_hit_rate=cache_hit_rate,
-                working_set_size=len(working_set.prompts) * working_set.rounded_context_size,  # Current WS size
+                working_set_size=empty_ws_size,  # Current active WS size
                 start_time=period_start,
                 end_time=time.time(),
                 duration=period_duration,
@@ -2192,12 +2254,14 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
         logger.info(f"{Colors.METRIC}    Avg ITL: {avg_itl*1000:.2f}ms | Avg Tokens/Req: {avg_output_per_request:.1f} tok/s{Colors.ENDC}")
 
         # Create period record (include current working set size)
-        current_ws_size = len(working_set.prompts) * working_set.rounded_context_size
+        # Use num_prompts_in_rotation if set (init=max mode), otherwise use total prompts
+        active_prompts = working_set.num_prompts_in_rotation if working_set.num_prompts_in_rotation > 0 else len(working_set.prompts)
+        current_ws_size = active_prompts * working_set.rounded_context_size
         period_record = AssessmentPeriodMetrics(
             period_number=period_number,
             context_size=context_size,
             cache_hit_rate=cache_hit_rate,
-            working_set_size=current_ws_size,  # Track actual WS size at this point
+            working_set_size=current_ws_size,  # Track actual active WS size at this point
             start_time=period_start,
             end_time=time.time(),
             duration=actual_period_duration,
@@ -3062,7 +3126,9 @@ def save_run_command(args: argparse.Namespace, output_dir: str):
     command_parts = [f"python {script_name}"]
 
     # Add all arguments
-    command_parts.append(f"  --api-endpoint {args.api_endpoint}")
+    # Handle multiple endpoints
+    endpoints = args.api_endpoint if isinstance(args.api_endpoint, list) else [args.api_endpoint]
+    command_parts.append(f"  --api-endpoint {' '.join(endpoints)}")
     command_parts.append(f"  --context-sizes {' '.join(map(str, args.context_sizes))}")
     command_parts.append(f"  --min-working-set-size {args.min_working_set_size}")
     command_parts.append(f"  --max-working-set-size {args.max_working_set_size}")
@@ -4184,7 +4250,10 @@ async def main():
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{Colors.BOLD}Working Set Size Performance Testing Tool{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
-    logger.info(f"{Colors.OKBLUE}API Endpoint: {config.api_endpoint}{Colors.ENDC}")
+    if len(config.api_endpoints) == 1:
+        logger.info(f"{Colors.OKBLUE}API Endpoint: {config.api_endpoints[0]}{Colors.ENDC}")
+    else:
+        logger.info(f"{Colors.OKBLUE}API Endpoints ({len(config.api_endpoints)} for load balancing): {', '.join(config.api_endpoints)}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Context Sizes: {config.context_sizes}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Working Set Sizes: {len(config.working_set_sizes)} tests from {min(config.working_set_sizes):,} to {max(config.working_set_sizes):,} tokens{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Cache Hit Rates: {config.cache_hit_rates}{Colors.ENDC}")
@@ -4206,7 +4275,7 @@ async def main():
     logger.info("Initializing components...")
 
     # Initialize API client and detect model first
-    api_client = APIClient(config.api_endpoint, model="")
+    api_client = APIClient(config.api_endpoints, model="")
     model = await api_client.detect_model()
     api_client.model = model
 
@@ -4323,29 +4392,41 @@ async def main():
                 # Create working set for this size
                 working_set = WorkingSet(context_size, working_set_size, tokenizer, config.chunk_size, config.seed)
 
-                # For sustained mode: only generate min-working-set-size prompts initially
+                # For sustained mode: generate prompts based on init_strategy
                 # For adaptive mode: generate all prompts for the working_set_size
                 if config.mode == "sustained":
-                    # Start with minimum working set size (first increment)
                     min_ws_size = config.working_set_sizes[0]  # Smallest working set size
                     initial_num_prompts = max(1, int(np.ceil(min_ws_size / working_set.rounded_context_size)))
-                    logger.info(f"Sustained mode: Generating initial {initial_num_prompts} prompts ({min_ws_size:,} tokens)")
-                    logger.info(f"  Will grow to {working_set_size:,} tokens during test")
 
-                    # Generate only initial prompts
-                    working_set.prompts = []
-                    for i in range(initial_num_prompts):
-                        prompt_seed = (working_set.seed + i) if working_set.seed is not None else None
-                        tokens = tokenizer.generate_dummy_tokens(working_set.rounded_context_size, seed=prompt_seed, prompt_number=i)
-                        working_set.prompts.append(tokens)
-                    logger.info(f"  Generated {len(working_set.prompts)} initial prompts")
+                    if config.init_strategy == "max":
+                        # Generate ALL prompts upfront (up to max working set)
+                        logger.info(f"Sustained mode (init=max): Generating ALL {working_set.num_prompts} prompts ({working_set_size:,} tokens)")
+                        logger.info(f"  Will initialize all prompts, then add to rotation during growth")
+                        working_set.generate_prompts()
+                        # Set initial rotation to min working set size
+                        working_set.num_prompts_in_rotation = initial_num_prompts
+                        logger.info(f"  Starting with {initial_num_prompts} prompts in rotation (will grow during test)")
+                    else:  # "min"
+                        # Generate only min working set prompts initially
+                        logger.info(f"Sustained mode (init=min): Generating initial {initial_num_prompts} prompts ({min_ws_size:,} tokens)")
+                        logger.info(f"  Will generate new prompts during growth (cache misses)")
+
+                        # Generate only initial prompts
+                        working_set.prompts = []
+                        for i in range(initial_num_prompts):
+                            prompt_seed = (working_set.seed + i) if working_set.seed is not None else None
+                            tokens = tokenizer.generate_dummy_tokens(working_set.rounded_context_size, seed=prompt_seed, prompt_number=i)
+                            working_set.prompts.append(tokens)
+                        logger.info(f"  Generated {len(working_set.prompts)} initial prompts")
                 else:
                     # Adaptive mode: generate all prompts for this working set size
                     working_set.generate_prompts()
 
-                # Initialize working set with API (pre-warm cache) - only initial prompts for sustained
+                # Initialize working set with API (pre-warm cache)
+                # For sustained mode with init=min: only initial prompts
+                # For sustained mode with init=max: all prompts
                 if config.reinit_strategy == "once" or config.reinit_strategy == "per_working_set":
-                    await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+                    await initialize_working_set(api_client, working_set, 1, config.init_concurrency)  # Use 1 token for fast init
 
                 # Run the working set size test - route to appropriate mode
                 try:
