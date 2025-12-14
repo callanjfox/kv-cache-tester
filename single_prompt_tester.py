@@ -567,10 +567,12 @@ async def main():
 
     parser.add_argument("--api-endpoint", type=str, required=True,
                        help="API endpoint (e.g., http://localhost:8000)")
+    parser.add_argument("--context-sizes", type=int, nargs='+', default=None,
+                       help="Specific context sizes to test (e.g., 8000 32000 64000). Overrides --min-tokens and --max-tokens.")
     parser.add_argument("--min-tokens", type=int, default=1000,
-                       help="Minimum context size in tokens (default: 1000)")
+                       help="Minimum context size in tokens (default: 1000). Ignored if --context-sizes is specified.")
     parser.add_argument("--max-tokens", type=int, default=128000,
-                       help="Maximum context size in tokens (default: 128000)")
+                       help="Maximum context size in tokens (default: 128000). Ignored if --context-sizes is specified.")
     parser.add_argument("--output-tokens", type=int, default=256,
                        help="Output tokens per request (default: 256)")
     parser.add_argument("--num-iterations", type=int, default=5,
@@ -593,7 +595,6 @@ async def main():
     logger.info(f"{Colors.HEADER}{Colors.BOLD}Single Prompt Performance Tester{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}API Endpoint: {args.api_endpoint}{Colors.ENDC}")
-    logger.info(f"{Colors.OKBLUE}Context Range: {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling){Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Iterations per size: {args.num_iterations}{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
 
@@ -615,20 +616,27 @@ async def main():
         base_seed = args.seed
         logger.info(f"{Colors.OKBLUE}Using provided seed: {base_seed}{Colors.ENDC}")
 
-    # Validate input parameters
-    if args.min_tokens > args.max_tokens:
-        logger.error(f"Invalid parameter range: min-tokens ({args.min_tokens}) must be <= max-tokens ({args.max_tokens})")
-        sys.exit(1)
+    # Generate context sizes
+    if args.context_sizes:
+        # Use explicitly specified context sizes
+        context_sizes = sorted(args.context_sizes)
+        logger.info(f"{Colors.OKBLUE}Using specified context sizes: {context_sizes}{Colors.ENDC}")
+    else:
+        # Validate input parameters for doubling mode
+        if args.min_tokens > args.max_tokens:
+            logger.error(f"Invalid parameter range: min-tokens ({args.min_tokens}) must be <= max-tokens ({args.max_tokens})")
+            sys.exit(1)
 
-    # Generate context sizes (doubling)
-    context_sizes = []
-    size = args.min_tokens
-    while size <= args.max_tokens:
-        context_sizes.append(size)
-        size *= 2
+        # Generate context sizes (doubling)
+        context_sizes = []
+        size = args.min_tokens
+        while size <= args.max_tokens:
+            context_sizes.append(size)
+            size *= 2
+        logger.info(f"{Colors.OKBLUE}Context Range: {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling){Colors.ENDC}")
 
     if len(context_sizes) == 0:
-        logger.error("No context sizes to test. Check --min-tokens and --max-tokens parameters.")
+        logger.error("No context sizes to test. Specify --context-sizes or check --min-tokens and --max-tokens parameters.")
         sys.exit(1)
 
     logger.info(f"\n{Colors.PHASE}Testing {len(context_sizes)} context sizes: {context_sizes}{Colors.ENDC}\n")
@@ -663,88 +671,31 @@ async def main():
     generate_graphs(all_results, args.output_dir)
     generate_summary_table(all_results, args.output_dir)
 
-    # Generate index.html
+    # Save metadata for index.html generator
+    metadata = {
+        "test_type": "single_prompt",
+        "api_endpoint": args.api_endpoint,
+        "detected_model": model,
+        "context_sizes": context_sizes,
+        "num_iterations": args.num_iterations,
+        "output_tokens": args.output_tokens,
+        "seed": base_seed
+    }
+    metadata_file = output_path / "metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    # Generate index.html using unified generator
     logger.info(f"{Colors.PHASE}Generating index.html dashboard...{Colors.ENDC}")
-    output_path = Path(args.output_dir)
-    index_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Single Prompt Performance Test Results</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f5f5f5;
-        }}
-        h1 {{
-            color: #333;
-        }}
-        .link-section {{
-            background-color: white;
-            padding: 20px;
-            border-radius: 5px;
-            margin: 20px 0;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        .graph-link {{
-            display: block;
-            padding: 15px;
-            margin: 10px 0;
-            background-color: #4CAF50;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
-            font-size: 18px;
-            transition: background-color 0.3s;
-        }}
-        .graph-link:hover {{
-            background-color: #45a049;
-        }}
-        .info {{
-            background-color: #e3f2fd;
-            padding: 15px;
-            border-left: 4px solid #2196F3;
-            margin: 20px 0;
-        }}
-    </style>
-</head>
-<body>
-    <h1>Single Prompt Performance Test Results</h1>
-
-    <div class="info">
-        <h3>Test Overview</h3>
-        <p><strong>Test Pattern:</strong> For each context size, send a unique prompt (cold start),
-        then immediately send the same prompt again (100% cache hit). Repeat {args.num_iterations} times.</p>
-        <p><strong>Context Sizes Tested:</strong> {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling)</p>
-        <p><strong>Model:</strong> {model}</p>
-        <p><strong>Random Seed:</strong> {base_seed} (for reproducibility)</p>
-    </div>
-
-    <div class="link-section">
-        <h2>Results</h2>
-        <a class="graph-link" href="single_prompt_performance.html">📊 Performance Graphs (TTFT Bar Chart + Speedup)</a>
-        <a class="graph-link" href="summary_table.html">📋 Summary Table</a>
-    </div>
-
-    <div class="info">
-        <h3>How to Interpret</h3>
-        <ul>
-            <li><strong>Unique (Cold Start):</strong> First time seeing this prompt - no cache benefit</li>
-            <li><strong>Cached (100% Hit):</strong> Same prompt sent again - should use cached KV</li>
-            <li><strong>Speedup:</strong> Unique TTFT / Cached TTFT - higher is better</li>
-        </ul>
-        <p>A speedup of 2-10x for cached prompts indicates effective caching.
-        Speedup typically increases with context size.</p>
-    </div>
-</body>
-</html>
-"""
-
-    index_file = output_path / "index.html"
-    with open(index_file, 'w') as f:
-        f.write(index_html)
-    logger.info(f"Generated index: {index_file}")
+    try:
+        import subprocess
+        subprocess.run([
+            sys.executable, "generate_index.py",
+            str(output_path)
+        ], check=True, cwd=Path(__file__).parent)
+        logger.info(f"{Colors.SUCCESS}✓ Generated index.html dashboard{Colors.ENDC}")
+    except Exception as e:
+        logger.warning(f"Failed to generate index.html: {e}")
 
     logger.info(f"\n{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}✓ Testing complete!{Colors.ENDC}")

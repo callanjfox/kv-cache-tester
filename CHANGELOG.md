@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
+  - `docs/single_prompt_tester.md` - single_prompt_tester usage
+  - `docs/cache_rate_tester.md` - cache_rate_tester usage
+  - `docs/working_set_tester.md` - working_set_tester usage
+  - `docs/utilities.md` - utility scripts usage
+- **Simplified README**: Now has brief overview with links to detailed docs
+- **`--context-sizes` option for single_prompt_tester.py**: Specify exact context sizes to test (e.g., `--context-sizes 8000 32000 64000`) instead of using min/max-tokens doubling
+- **Unified index.html generator**: `generate_index.py` now auto-detects test type and generates appropriate dashboard for all tools (single_prompt, cache_rate, working_set, sustained, combined)
+  - Consistent styling across all test types
+  - Auto-detects test type from output files
+  - Reads config from progress.json or metadata.json
+  - single_prompt_tester.py now uses the unified generator
+
 ### Fixed
 - **Critical: `--strict-time-window` flag now works correctly**
   - Fixed throughput calculations to filter requests BEFORE calculation when `--strict-time-window` is enabled
