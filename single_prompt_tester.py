@@ -585,8 +585,15 @@ async def main():
                        help="Random seed for reproducibility (default: random based on timestamp)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose logging")
+    parser.add_argument("--brief", action="store_true",
+                       help="Brief output mode for agents - minimal, parseable output")
 
     args = parser.parse_args()
+
+    # Brief mode setup - suppress normal logging
+    brief_mode = args.brief
+    if brief_mode:
+        logger.setLevel(logging.WARNING)  # Only show warnings/errors
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -701,6 +708,28 @@ async def main():
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}✓ Testing complete!{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Results saved to: {args.output_dir}{Colors.ENDC}\n")
+
+    # Brief mode output
+    if brief_mode:
+        print(f"model: {model}")
+        print(f"endpoint: {args.api_endpoint}")
+        print(f"seed: {base_seed}")
+        print()
+        print("context_size,unique_ttft,cached_ttft,speedup")
+
+        # Calculate averages per context size
+        df = pd.DataFrame([m.to_dict() for m in all_results])
+        for ctx in sorted(df['context_size'].unique()):
+            unique_data = df[(df['context_size'] == ctx) & (df['prompt_type'] == 'unique')]
+            cached_data = df[(df['context_size'] == ctx) & (df['prompt_type'] == 'cached')]
+            if len(unique_data) > 0 and len(cached_data) > 0:
+                u_ttft = unique_data['ttft'].mean()
+                c_ttft = cached_data['ttft'].mean()
+                speedup = u_ttft / c_ttft if c_ttft > 0 else 0
+                print(f"{ctx},{u_ttft:.3f},{c_ttft:.3f},{speedup:.2f}x")
+
+        print()
+        print(f"output: {args.output_dir}")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Auto-detects test type from output files
   - Reads config from progress.json or metadata.json
   - single_prompt_tester.py now uses the unified generator
+- **`--brief` mode for all tools**: Agent-friendly output mode for single_prompt_tester, cache_rate_tester, and working_set_tester
+  - Suppresses verbose logging, only shows warnings/errors
+  - Outputs minimal, parseable CSV-like format at completion
+  - Format: key-value header, blank line, CSV header, CSV data rows, blank line, output path
+  - Useful for automation and integration with AI agents
 
 ### Fixed
 - **Critical: `--strict-time-window` flag now works correctly**

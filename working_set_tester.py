@@ -871,6 +871,8 @@ def parse_arguments() -> argparse.Namespace:
                        help="Initialization strategy for sustained mode (default: min). "
                             "'min' = initialize only min working set, add new prompts at growth (cache misses), "
                             "'max' = initialize all prompts upfront, add pre-warmed prompts at growth (no cache misses)")
+    parser.add_argument("--brief", action="store_true",
+                       help="Brief output mode for agents - minimal, parseable output")
 
     return parser.parse_args()
 
@@ -4240,6 +4242,11 @@ async def main():
     """Main entry point"""
     args = parse_arguments()
 
+    # Brief mode setup - suppress normal logging
+    brief_mode = args.brief
+    if brief_mode:
+        logger.setLevel(logging.WARNING)  # Only show warnings/errors
+
     # Set logging level
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -4549,6 +4556,20 @@ async def main():
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Results saved to: {config.output_dir}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Total tests completed: {len(all_aggregated_results)}{Colors.ENDC}")
+
+    # Brief mode output
+    if brief_mode and all_aggregated_results:
+        print(f"model: {model}")
+        print(f"endpoint: {config.api_endpoints[0]}")
+        print(f"cache_rate: {config.cache_hit_rates[0]}")
+        print()
+        print("context_size,working_set,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+
+        for m in sorted(all_aggregated_results, key=lambda x: (x.context_size, x.working_set_size)):
+            print(f"{m.context_size},{m.working_set_size},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+
+        print()
+        print(f"output: {config.output_dir}")
 
 
 if __name__ == "__main__":

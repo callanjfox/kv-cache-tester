@@ -893,6 +893,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--strict-time-window", action="store_true",
                        help="Calculate throughput using only requests that launched AND completed within the ramp-duration window. "
                             "Default behavior includes all requests in throughput calculation (including cleanup time).")
+    parser.add_argument("--brief", action="store_true",
+                       help="Brief output mode for agents - minimal, parseable output")
 
     return parser.parse_args()
 
@@ -4635,6 +4637,11 @@ async def main():
     """Main entry point"""
     args = parse_arguments()
 
+    # Brief mode setup - suppress normal logging
+    brief_mode = args.brief
+    if brief_mode:
+        logger.setLevel(logging.WARNING)  # Only show warnings/errors
+
     # Set logging level
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -5069,6 +5076,26 @@ async def main():
         # Count continuous mode tests from period files
         period_files = list(Path(config.output_dir).glob("sustained_periods_*.csv"))
         logger.info(f"{Colors.OKGREEN}Total continuous tests completed: {len(period_files)}{Colors.ENDC}")
+
+    # Brief mode output
+    if brief_mode:
+        print(f"model: {model}")
+        print(f"endpoint: {config.api_endpoints[0]}")
+        print(f"working_set: {config.working_set_size}")
+        print()
+        print("context_size,cache_rate,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+
+        # Output results from aggregated data
+        if config.mode in ["adaptive", "fixed"]:
+            for m in sorted(all_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate)):
+                print(f"{m.context_size},{m.cache_hit_rate},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+        else:
+            # For sustained mode, use aggregated results calculated from period data
+            for m in sorted(continuous_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate)):
+                print(f"{m.context_size},{m.cache_hit_rate},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+
+        print()
+        print(f"output: {config.output_dir}")
 
 
 if __name__ == "__main__":
