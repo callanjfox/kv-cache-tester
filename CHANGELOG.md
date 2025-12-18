@@ -24,6 +24,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Outputs minimal, parseable CSV-like format at completion
   - Format: key-value header, blank line, CSV header, CSV data rows, blank line, output path
   - Useful for automation and integration with AI agents
+- **`--concurrent-prompts` / `-n` option for single_prompt_tester.py**: Send N prompts simultaneously
+  - Uses `asyncio.gather` to fire all prompts at once
+  - Useful for testing server behavior under concurrent load
+  - Reports per-prompt metrics plus batch-level statistics (avg TTFT, batch time)
+  - Both unique (cold) and cached (warm) tests send all N prompts concurrently
 
 ### Fixed
 - **Critical: `--strict-time-window` flag now works correctly**

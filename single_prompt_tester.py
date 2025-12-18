@@ -303,68 +303,131 @@ class APIClient:
 
 
 async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerManager,
-                                  context_size: int, output_tokens: int, iteration: int, base_seed: int) -> Tuple[PromptMetrics, PromptMetrics]:
+                                  context_size: int, output_tokens: int, iteration: int, base_seed: int,
+                                  concurrent_prompts: int = 1) -> Tuple[List[PromptMetrics], List[PromptMetrics]]:
     """
-    Test a single unique prompt followed by cached repeat
-    Returns: (unique_metrics, cached_metrics)
+    Test unique prompts followed by cached repeats
+    Returns: (list of unique_metrics, list of cached_metrics)
     """
-    # Generate unique prompt with seed offset for this iteration
-    prompt_seed = base_seed + iteration * 1000
-    unique_tokens = tokenizer.generate_dummy_tokens(context_size, seed=prompt_seed)
-    unique_prompt = tokenizer.decode(unique_tokens) + "\n\nTell me a story."
+    # Generate unique prompts with seed offset for this iteration
+    prompts = []
+    for i in range(concurrent_prompts):
+        prompt_seed = base_seed + iteration * 1000 + i * 100
+        unique_tokens = tokenizer.generate_dummy_tokens(context_size, seed=prompt_seed)
+        unique_prompt = tokenizer.decode(unique_tokens) + "\n\nTell me a story."
+        prompts.append(unique_prompt)
 
-    logger.info(f"    Iteration {iteration + 1}: Testing unique prompt ({context_size:,} tokens)...")
+    prompt_label = "prompts" if concurrent_prompts > 1 else "prompt"
+    logger.info(f"    Iteration {iteration + 1}: Testing {concurrent_prompts} unique {prompt_label} ({context_size:,} tokens each)...")
 
-    # Test unique prompt (cold start)
-    start_time = time.time()
-    response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(unique_prompt, output_tokens)
-    total_time = time.time() - start_time
-    output_tps = completion_tok / gen_time if gen_time > 0 else 0
+    # Test unique prompts (cold start) - send all simultaneously
+    # Returns: (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, absolute_first_token_time)
+    async def send_and_measure(prompt: str, prompt_idx: int, batch_start_ref: float) -> Tuple[str, float, float, int, int, float, float]:
+        start_time = time.time()
+        response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(prompt, output_tokens)
+        total_time = time.time() - start_time
+        # Calculate absolute first-token time relative to batch start
+        absolute_first_token = (start_time - batch_start_ref) + ttft
+        return response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, absolute_first_token
 
-    unique_metrics = PromptMetrics(
-        context_size=context_size,
-        iteration=iteration,
-        prompt_type="unique",
-        prompt_tokens=prompt_tok,
-        completion_tokens=completion_tok,
-        ttft=ttft,
-        generation_time=gen_time,
-        total_time=total_time,
-        output_tokens_per_sec=output_tps
-    )
+    # Send all unique prompts simultaneously
+    batch_start = time.time()
+    unique_results = await asyncio.gather(*[send_and_measure(p, i, batch_start) for i, p in enumerate(prompts)])
+    batch_elapsed = time.time() - batch_start
 
-    # Show snippet of response
-    snippet = response_text[:100].replace('\n', ' ') if response_text else ""
-    logger.info(f"      Unique: TTFT={ttft:.3f}s, Output={completion_tok} tok")
-    logger.info(f"      Response: {snippet}...")
+    unique_metrics_list = []
+    for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(unique_results):
+        output_tps = completion_tok / gen_time if gen_time > 0 else 0
+        metrics = PromptMetrics(
+            context_size=context_size,
+            iteration=iteration,
+            prompt_type="unique",
+            prompt_tokens=prompt_tok,
+            completion_tokens=completion_tok,
+            ttft=ttft,
+            generation_time=gen_time,
+            total_time=total_time,
+            output_tokens_per_sec=output_tps
+        )
+        unique_metrics_list.append(metrics)
 
-    # Test cached prompt (same prompt again - 100% cache hit)
-    logger.info(f"    Iteration {iteration + 1}: Testing cached prompt (same prompt)...")
+    # Log per-prompt details when concurrent
+    if concurrent_prompts > 1:
+        for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(unique_results):
+            snippet = response_text[:80].replace('\n', ' ') if response_text else ""
+            logger.info(f"        [Prompt {i+1}] TTFT={ttft:.3f}s, abs_time={abs_ttft:.3f}s, output={completion_tok} tok")
+            logger.info(f"                  Response: {snippet}...")
 
-    start_time = time.time()
-    response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(unique_prompt, output_tokens)
-    total_time = time.time() - start_time
-    output_tps = completion_tok / gen_time if gen_time > 0 else 0
+    # Log summary for unique prompts
+    avg_ttft = np.mean([m.ttft for m in unique_metrics_list])
+    avg_completion = np.mean([m.completion_tokens for m in unique_metrics_list])
+    if concurrent_prompts > 1:
+        abs_times = [r[6] for r in unique_results]
+        abs_spread = max(abs_times) - min(abs_times)
+        prefill_time = max(abs_times)  # Time until all prompts got first token
+        effective_prefill_per_prompt = prefill_time / concurrent_prompts
+        total_input_tokens = sum([m.prompt_tokens for m in unique_metrics_list])
+        logger.info(f"      Unique batch summary:")
+        logger.info(f"        avg TTFT={avg_ttft:.3f}s, abs_time spread={abs_spread:.3f}s")
+        logger.info(f"        prefill time={prefill_time:.3f}s (until all first tokens), effective per-prompt={effective_prefill_per_prompt:.3f}s")
+        logger.info(f"        total input tokens={total_input_tokens:,}, prefill throughput={total_input_tokens/prefill_time:.0f} tok/s")
+    else:
+        snippet = unique_results[0][0][:100].replace('\n', ' ') if unique_results[0][0] else ""
+        logger.info(f"      Unique: TTFT={avg_ttft:.3f}s, Output={int(avg_completion)} tok")
+        logger.info(f"      Response: {snippet}...")
 
-    cached_metrics = PromptMetrics(
-        context_size=context_size,
-        iteration=iteration,
-        prompt_type="cached",
-        prompt_tokens=prompt_tok,
-        completion_tokens=completion_tok,
-        ttft=ttft,
-        generation_time=gen_time,
-        total_time=total_time,
-        output_tokens_per_sec=output_tps
-    )
+    # Test cached prompts (same prompts again - 100% cache hit) - send all simultaneously
+    logger.info(f"    Iteration {iteration + 1}: Testing {concurrent_prompts} cached {prompt_label} (same prompts)...")
 
-    # Show snippet of response
-    snippet = response_text[:100].replace('\n', ' ') if response_text else ""
-    logger.info(f"      Cached: TTFT={ttft:.3f}s, Output={completion_tok} tok")
-    logger.info(f"      Response: {snippet}...")
-    logger.info(f"      Cache speedup: TTFT {unique_metrics.ttft/ttft:.2f}x faster")
+    batch_start_cached = time.time()
+    cached_results = await asyncio.gather(*[send_and_measure(p, i, batch_start_cached) for i, p in enumerate(prompts)])
+    batch_elapsed_cached = time.time() - batch_start_cached
 
-    return unique_metrics, cached_metrics
+    cached_metrics_list = []
+    for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(cached_results):
+        output_tps = completion_tok / gen_time if gen_time > 0 else 0
+        metrics = PromptMetrics(
+            context_size=context_size,
+            iteration=iteration,
+            prompt_type="cached",
+            prompt_tokens=prompt_tok,
+            completion_tokens=completion_tok,
+            ttft=ttft,
+            generation_time=gen_time,
+            total_time=total_time,
+            output_tokens_per_sec=output_tps
+        )
+        cached_metrics_list.append(metrics)
+
+    # Log per-prompt details when concurrent
+    if concurrent_prompts > 1:
+        for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(cached_results):
+            snippet = response_text[:80].replace('\n', ' ') if response_text else ""
+            logger.info(f"        [Prompt {i+1}] TTFT={ttft:.3f}s, abs_time={abs_ttft:.3f}s, output={completion_tok} tok")
+            logger.info(f"                  Response: {snippet}...")
+
+    # Log summary for cached prompts
+    avg_cached_ttft = np.mean([m.ttft for m in cached_metrics_list])
+    avg_cached_completion = np.mean([m.completion_tokens for m in cached_metrics_list])
+    if concurrent_prompts > 1:
+        abs_times_cached = [r[6] for r in cached_results]
+        abs_spread_cached = max(abs_times_cached) - min(abs_times_cached)
+        prefill_time_cached = max(abs_times_cached)  # Time until all prompts got first token
+        effective_prefill_per_prompt_cached = prefill_time_cached / concurrent_prompts
+        total_input_tokens_cached = sum([m.prompt_tokens for m in cached_metrics_list])
+        logger.info(f"      Cached batch summary:")
+        logger.info(f"        avg TTFT={avg_cached_ttft:.3f}s, abs_time spread={abs_spread_cached:.3f}s")
+        logger.info(f"        prefill time={prefill_time_cached:.3f}s (until all first tokens), effective per-prompt={effective_prefill_per_prompt_cached:.3f}s")
+        logger.info(f"        total input tokens={total_input_tokens_cached:,}, prefill throughput={total_input_tokens_cached/prefill_time_cached:.0f} tok/s")
+    else:
+        snippet = cached_results[0][0][:100].replace('\n', ' ') if cached_results[0][0] else ""
+        logger.info(f"      Cached: TTFT={avg_cached_ttft:.3f}s, Output={int(avg_cached_completion)} tok")
+        logger.info(f"      Response: {snippet}...")
+
+    speedup = avg_ttft / avg_cached_ttft if avg_cached_ttft > 0 else 0
+    logger.info(f"      Cache speedup: TTFT {speedup:.2f}x faster")
+
+    return unique_metrics_list, cached_metrics_list
 
 
 def generate_graphs(results: List[PromptMetrics], output_dir: str):
@@ -577,6 +640,8 @@ async def main():
                        help="Output tokens per request (default: 256)")
     parser.add_argument("--num-iterations", type=int, default=5,
                        help="Number of iterations per context size (default: 5)")
+    parser.add_argument("--concurrent-prompts", "-n", type=int, default=1,
+                       help="Number of prompts to send simultaneously (default: 1)")
     parser.add_argument("--output-dir", type=str, default="./single_prompt_output",
                        help="Output directory (default: ./single_prompt_output)")
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -646,6 +711,10 @@ async def main():
         logger.error("No context sizes to test. Specify --context-sizes or check --min-tokens and --max-tokens parameters.")
         sys.exit(1)
 
+    concurrent_prompts = args.concurrent_prompts
+    if concurrent_prompts > 1:
+        logger.info(f"{Colors.OKBLUE}Concurrent prompts per test: {concurrent_prompts}{Colors.ENDC}")
+
     logger.info(f"\n{Colors.PHASE}Testing {len(context_sizes)} context sizes: {context_sizes}{Colors.ENDC}\n")
 
     # Run tests
@@ -655,10 +724,12 @@ async def main():
         logger.info(f"{Colors.OKCYAN}Testing context size: {context_size:,} tokens{Colors.ENDC}")
 
         for iteration in range(args.num_iterations):
-            unique_metrics, cached_metrics = await test_single_prompt_pair(
-                api_client, tokenizer, context_size, args.output_tokens, iteration, base_seed
+            unique_metrics_list, cached_metrics_list = await test_single_prompt_pair(
+                api_client, tokenizer, context_size, args.output_tokens, iteration, base_seed,
+                concurrent_prompts=concurrent_prompts
             )
-            all_results.extend([unique_metrics, cached_metrics])
+            all_results.extend(unique_metrics_list)
+            all_results.extend(cached_metrics_list)
 
         logger.info("")
 
@@ -685,6 +756,7 @@ async def main():
         "detected_model": model,
         "context_sizes": context_sizes,
         "num_iterations": args.num_iterations,
+        "concurrent_prompts": concurrent_prompts,
         "output_tokens": args.output_tokens,
         "seed": base_seed
     }
