@@ -1,8 +1,0 @@
-{
-  "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
-  "api_endpoints": [
-    "http://localhost:8125"
-  ],
-  "mode": "sustained",
-  "timestamp": "2025-12-20T02:47:34.823010+00:00"
-}
