@@ -4866,8 +4866,15 @@ async def main():
                         generate_ramp_graph(detailed_metrics, context_size, cache_hit_rate,
                                            config.max_ttft, aggregated.peak_concurrency, config.output_dir)
 
+                    # Calculate total tokens processed (aligned with graph calculations)
+                    total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in detailed_metrics)
+                    total_output_tokens = sum(m.output_tokens for m in detailed_metrics)
+
                     logger.info(f"{Colors.SUCCESS}  ✓ Cache hit rate {cache_hit_rate}% complete{Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Peak concurrency: {aggregated.peak_concurrency}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total requests: {len(detailed_metrics):,}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total input tokens: {total_input_tokens:,} ({total_input_tokens/1e6:.2f}M){Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total output tokens: {total_output_tokens:,} ({total_output_tokens/1e6:.2f}M){Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg ITL: {aggregated.avg_itl*1000:.2f}ms{Colors.ENDC}")
@@ -4904,8 +4911,15 @@ async def main():
                         generate_ramp_graph(detailed_metrics, context_size, cache_hit_rate,
                                            config.max_ttft, aggregated.peak_concurrency, config.output_dir)
 
+                    # Calculate total tokens processed (aligned with graph calculations)
+                    total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in detailed_metrics)
+                    total_output_tokens = sum(m.output_tokens for m in detailed_metrics)
+
                     logger.info(f"{Colors.SUCCESS}  ✓ Cache hit rate {cache_hit_rate}% complete (fixed mode){Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Tested concurrency levels: {config.fixed_concurrency_levels}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total requests: {len(detailed_metrics):,}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total input tokens: {total_input_tokens:,} ({total_input_tokens/1e6:.2f}M){Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total output tokens: {total_output_tokens:,} ({total_output_tokens/1e6:.2f}M){Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Avg ITL: {aggregated.avg_itl*1000:.2f}ms{Colors.ENDC}")
@@ -4936,9 +4950,23 @@ async def main():
                         generate_continuous_graphs(period_metrics, config.output_dir,
                                                   context_size, cache_hit_rate, config.max_ttft, config.min_tokens_per_req)
 
+                    # Calculate total tokens processed (aligned with graph calculations)
+                    total_input_tokens = sum(p.total_input_tokens for p in period_metrics)
+                    total_output_tokens = sum(p.total_output_tokens for p in period_metrics)
+                    total_requests = sum(p.num_requests_completed for p in period_metrics)
+
                     logger.info(f"{Colors.SUCCESS}  ✓ Cache hit rate {cache_hit_rate}% complete (continuous mode){Colors.ENDC}")
                     logger.info(f"{Colors.METRIC}    Total periods: {len(period_metrics)}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total requests: {total_requests:,}{Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total input tokens: {total_input_tokens:,} ({total_input_tokens/1e6:.2f}M){Colors.ENDC}")
+                    logger.info(f"{Colors.METRIC}    Total output tokens: {total_output_tokens:,} ({total_output_tokens/1e6:.2f}M){Colors.ENDC}")
                     if period_metrics:
+                        avg_input_tps = np.mean([p.input_tokens_per_sec for p in period_metrics])
+                        avg_output_tps = np.mean([p.output_tokens_per_sec for p in period_metrics])
+                        avg_ttft = np.mean([p.avg_ttft for p in period_metrics])
+                        logger.info(f"{Colors.METRIC}    Avg input: {avg_input_tps:,.0f} tok/s{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}    Avg output: {avg_output_tps:,.0f} tok/s{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}    Avg TTFT: {avg_ttft:.3f}s{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}    Concurrency range: {min(p.concurrency_level for p in period_metrics)} - {max(p.concurrency_level for p in period_metrics)}{Colors.ENDC}")
 
                 else:
@@ -5070,12 +5098,90 @@ async def main():
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Results saved to: {config.output_dir}{Colors.ENDC}")
 
+    # Print final summary table
     if config.mode in ["adaptive", "fixed"]:
         logger.info(f"{Colors.OKGREEN}Total tests completed: {len(all_aggregated_results)}{Colors.ENDC}")
+
+        if all_aggregated_results:
+            logger.info("")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+
+            # Header
+            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+
+            # Calculate grand totals
+            grand_total_input = 0
+            grand_total_output = 0
+            grand_total_requests = 0
+
+            # Sort by context size, then cache rate
+            sorted_results = sorted(all_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate))
+
+            for m in sorted_results:
+                # Estimate total tokens from throughput and duration
+                est_input_tokens = int(m.input_tokens_per_sec * m.test_duration)
+                est_output_tokens = int(m.output_tokens_per_sec * m.test_duration)
+
+                grand_total_input += est_input_tokens
+                grand_total_output += est_output_tokens
+                grand_total_requests += m.total_requests
+
+                logger.info(f"{m.context_size:>10,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
+                           f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
+                           f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
+                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
+
+            # Grand totals
+            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.SUCCESS}{'TOTAL':>10} {'':>8} {grand_total_requests:>10,} "
+                       f"{grand_total_input/1e6:>11.2f}M {grand_total_output/1e6:>11.2f}M{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+
     else:
         # Count continuous mode tests from period files
         period_files = list(Path(config.output_dir).glob("sustained_periods_*.csv"))
         logger.info(f"{Colors.OKGREEN}Total continuous tests completed: {len(period_files)}{Colors.ENDC}")
+
+        if continuous_aggregated_results:
+            logger.info("")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+
+            # Header
+            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+
+            # Calculate grand totals
+            grand_total_input = 0
+            grand_total_output = 0
+            grand_total_requests = 0
+
+            # Sort by context size, then cache rate
+            sorted_results = sorted(continuous_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate))
+
+            for m in sorted_results:
+                # Estimate total tokens from throughput and duration
+                est_input_tokens = int(m.input_tokens_per_sec * m.test_duration)
+                est_output_tokens = int(m.output_tokens_per_sec * m.test_duration)
+
+                grand_total_input += est_input_tokens
+                grand_total_output += est_output_tokens
+                grand_total_requests += m.total_requests
+
+                logger.info(f"{m.context_size:>10,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
+                           f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
+                           f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
+                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
+
+            # Grand totals
+            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.SUCCESS}{'TOTAL':>10} {'':>8} {grand_total_requests:>10,} "
+                       f"{grand_total_input/1e6:>11.2f}M {grand_total_output/1e6:>11.2f}M{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
 
     # Brief mode output
     if brief_mode:

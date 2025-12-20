@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Per-test token summary**: After each cache hit rate test completes, displays total processed input/output tokens
+  - Shows total requests, input tokens (with M suffix), output tokens (with M suffix)
+  - Aligned with graph calculations for consistency
+  - Works in all modes: adaptive, fixed, and sustained
+- **Final summary table**: At end of all tests, displays comprehensive results table
+  - Shows all test results sorted by context size and cache hit rate
+  - Columns: Context, Cache%, Requests, Input Tok, Output Tok, Input/s, Output/s, Avg TTFT, Concurrency
+  - Includes grand totals for requests and tokens processed
+  - Provides quick overview of entire test run
+
 - **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
   - `docs/single_prompt_tester.md` - single_prompt_tester usage
   - `docs/cache_rate_tester.md` - cache_rate_tester usage
