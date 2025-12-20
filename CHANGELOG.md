@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Per-test token summary**: After each cache hit rate test completes, displays total processed input/output tokens
   - Shows total requests, input tokens (with M suffix), output tokens (with M suffix)
   - Aligned with graph calculations for consistency
-  - Works in all modes: adaptive, fixed, and sustained
+  - Works in both modes: fixed and sustained
 - **Final summary table**: At end of all tests, displays comprehensive results table
   - Shows all test results sorted by context size and cache hit rate
   - Columns: Context, Cache%, Requests, Input Tok, Output Tok, Input/s, Output/s, Avg TTFT, Concurrency
@@ -19,6 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Brief mode token totals**: Extended `--brief` output with token statistics
   - Added requests, input_tokens, output_tokens columns to CSV
   - Added total_requests, total_input_tokens, total_output_tokens summary lines
+
+### Removed
+- **Adaptive mode**: Removed `--mode adaptive` option from cache_rate_tester.py
+  - Sustained mode (default) provides better production capacity planning
+  - Fixed mode covers specific concurrency level testing needs
+  - Reduces code complexity (~550 lines removed)
+  - Only `sustained` and `fixed` modes remain
 
 - **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
   - `docs/single_prompt_tester.md` - single_prompt_tester usage
