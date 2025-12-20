@@ -79,3 +79,8 @@ uv run python single_prompt_tester.py --help
 - **TTLT (Time To Last Token):** Total request completion time
 - **ITL (Inter-Token Latency):** Time between generated tokens
 - **Input/Output Throughput:** Tokens processed/generated per second
+
+## Testing Methodology
+
+For a detailed guide on testing methodology and how to use these tools effectively, see:
+[Evaluating Management of KV Cache within an Inference System](https://medium.com/@callan.j.fox/evaluating-management-of-kv-cache-within-an-inference-system-2d7c3d266c3a)
