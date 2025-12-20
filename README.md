@@ -5,25 +5,29 @@ A toolkit for testing and benchmarking LLM inference servers and their KV Cache 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Install dependencies (using uv - recommended)
+uv pip install -r requirements.txt
+
+# Or with pip
 pip install -r requirements.txt
 
 # Run a simple single-prompt test
-python single_prompt_tester.py \
+uv run python single_prompt_tester.py \
     --api-endpoint http://localhost:8000 \
     --min-tokens 1000 \
     --max-tokens 128000 \
     --output-dir results
 
-# Test various cache hit rates
-python cache_rate_tester.py \
+# Test various cache hit rates (sustained mode - default)
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 8000 32000 64000 \
     --working-set-size 2000000 \
+    --max-ttft 2.0 \
     --output-dir output
 
 # Test performance across different memory tiers
-python working_set_tester.py \
+uv run python working_set_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 30000 \
     --min-working-set-size 100000 \
@@ -52,10 +56,21 @@ See [Utilities Documentation](docs/utilities.md) for details.
 
 ## Installation
 
+We recommend using [uv](https://docs.astral.sh/uv/) for fast, reliable Python package management.
+
 ```bash
+# Clone the repository
 git clone https://github.com/callanjfox/kv-cache-tester.git
+cd kv-cache-tester
+
+# Install dependencies with uv (recommended)
+uv pip install -r requirements.txt
+
+# Or with pip
 pip install -r requirements.txt
-python single_prompt_tester.py --help
+
+# Verify installation
+uv run python single_prompt_tester.py --help
 ```
 
 ## Understanding the Metrics
