@@ -4204,15 +4204,66 @@ async def main():
         except Exception as e:
             logger.warning(f"Failed to generate index.html: {e}")
 
+    # For sustained mode: aggregate results from period CSV files for the summary
+    sustained_aggregated_results = []
+    if config.mode == "sustained":
+        period_files = list(Path(config.output_dir).glob("sustained_periods_*.csv"))
+
+        for period_file in period_files:
+            try:
+                df_periods = pd.read_csv(period_file)
+                if len(df_periods) > 0:
+                    # Extract context, working_set, and cache rate from filename
+                    # Format: sustained_periods_ctx{context}_ws{ws_size}_cache{rate}_{timestamp}.csv
+                    filename = period_file.stem
+                    context_str = filename.split('ctx')[1].split('_')[0]
+                    ws_str = filename.split('ws')[1].split('_')[0]
+                    cache_str = filename.split('cache')[1].split('_')[0]
+                    ctx_size = int(context_str)
+                    ws_size = int(ws_str)
+                    cache_rate = int(cache_str)
+
+                    # Create aggregated metrics from period data
+                    aggregated = AggregatedMetrics(
+                        context_size=ctx_size,
+                        working_set_size=ws_size,
+                        cache_hit_rate=cache_rate,
+                        model=model,
+                        input_tokens_per_sec=df_periods['input_tokens_per_sec'].mean(),
+                        output_tokens_per_sec=df_periods['output_tokens_per_sec'].mean(),
+                        avg_ttft=df_periods['avg_ttft'].mean(),
+                        median_ttft=df_periods['median_ttft'].mean(),
+                        p95_ttft=df_periods['p95_ttft'].mean(),
+                        p99_ttft=df_periods['p99_ttft'].mean(),
+                        avg_ttlt=df_periods['avg_ttlt'].mean(),
+                        median_ttlt=df_periods['median_ttlt'].mean(),
+                        p95_ttlt=df_periods['p95_ttlt'].mean(),
+                        p99_ttlt=df_periods['p99_ttlt'].mean(),
+                        avg_output_tokens=df_periods['avg_output_tokens_per_request'].mean(),
+                        avg_itl=df_periods['avg_itl'].mean(),
+                        median_itl=df_periods['median_itl'].mean(),
+                        p95_itl=df_periods['p95_itl'].mean(),
+                        p99_itl=df_periods['p99_itl'].mean(),
+                        peak_concurrency=int(df_periods['concurrency_level'].max()),
+                        total_requests=int(df_periods['num_requests_completed'].sum()),
+                        test_duration=df_periods['duration'].sum()
+                    )
+                    sustained_aggregated_results.append(aggregated)
+            except Exception as e:
+                logger.warning(f"Failed to parse sustained period file {period_file}: {e}")
+
+    # Combine fixed and sustained mode results for summary
+    all_results_for_summary = all_aggregated_results + sustained_aggregated_results
+
     logger.info("")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}✓ All tests complete!{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Results saved to: {config.output_dir}{Colors.ENDC}")
-    logger.info(f"{Colors.OKGREEN}Total tests completed: {len(all_aggregated_results)}{Colors.ENDC}")
+    logger.info(f"{Colors.OKGREEN}Total tests completed: {len(all_results_for_summary)}{Colors.ENDC}")
 
     # Print final summary table
-    if all_aggregated_results:
+    if all_results_for_summary:
         logger.info("")
         logger.info(f"{Colors.PHASE}{'='*130}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
@@ -4228,7 +4279,7 @@ async def main():
         grand_total_requests = 0
 
         # Sort by context size, then working set size, then cache rate
-        sorted_results = sorted(all_aggregated_results, key=lambda x: (x.context_size, x.working_set_size, x.cache_hit_rate))
+        sorted_results = sorted(all_results_for_summary, key=lambda x: (x.context_size, x.working_set_size, x.cache_hit_rate))
 
         for m in sorted_results:
             # Estimate total tokens from throughput and duration
@@ -4251,7 +4302,7 @@ async def main():
         logger.info(f"{Colors.PHASE}{'='*130}{Colors.ENDC}")
 
     # Brief mode output
-    if brief_mode and all_aggregated_results:
+    if brief_mode and all_results_for_summary:
         print(f"model: {model}")
         print(f"endpoint: {config.api_endpoints[0]}")
         print(f"cache_rate: {config.cache_hit_rates[0]}")
@@ -4263,7 +4314,7 @@ async def main():
         brief_total_input = 0
         brief_total_output = 0
 
-        for m in sorted(all_aggregated_results, key=lambda x: (x.context_size, x.working_set_size)):
+        for m in sorted(all_results_for_summary, key=lambda x: (x.context_size, x.working_set_size)):
             est_input = int(m.input_tokens_per_sec * m.test_duration)
             est_output = int(m.output_tokens_per_sec * m.test_duration)
             brief_total_requests += m.total_requests
