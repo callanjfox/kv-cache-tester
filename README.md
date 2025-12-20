@@ -84,3 +84,13 @@ uv run python single_prompt_tester.py --help
 
 For a detailed guide on testing methodology and how to use these tools effectively, see:
 [Evaluating Management of KV Cache within an Inference System](https://medium.com/@callan.j.fox/evaluating-management-of-kv-cache-within-an-inference-system-2d7c3d266c3a)
+
+## Roadmap
+
+**Next Up: Real-World Trace Replay**
+
+Update `cache_rate_tester.py` and `working_set_tester.py` to consume real traces from agentic coding workloads. This will enable:
+
+- Real-world benchmarking using actual production traces
+- Honoring the real delay between prompts for accurate load simulation
+- Adherence to trace patterns for realistic cache behavior testing
