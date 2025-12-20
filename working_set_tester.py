@@ -833,8 +833,8 @@ def parse_arguments() -> argparse.Namespace:
                             "'per_test' = before each concurrency level")
     parser.add_argument("--random-working-set-selection", action="store_true",
                        help="Use random selection instead of cycling")
-    parser.add_argument("--num-retries", type=int, default=3,
-                       help="Number of retries at peak concurrency (default: 3)")
+    parser.add_argument("--num-retries", type=int, default=0,
+                       help="Number of retries at peak concurrency (default: 0)")
     parser.add_argument("--start-concurrency", type=int, default=2,
                        help="Starting concurrent requests (default: 2)")
     parser.add_argument("--concurrency-increment", type=int, default=2,
