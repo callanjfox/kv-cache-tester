@@ -6,15 +6,15 @@ The primary testing tool. Measures performance at various cache hit rates (0%, 5
 
 | Mode | Description |
 |------|-------------|
-| `sustained` (default) | Sustained load testing with continuous concurrency adjustment. Recommended for production capacity planning. |
-| `fixed` | Test specific concurrency levels with retries. Useful for benchmarking at known concurrency points. |
+| `sustained` (default) | Sustained load testing with continuous concurrency adjustment. Recommended for production capacity planning. Requires TTFT threshold. |
+| `fixed` | Test specific concurrency levels to understand how concurrency impacts the system. Thresholds are optional - useful for exploring behavior without constraints. |
 
 ## What it does
 
 - Pre-warms a working set of prompts
 - Tests each cache hit rate by mixing cached prefixes with unique suffixes
-- **Sustained mode**: Continuously adjusts concurrency based on performance thresholds
-- **Fixed mode**: Tests specified concurrency levels with retries for stable measurements
+- **Sustained mode**: Continuously adjusts concurrency based on performance thresholds. Ramps up when under threshold, ramps down when over.
+- **Fixed mode**: Tests each specified concurrency level for a fixed duration, measuring performance regardless of whether thresholds are met. Use this when you want to understand how the system behaves at specific concurrency points without the test terminating early due to threshold violations.
 
 ## Options
 
@@ -35,11 +35,11 @@ The primary testing tool. Measures performance at various cache hit rates (0%, 5
 
 ### Performance Thresholds
 
-At least one threshold is required:
+At least one threshold is required for **sustained mode**. In **fixed mode**, thresholds are optional - if omitted, all concurrency levels run for the full duration regardless of performance.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--max-ttft` | TTFT threshold in seconds (e.g., 2.0) | - |
+| `--max-ttft` | TTFT threshold in seconds (e.g., 2.0). Required for sustained mode, optional for fixed mode. | - |
 | `--ttft-metric` | Metric for TTFT threshold (`max`, `avg`, `p95`) | p95 |
 | `--min-tokens-per-req` | Minimum output tokens/s per request | - |
 | `--tokens-per-req-metric` | Metric for tokens/req (`avg`, `p5`, `p10`) | avg |
@@ -97,7 +97,16 @@ uv run python cache_rate_tester.py \
     --max-ttft 2.0 \
     --output-dir test_output
 
-# Fixed mode - test specific concurrency levels
+# Fixed mode - test specific concurrency levels (no thresholds, full exploration)
+uv run python cache_rate_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --context-sizes 32000 \
+    --working-set-size 2000000 \
+    --mode fixed \
+    --fixed-concurrency-levels 10 20 40 80 \
+    --output-dir fixed_output
+
+# Fixed mode with threshold - limits test duration if TTFT exceeds target
 uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 \
@@ -105,7 +114,7 @@ uv run python cache_rate_tester.py \
     --mode fixed \
     --fixed-concurrency-levels 10 20 40 80 \
     --max-ttft 2.0 \
-    --output-dir fixed_output
+    --output-dir fixed_output_with_threshold
 
 # Multiple context sizes with custom cache rates
 uv run python cache_rate_tester.py \
@@ -155,8 +164,8 @@ uv run python cache_rate_tester.py \
 
 ## When to use
 
-- **Sustained mode**: Production capacity planning, understanding sustainable throughput
-- **Fixed mode**: Benchmarking at specific concurrency points, comparing configurations
+- **Sustained mode**: Production capacity planning, understanding sustainable throughput at a given TTFT target
+- **Fixed mode**: Understanding how concurrency impacts throughput, latency, and system behavior. Run without thresholds to explore the full performance curve, or with thresholds to limit test duration at underperforming levels.
 - Understanding performance across cache efficiency spectrum
 - Finding optimal working set size for your memory tier
 

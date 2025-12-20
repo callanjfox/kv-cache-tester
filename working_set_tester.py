@@ -4493,7 +4493,14 @@ async def main():
                             generate_ramp_graph(detailed_metrics, context_size, working_set_size, cache_hit_rate,
                                                config.max_ttft, aggregated.peak_concurrency, config.output_dir)
 
+                        # Calculate total tokens processed (aligned with graph calculations)
+                        total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in detailed_metrics)
+                        total_output_tokens = sum(m.output_tokens for m in detailed_metrics)
+
                         logger.info(f"{Colors.SUCCESS}    ✓ Working set size {working_set_size:,} complete{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Total requests: {len(detailed_metrics):,}{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Total input tokens: {total_input_tokens:,} ({total_input_tokens/1e6:.2f}M){Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Total output tokens: {total_output_tokens:,} ({total_output_tokens/1e6:.2f}M){Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Peak concurrency: {aggregated.peak_concurrency}{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
@@ -4557,17 +4564,70 @@ async def main():
     logger.info(f"{Colors.OKGREEN}Results saved to: {config.output_dir}{Colors.ENDC}")
     logger.info(f"{Colors.OKGREEN}Total tests completed: {len(all_aggregated_results)}{Colors.ENDC}")
 
+    # Print final summary table
+    if all_aggregated_results:
+        logger.info("")
+        logger.info(f"{Colors.PHASE}{'='*130}{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}{'='*130}{Colors.ENDC}")
+
+        # Header
+        logger.info(f"{Colors.PHASE}{'Context':>10} {'WorkingSet':>12} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6}{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}{'-'*130}{Colors.ENDC}")
+
+        # Calculate grand totals
+        grand_total_input = 0
+        grand_total_output = 0
+        grand_total_requests = 0
+
+        # Sort by context size, then working set size, then cache rate
+        sorted_results = sorted(all_aggregated_results, key=lambda x: (x.context_size, x.working_set_size, x.cache_hit_rate))
+
+        for m in sorted_results:
+            # Estimate total tokens from throughput and duration
+            est_input_tokens = int(m.input_tokens_per_sec * m.test_duration)
+            est_output_tokens = int(m.output_tokens_per_sec * m.test_duration)
+
+            grand_total_input += est_input_tokens
+            grand_total_output += est_output_tokens
+            grand_total_requests += m.total_requests
+
+            logger.info(f"{m.context_size:>10,} {m.working_set_size:>12,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
+                       f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
+                       f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
+                       f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
+
+        # Grand totals
+        logger.info(f"{Colors.PHASE}{'-'*130}{Colors.ENDC}")
+        logger.info(f"{Colors.SUCCESS}{'TOTAL':>10} {'':>12} {'':>8} {grand_total_requests:>10,} "
+                   f"{grand_total_input/1e6:>11.2f}M {grand_total_output/1e6:>11.2f}M{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}{'='*130}{Colors.ENDC}")
+
     # Brief mode output
     if brief_mode and all_aggregated_results:
         print(f"model: {model}")
         print(f"endpoint: {config.api_endpoints[0]}")
         print(f"cache_rate: {config.cache_hit_rates[0]}")
         print()
-        print("context_size,working_set,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+        print("context_size,working_set,requests,input_tokens,output_tokens,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+
+        # Calculate totals for brief mode
+        brief_total_requests = 0
+        brief_total_input = 0
+        brief_total_output = 0
 
         for m in sorted(all_aggregated_results, key=lambda x: (x.context_size, x.working_set_size)):
-            print(f"{m.context_size},{m.working_set_size},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+            est_input = int(m.input_tokens_per_sec * m.test_duration)
+            est_output = int(m.output_tokens_per_sec * m.test_duration)
+            brief_total_requests += m.total_requests
+            brief_total_input += est_input
+            brief_total_output += est_output
+            print(f"{m.context_size},{m.working_set_size},{m.total_requests},{est_input},{est_output},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
 
+        print()
+        print(f"total_requests: {brief_total_requests}")
+        print(f"total_input_tokens: {brief_total_input}")
+        print(f"total_output_tokens: {brief_total_output}")
         print()
         print(f"output: {config.output_dir}")
 
