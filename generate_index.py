@@ -127,7 +127,7 @@ def get_graph_files(output_path: Path) -> Dict[str, List[Path]]:
     graphs = {
         'performance': [],
         'comparison': [],
-        'ramp': [],
+        'fixed': [],
         'sustained': [],
         'heatmap': [],
         'single_prompt': [],
@@ -143,8 +143,8 @@ def get_graph_files(output_path: Path) -> Dict[str, List[Path]]:
             graphs['performance'].append(html_file)
         elif 'comparison' in name or 'throughput_ctx' in name or 'ttft_comparison' in name:
             graphs['comparison'].append(html_file)
-        elif 'ramp_' in name:
-            graphs['ramp'].append(html_file)
+        elif 'fixed_' in name or 'ramp_' in name:
+            graphs['fixed'].append(html_file)
         elif 'sustained' in name:
             graphs['sustained'].append(html_file)
         elif 'heatmap' in name:
@@ -587,24 +587,26 @@ def generate_graphs_section(graphs: Dict[str, List[Path]], test_type: str) -> st
             <p>Compare performance across context sizes</p>
         </a>""")
 
-    # Ramp graphs (collapsible by context)
-    if graphs['ramp']:
-        ramp_by_ctx = {}
-        for g in graphs['ramp']:
-            parts = g.stem.replace('ramp_ctx', '').split('_')
+    # Fixed mode / Ramp graphs (collapsible by context)
+    if graphs['fixed']:
+        fixed_by_ctx = {}
+        for g in graphs['fixed']:
+            # Handle both fixed_ctx and ramp_ctx naming
+            name = g.stem.replace('fixed_ctx', '').replace('ramp_ctx', '')
+            parts = name.split('_')
             ctx = parts[0]
-            if ctx not in ramp_by_ctx:
-                ramp_by_ctx[ctx] = []
-            ramp_by_ctx[ctx].append(g)
+            if ctx not in fixed_by_ctx:
+                fixed_by_ctx[ctx] = []
+            fixed_by_ctx[ctx].append(g)
 
-        sections.append('<h3 style="margin-top: 20px;">Concurrency Ramp Analysis</h3>')
-        for ctx in sorted(ramp_by_ctx.keys(), key=lambda x: int(x)):
-            ramps = ramp_by_ctx[ctx]
+        sections.append('<h3 style="margin-top: 20px;">Fixed Concurrency Analysis</h3>')
+        for ctx in sorted(fixed_by_ctx.keys(), key=lambda x: int(x)):
+            fixed_graphs = fixed_by_ctx[ctx]
             sections.append(f"""
         <details>
-            <summary>Context: {ctx} tokens ({len(ramps)} tests)</summary>
+            <summary>Context: {ctx} tokens ({len(fixed_graphs)} tests)</summary>
             <div>""")
-            for g in sorted(ramps):
+            for g in sorted(fixed_graphs):
                 name = g.stem
                 if '_cache' in name:
                     cache = name.split('_cache')[1].split('_')[0]

@@ -917,9 +917,9 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
     if args.assessment_period < 1:
         raise ValueError(f"assessment-period must be >= 1 second (got {args.assessment_period})")
 
-    # Validate that at least one performance threshold is specified
-    if args.max_ttft is None and args.min_tokens_per_req is None:
-        raise ValueError(f"At least one performance threshold is required: --max-ttft OR --min-tokens-per-req (or both)")
+    # Validate that at least one performance threshold is specified (required for sustained mode only)
+    if args.mode == "sustained" and args.max_ttft is None and args.min_tokens_per_req is None:
+        raise ValueError(f"At least one performance threshold is required for sustained mode: --max-ttft OR --min-tokens-per-req (or both)")
 
     # Validate threshold values are positive
     if args.max_ttft is not None and args.max_ttft <= 0:
@@ -2441,15 +2441,17 @@ def save_run_command(args: argparse.Namespace, output_dir: str):
 
 
 def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: int,
-                       cache_hit_rate: int, max_ttft: float, peak_concurrency: int, output_dir: str):
+                       cache_hit_rate: int, max_ttft: float, peak_concurrency: int, output_dir: str,
+                       mode: str = "fixed"):
     """
-    Generate detailed concurrency ramp visualization for a single cache hit rate test
+    Generate detailed concurrency visualization for a single cache hit rate test
 
-    Shows ONLY the ramp phase data (excludes retry runs) to make it clear why each
-    concurrency level was chosen or rejected during the ramp.
+    Shows ONLY the run phase data (excludes retry runs) to show performance at each
+    concurrency level.
 
-    Naming scheme: ramp_ctx{context_size}_cache{cache_hit_rate}.html
-    Example: ramp_ctx30000_cache50.html (30K context, 50% cache hit rate)
+    Naming scheme:
+    - Fixed mode: fixed_ctx{context_size}_cache{cache_hit_rate}.html
+    - Other modes: ramp_ctx{context_size}_cache{cache_hit_rate}.html
     """
     if not detailed_metrics:
         return
@@ -2457,13 +2459,20 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Filter to ONLY RAMP phases (exclude RETRY phases)
-    # This shows the actual ramp behavior that determined peak concurrency
+    # Filter to ONLY run phases (exclude RETRY phases)
+    # This shows the actual ramp/run behavior that determined peak concurrency
+    # For adaptive mode: RAMP_c{concurrency}
+    # For fixed mode: FIXED_c{concurrency}_run{n}
     df = pd.DataFrame([m.to_dict() for m in detailed_metrics])
-    ramp_df = df[df['phase_id'].str.startswith('RAMP')].copy()
+
+    # Include RAMP phases and FIXED run phases, exclude RETRY phases
+    ramp_df = df[
+        (df['phase_id'].str.startswith('RAMP')) |
+        (df['phase_id'].str.contains('_run') & ~df['phase_id'].str.contains('RETRY'))
+    ].copy()
 
     if len(ramp_df) == 0:
-        logger.warning(f"No RAMP phase data found for ramp graph (context={context_size}, cache_rate={cache_hit_rate})")
+        logger.warning(f"No run phase data found for graph (context={context_size}, cache_rate={cache_hit_rate})")
         return
 
     # Calculate metrics per concurrency level using ONLY ramp data
@@ -2583,14 +2592,15 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
         row=3, col=1
     )
 
-    # Add horizontal line for TTFT threshold
-    fig.add_hline(
-        y=max_ttft,
-        line=dict(color='red', width=2, dash='dash'),
-        annotation_text=f"TTFT Threshold ({max_ttft}s)",
-        annotation_position="right",
-        row=3, col=1
-    )
+    # Add horizontal line for TTFT threshold (if specified)
+    if max_ttft is not None:
+        fig.add_hline(
+            y=max_ttft,
+            line=dict(color='red', width=2, dash='dash'),
+            annotation_text=f"TTFT Threshold ({max_ttft}s)",
+            annotation_position="right",
+            row=3, col=1
+        )
 
     # Add vertical line for peak concurrency (across all subplots)
     for row in [1, 2, 3]:
@@ -2638,10 +2648,11 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
         hovermode='x unified'
     )
 
-    # Save with naming scheme: ramp_ctx{context_size}_cache{cache_hit_rate}.html
-    filename = output_path / f"ramp_ctx{context_size}_cache{cache_hit_rate}.html"
+    # Save with naming scheme based on mode
+    prefix = "fixed" if mode == "fixed" else "ramp"
+    filename = output_path / f"{prefix}_ctx{context_size}_cache{cache_hit_rate}.html"
     fig.write_html(filename)
-    logger.debug(f"Generated ramp graph: {filename}")
+    logger.info(f"Generated {prefix} mode graph: {filename}")
 
 
 def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str, config: TestConfig):
@@ -4093,10 +4104,11 @@ async def main():
                     save_aggregated_results(all_aggregated_results, config.output_dir)
                     save_phase_metadata(phase_metadata_list, config.output_dir)
 
-                    # Generate ramp graph for this cache hit rate
+                    # Generate fixed mode graph for this cache hit rate
                     if not config.skip_graphs:
                         generate_ramp_graph(detailed_metrics, context_size, cache_hit_rate,
-                                           config.max_ttft, aggregated.peak_concurrency, config.output_dir)
+                                           config.max_ttft, aggregated.peak_concurrency, config.output_dir,
+                                           mode="fixed")
 
                     # Calculate total tokens processed (aligned with graph calculations)
                     total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in detailed_metrics)
