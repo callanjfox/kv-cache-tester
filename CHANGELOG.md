@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Unified working_set_tester modes**: Fixed mode now behaves like sustained mode
+  - Both modes use assessment periods for stats collection
+  - Both modes support working set growth during the test
+  - Fixed mode keeps concurrency constant (no ramping up/down)
+  - Changed `--fixed-concurrency-levels` to `--fixed-concurrency` (single value)
+  - Summary shows min-max working set range (e.g., "51K-205K")
 - **Per-test token summary**: After each cache hit rate test completes, displays total processed input/output tokens
   - Shows total requests, input tokens (with M suffix), output tokens (with M suffix)
   - Aligned with graph calculations for consistency
@@ -19,16 +25,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Brief mode token totals**: Extended `--brief` output with token statistics
   - Added requests, input_tokens, output_tokens columns to CSV
   - Added total_requests, total_input_tokens, total_output_tokens summary lines
-
-### Removed
-- **Adaptive mode**: Removed `--mode adaptive` option from cache_rate_tester.py
-  - Sustained mode (default) provides better production capacity planning
-  - Fixed mode covers specific concurrency level testing needs
-  - Reduces code complexity (~550 lines removed)
-  - Only `sustained` and `fixed` modes remain
-- **Dead code cleanup**: Removed unused `generate_continuous_index` function (~220 lines)
-  - Was superseded by unified `generate_index.py` which auto-detects test type
-
 - **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
   - `docs/single_prompt_tester.md` - single_prompt_tester usage
   - `docs/cache_rate_tester.md` - cache_rate_tester usage
@@ -61,28 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Added final summary table at end showing all context sizes
   - Added blank lines between iterations for better readability
   - Brief mode now shows per-context summaries during testing and formatted final table
-
-### Fixed
-- **Critical: `--strict-time-window` flag now works correctly**
-  - Fixed throughput calculations to filter requests BEFORE calculation when `--strict-time-window` is enabled
-  - Previously, the flag would filter requests but throughput was calculated from unfiltered data, causing incorrect metrics
-  - Now all calculations (aggregated metrics, ramp decisions, and graphs) properly respect the strict time window
-
-- **Fixed duplicate entries crash in graph generation**
-  - Added deduplication in `generate_graphs()` to handle resumed tests
-  - Prevents "Index contains duplicate entries, cannot reshape" error in heatmap generation
-  - Keeps most recent entry when same test configuration runs multiple times
-
-- **Ramping logic now respects `--strict-time-window`**
-  - Ramp phase TTFT threshold checks now use filtered metrics when strict mode is enabled
-  - Peak concurrency selection is now based on strict window performance
-  - Binary search refinement also respects strict window filtering
-  - This ensures that concurrency decisions are made based on "in-window" request performance only
-
-- **Graph generation now respects `--strict-time-window`**
-  - Variability bands in graphs now calculated from filtered data when strict mode is enabled
-  - Previously graphs recalculated from phase metadata without checking the flag
-  - Now both main graph lines and variability calculations use consistent filtering
+- `.gitignore` file to exclude test artifacts (`output/`, `*.log`, `__pycache__/`, etc.)
 
 ### Changed
 - `generate_graphs()` function now requires `config: TestConfig` parameter in both tools
@@ -92,8 +67,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Partial results are discarded and tests are re-run completely
   - Provides clean, consistent data and prevents duplicate entries
 
-### Added
-- `.gitignore` file to exclude test artifacts (`output/`, `*.log`, `__pycache__/`, etc.)
+### Fixed
+- **Critical: `--strict-time-window` flag now works correctly**
+  - Fixed throughput calculations to filter requests BEFORE calculation when `--strict-time-window` is enabled
+  - Previously, the flag would filter requests but throughput was calculated from unfiltered data, causing incorrect metrics
+  - Now all calculations (aggregated metrics, ramp decisions, and graphs) properly respect the strict time window
+- **Fixed duplicate entries crash in graph generation**
+  - Added deduplication in `generate_graphs()` to handle resumed tests
+  - Prevents "Index contains duplicate entries, cannot reshape" error in heatmap generation
+  - Keeps most recent entry when same test configuration runs multiple times
+- **Ramping logic now respects `--strict-time-window`**
+  - Ramp phase TTFT threshold checks now use filtered metrics when strict mode is enabled
+  - Peak concurrency selection is now based on strict window performance
+  - Binary search refinement also respects strict window filtering
+  - This ensures that concurrency decisions are made based on "in-window" request performance only
+- **Graph generation now respects `--strict-time-window`**
+  - Variability bands in graphs now calculated from filtered data when strict mode is enabled
+  - Previously graphs recalculated from phase metadata without checking the flag
+  - Now both main graph lines and variability calculations use consistent filtering
+
+### Removed
+- **Adaptive mode**: Removed `--mode adaptive` option from cache_rate_tester.py
+  - Sustained mode (default) provides better production capacity planning
+  - Fixed mode covers specific concurrency level testing needs
+  - Reduces code complexity (~550 lines removed)
+  - Only `sustained` and `fixed` modes remain
+- **Dead code cleanup**: Removed unused `generate_continuous_index` function (~220 lines)
+  - Was superseded by unified `generate_index.py` which auto-detects test type
+- **Redundant working_set_tester code**: Removed ~130 lines of `run_fixed_concurrency_mode` function
+  - Fixed mode now uses the same `run_continuous_mode` function as sustained mode
 
 ## Notes
 
