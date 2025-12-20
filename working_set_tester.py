@@ -2860,7 +2860,7 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Filter to ONLY run phases (exclude RETRY phases)
-    # For adaptive mode: RAMP_c{concurrency}
+    # For sustained mode: RAMP_c{concurrency}
     # For fixed mode: FIXED_c{concurrency}_run{n}
     df = pd.DataFrame([m.to_dict() for m in detailed_metrics])
 
@@ -4030,9 +4030,6 @@ async def main():
             logger.info("")
             logger.info(f"{Colors.HEADER}  Testing cache hit rate: {cache_hit_rate}%{Colors.ENDC}")
             logger.info(f"{Colors.HEADER}  {'='*70}{Colors.ENDC}")
-
-            # Track previous peak concurrency for adaptive starting points
-            previous_peak_concurrency = None
 
             # For sustained mode: only test the max working_set_size (growth happens inside test)
             # For fixed mode: test each working_set_size separately
