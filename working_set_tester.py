@@ -1687,6 +1687,11 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
         # Skip concurrency adjustment for fixed mode
         if is_fixed_mode:
             # In fixed mode, just log the metrics without adjustment
+            # Still track peak for reporting
+            if input_tps > peak_input_tps:
+                peak_input_tps = input_tps
+                peak_output_tps = output_tps
+                peak_period = period_number
             logger.info(f"    {ttft_metric_name}: {measured_ttft:.3f}s | {tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s")
         else:
             # Check if thresholds exceeded (sustained mode only)
@@ -4036,10 +4041,10 @@ async def main():
         except Exception as e:
             logger.warning(f"Failed to generate index.html: {e}")
 
-    # For sustained mode: aggregate results from period CSV files for the summary
+    # Aggregate results from period CSV files for the summary (both modes use same format)
     sustained_aggregated_results = []
-    if config.mode == "sustained":
-        period_files = list(Path(config.output_dir).glob("sustained_periods_*.csv"))
+    period_files = list(Path(config.output_dir).glob("sustained_periods_*.csv"))
+    if period_files:
 
         for period_file in period_files:
             try:
