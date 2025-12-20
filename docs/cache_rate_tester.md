@@ -51,7 +51,7 @@ At least one threshold is required:
 | `--test-duration` | Max seconds per cache rate test | 300 |
 | `--ramp-duration` | Seconds per concurrency level (fixed mode) | 60 |
 | `--assessment-period` | Seconds per assessment period (sustained mode) | 30 |
-| `--num-retries` | Retry runs at each concurrency level (fixed mode) | 3 |
+| `--num-retries` | Retry runs at each concurrency level (fixed mode) | 0 |
 
 ### Concurrency Control
 
