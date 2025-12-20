@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Fixed mode covers specific concurrency level testing needs
   - Reduces code complexity (~550 lines removed)
   - Only `sustained` and `fixed` modes remain
+- **Dead code cleanup**: Removed unused `generate_continuous_index` function (~220 lines)
+  - Was superseded by unified `generate_index.py` which auto-detects test type
 
 - **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
   - `docs/single_prompt_tester.md` - single_prompt_tester usage

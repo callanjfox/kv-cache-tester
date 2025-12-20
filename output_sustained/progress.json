@@ -1,0 +1,45 @@
+{
+  "test_id": "5bc4a380c13d3548",
+  "parameters": {
+    "api_endpoints": [
+      "http://localhost:8125"
+    ],
+    "context_sizes": [
+      8000
+    ],
+    "working_set_size": 500000,
+    "output_tokens": 256,
+    "max_ttft": 5.0,
+    "ttft_metric": "p95",
+    "min_tokens_per_req": null,
+    "tokens_per_req_metric": "avg",
+    "output_dir": "./output_sustained",
+    "tokenizer_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "test_duration": 30,
+    "ramp_duration": 60,
+    "assessment_period": 10,
+    "mode": "sustained",
+    "reinit_strategy": "once",
+    "random_selection": false,
+    "num_retries": 3,
+    "start_concurrency": 2,
+    "concurrency_increment": 2,
+    "max_concurrency": 1000,
+    "init_concurrency": 16,
+    "cache_hit_rates": [
+      50
+    ],
+    "skip_graphs": true,
+    "force_restart": true,
+    "verbose": false,
+    "chunk_size": 256,
+    "seed": null,
+    "kv_cache_bytes": 2,
+    "strict_time_window": false,
+    "fixed_concurrency_levels": null
+  },
+  "completed_tests": [
+    "8000_50"
+  ],
+  "last_update": "2025-12-20T02:39:44.500077+00:00"
+}
