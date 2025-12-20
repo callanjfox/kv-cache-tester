@@ -303,68 +303,137 @@ class APIClient:
 
 
 async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerManager,
-                                  context_size: int, output_tokens: int, iteration: int, base_seed: int) -> Tuple[PromptMetrics, PromptMetrics]:
+                                  context_size: int, output_tokens: int, iteration: int, base_seed: int,
+                                  concurrent_prompts: int = 1, cached_repeats: int = 1) -> Tuple[List[PromptMetrics], List[PromptMetrics]]:
     """
-    Test a single unique prompt followed by cached repeat
-    Returns: (unique_metrics, cached_metrics)
+    Test unique prompts followed by cached repeats
+    Returns: (list of unique_metrics, list of cached_metrics)
     """
-    # Generate unique prompt with seed offset for this iteration
-    prompt_seed = base_seed + iteration * 1000
-    unique_tokens = tokenizer.generate_dummy_tokens(context_size, seed=prompt_seed)
-    unique_prompt = tokenizer.decode(unique_tokens) + "\n\nTell me a story."
+    # Generate unique prompts with seed offset for this iteration
+    prompts = []
+    for i in range(concurrent_prompts):
+        prompt_seed = base_seed + iteration * 1000 + i * 100
+        unique_tokens = tokenizer.generate_dummy_tokens(context_size, seed=prompt_seed)
+        unique_prompt = tokenizer.decode(unique_tokens) + "\n\nTell me a story."
+        prompts.append(unique_prompt)
 
-    logger.info(f"    Iteration {iteration + 1}: Testing unique prompt ({context_size:,} tokens)...")
+    prompt_label = "prompts" if concurrent_prompts > 1 else "prompt"
+    logger.info(f"    Iteration {iteration + 1}: Testing {concurrent_prompts} unique {prompt_label} ({context_size:,} tokens each)...")
 
-    # Test unique prompt (cold start)
-    start_time = time.time()
-    response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(unique_prompt, output_tokens)
-    total_time = time.time() - start_time
-    output_tps = completion_tok / gen_time if gen_time > 0 else 0
+    # Test unique prompts (cold start) - send all simultaneously
+    # Returns: (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, absolute_first_token_time)
+    async def send_and_measure(prompt: str, prompt_idx: int, batch_start_ref: float) -> Tuple[str, float, float, int, int, float, float]:
+        start_time = time.time()
+        response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(prompt, output_tokens)
+        total_time = time.time() - start_time
+        # Calculate absolute first-token time relative to batch start
+        absolute_first_token = (start_time - batch_start_ref) + ttft
+        return response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, absolute_first_token
 
-    unique_metrics = PromptMetrics(
-        context_size=context_size,
-        iteration=iteration,
-        prompt_type="unique",
-        prompt_tokens=prompt_tok,
-        completion_tokens=completion_tok,
-        ttft=ttft,
-        generation_time=gen_time,
-        total_time=total_time,
-        output_tokens_per_sec=output_tps
-    )
+    # Send all unique prompts simultaneously
+    batch_start = time.time()
+    unique_results = await asyncio.gather(*[send_and_measure(p, i, batch_start) for i, p in enumerate(prompts)])
+    batch_elapsed = time.time() - batch_start
 
-    # Show snippet of response
-    snippet = response_text[:100].replace('\n', ' ') if response_text else ""
-    logger.info(f"      Unique: TTFT={ttft:.3f}s, Output={completion_tok} tok")
-    logger.info(f"      Response: {snippet}...")
+    unique_metrics_list = []
+    for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(unique_results):
+        output_tps = completion_tok / gen_time if gen_time > 0 else 0
+        metrics = PromptMetrics(
+            context_size=context_size,
+            iteration=iteration,
+            prompt_type="unique",
+            prompt_tokens=prompt_tok,
+            completion_tokens=completion_tok,
+            ttft=ttft,
+            generation_time=gen_time,
+            total_time=total_time,
+            output_tokens_per_sec=output_tps
+        )
+        unique_metrics_list.append(metrics)
 
-    # Test cached prompt (same prompt again - 100% cache hit)
-    logger.info(f"    Iteration {iteration + 1}: Testing cached prompt (same prompt)...")
+    # Log per-prompt details when concurrent
+    if concurrent_prompts > 1:
+        for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(unique_results):
+            snippet = response_text[:80].replace('\n', ' ') if response_text else ""
+            logger.info(f"        [Prompt {i+1}] TTFT={ttft:.3f}s, abs_time={abs_ttft:.3f}s, output={completion_tok} tok")
+            logger.info(f"                  Response: {snippet}...")
 
-    start_time = time.time()
-    response_text, ttft, gen_time, prompt_tok, completion_tok = await api_client.send_request(unique_prompt, output_tokens)
-    total_time = time.time() - start_time
-    output_tps = completion_tok / gen_time if gen_time > 0 else 0
+    # Log summary for unique prompts
+    avg_ttft = np.mean([m.ttft for m in unique_metrics_list])
+    avg_completion = np.mean([m.completion_tokens for m in unique_metrics_list])
+    if concurrent_prompts > 1:
+        abs_times = [r[6] for r in unique_results]
+        abs_spread = max(abs_times) - min(abs_times)
+        prefill_time = max(abs_times)  # Time until all prompts got first token
+        effective_prefill_per_prompt = prefill_time / concurrent_prompts
+        total_input_tokens = sum([m.prompt_tokens for m in unique_metrics_list])
+        logger.info(f"      Unique batch summary:")
+        logger.info(f"        avg TTFT={avg_ttft:.3f}s, abs_time spread={abs_spread:.3f}s")
+        logger.info(f"        prefill time={prefill_time:.3f}s (until all first tokens), effective per-prompt={effective_prefill_per_prompt:.3f}s")
+        logger.info(f"        total input tokens={total_input_tokens:,}, prefill throughput={total_input_tokens/prefill_time:.0f} tok/s")
+    else:
+        snippet = unique_results[0][0][:100].replace('\n', ' ') if unique_results[0][0] else ""
+        logger.info(f"      Unique: TTFT={avg_ttft:.3f}s, Output={int(avg_completion)} tok")
+        logger.info(f"      Response: {snippet}...")
 
-    cached_metrics = PromptMetrics(
-        context_size=context_size,
-        iteration=iteration,
-        prompt_type="cached",
-        prompt_tokens=prompt_tok,
-        completion_tokens=completion_tok,
-        ttft=ttft,
-        generation_time=gen_time,
-        total_time=total_time,
-        output_tokens_per_sec=output_tps
-    )
+    # Test cached prompts (same prompts again - 100% cache hit) - send all simultaneously
+    cached_metrics_list = []
 
-    # Show snippet of response
-    snippet = response_text[:100].replace('\n', ' ') if response_text else ""
-    logger.info(f"      Cached: TTFT={ttft:.3f}s, Output={completion_tok} tok")
-    logger.info(f"      Response: {snippet}...")
-    logger.info(f"      Cache speedup: TTFT {unique_metrics.ttft/ttft:.2f}x faster")
+    for repeat in range(cached_repeats):
+        repeat_label = f" (repeat {repeat + 1}/{cached_repeats})" if cached_repeats > 1 else ""
+        logger.info(f"    Iteration {iteration + 1}: Testing {concurrent_prompts} cached {prompt_label}{repeat_label}...")
 
-    return unique_metrics, cached_metrics
+        batch_start_cached = time.time()
+        cached_results = await asyncio.gather(*[send_and_measure(p, i, batch_start_cached) for i, p in enumerate(prompts)])
+        batch_elapsed_cached = time.time() - batch_start_cached
+
+        for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(cached_results):
+            output_tps = completion_tok / gen_time if gen_time > 0 else 0
+            metrics = PromptMetrics(
+                context_size=context_size,
+                iteration=iteration,
+                prompt_type=f"cached_r{repeat + 1}" if cached_repeats > 1 else "cached",
+                prompt_tokens=prompt_tok,
+                completion_tokens=completion_tok,
+                ttft=ttft,
+                generation_time=gen_time,
+                total_time=total_time,
+                output_tokens_per_sec=output_tps
+            )
+            cached_metrics_list.append(metrics)
+
+        # Log per-prompt details when concurrent
+        if concurrent_prompts > 1:
+            for i, (response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, abs_ttft) in enumerate(cached_results):
+                snippet = response_text[:80].replace('\n', ' ') if response_text else ""
+                logger.info(f"        [Prompt {i+1}] TTFT={ttft:.3f}s, abs_time={abs_ttft:.3f}s, output={completion_tok} tok")
+                logger.info(f"                  Response: {snippet}...")
+
+        # Log summary for this cached repeat
+        repeat_metrics = cached_metrics_list[-concurrent_prompts:]  # Get metrics from this repeat
+        avg_cached_ttft = np.mean([m.ttft for m in repeat_metrics])
+        avg_cached_completion = np.mean([m.completion_tokens for m in repeat_metrics])
+        if concurrent_prompts > 1:
+            abs_times_cached = [r[6] for r in cached_results]
+            abs_spread_cached = max(abs_times_cached) - min(abs_times_cached)
+            prefill_time_cached = max(abs_times_cached)  # Time until all prompts got first token
+            effective_prefill_per_prompt_cached = prefill_time_cached / concurrent_prompts
+            total_input_tokens_cached = sum([m.prompt_tokens for m in repeat_metrics])
+            logger.info(f"      Cached{repeat_label} batch summary:")
+            logger.info(f"        avg TTFT={avg_cached_ttft:.3f}s, abs_time spread={abs_spread_cached:.3f}s")
+            logger.info(f"        prefill time={prefill_time_cached:.3f}s (until all first tokens), effective per-prompt={effective_prefill_per_prompt_cached:.3f}s")
+            logger.info(f"        total input tokens={total_input_tokens_cached:,}, prefill throughput={total_input_tokens_cached/prefill_time_cached:.0f} tok/s")
+        else:
+            snippet = cached_results[0][0][:100].replace('\n', ' ') if cached_results[0][0] else ""
+            logger.info(f"      Cached{repeat_label}: TTFT={avg_cached_ttft:.3f}s, Output={int(avg_cached_completion)} tok")
+            logger.info(f"      Response: {snippet}...")
+
+    # Overall cache speedup (using all cached metrics)
+    overall_avg_cached_ttft = np.mean([m.ttft for m in cached_metrics_list])
+    speedup = avg_ttft / overall_avg_cached_ttft if overall_avg_cached_ttft > 0 else 0
+    logger.info(f"      Cache speedup: TTFT {speedup:.2f}x faster")
+
+    return unique_metrics_list, cached_metrics_list
 
 
 def generate_graphs(results: List[PromptMetrics], output_dir: str):
@@ -375,22 +444,36 @@ def generate_graphs(results: List[PromptMetrics], output_dir: str):
     df = pd.DataFrame([m.to_dict() for m in results])
 
     # Calculate aggregated metrics (mean across iterations)
+    # Group all cached_* types together as "cached"
     agg_data = []
     for context_size in sorted(df['context_size'].unique()):
-        for prompt_type in ['unique', 'cached']:
-            data = df[(df['context_size'] == context_size) & (df['prompt_type'] == prompt_type)]
+        # Unique prompts
+        unique_data = df[(df['context_size'] == context_size) & (df['prompt_type'] == 'unique')]
+        if len(unique_data) > 0:
+            agg_data.append({
+                'context_size': context_size,
+                'prompt_type': 'unique',
+                'avg_ttft': unique_data['ttft'].mean(),
+                'std_ttft': unique_data['ttft'].std(),
+                'min_ttft': unique_data['ttft'].min(),
+                'max_ttft': unique_data['ttft'].max(),
+                'avg_output_tps': unique_data['output_tokens_per_sec'].mean(),
+                'num_iterations': len(unique_data)
+            })
 
-            if len(data) > 0:
-                agg_data.append({
-                    'context_size': context_size,
-                    'prompt_type': prompt_type,
-                    'avg_ttft': data['ttft'].mean(),
-                    'std_ttft': data['ttft'].std(),
-                    'min_ttft': data['ttft'].min(),
-                    'max_ttft': data['ttft'].max(),
-                    'avg_output_tps': data['output_tokens_per_sec'].mean(),
-                    'num_iterations': len(data)
-                })
+        # Cached prompts (all cached_* types combined)
+        cached_data = df[(df['context_size'] == context_size) & (df['prompt_type'].str.startswith('cached'))]
+        if len(cached_data) > 0:
+            agg_data.append({
+                'context_size': context_size,
+                'prompt_type': 'cached',
+                'avg_ttft': cached_data['ttft'].mean(),
+                'std_ttft': cached_data['ttft'].std(),
+                'min_ttft': cached_data['ttft'].min(),
+                'max_ttft': cached_data['ttft'].max(),
+                'avg_output_tps': cached_data['output_tokens_per_sec'].mean(),
+                'num_iterations': len(cached_data)
+            })
 
     agg_df = pd.DataFrame(agg_data)
 
@@ -479,11 +562,11 @@ def generate_summary_table(results: List[PromptMetrics], output_dir: str):
     output_path = Path(output_dir)
     df = pd.DataFrame([m.to_dict() for m in results])
 
-    # Calculate aggregated metrics
+    # Calculate aggregated metrics (group all cached_* types together)
     summary_data = []
     for context_size in sorted(df['context_size'].unique()):
         unique_data = df[(df['context_size'] == context_size) & (df['prompt_type'] == 'unique')]
-        cached_data = df[(df['context_size'] == context_size) & (df['prompt_type'] == 'cached')]
+        cached_data = df[(df['context_size'] == context_size) & (df['prompt_type'].str.startswith('cached'))]
 
         if len(unique_data) > 0 and len(cached_data) > 0:
             u_ttft_mean = unique_data['ttft'].mean()
@@ -567,14 +650,20 @@ async def main():
 
     parser.add_argument("--api-endpoint", type=str, required=True,
                        help="API endpoint (e.g., http://localhost:8000)")
+    parser.add_argument("--context-sizes", type=int, nargs='+', default=None,
+                       help="Specific context sizes to test (e.g., 8000 32000 64000). Overrides --min-tokens and --max-tokens.")
     parser.add_argument("--min-tokens", type=int, default=1000,
-                       help="Minimum context size in tokens (default: 1000)")
+                       help="Minimum context size in tokens (default: 1000). Ignored if --context-sizes is specified.")
     parser.add_argument("--max-tokens", type=int, default=128000,
-                       help="Maximum context size in tokens (default: 128000)")
+                       help="Maximum context size in tokens (default: 128000). Ignored if --context-sizes is specified.")
     parser.add_argument("--output-tokens", type=int, default=256,
                        help="Output tokens per request (default: 256)")
     parser.add_argument("--num-iterations", type=int, default=5,
                        help="Number of iterations per context size (default: 5)")
+    parser.add_argument("--concurrent-prompts", "-n", type=int, default=1,
+                       help="Number of prompts to send simultaneously (default: 1)")
+    parser.add_argument("--cached-repeats", "-r", type=int, default=1,
+                       help="Number of times to repeat cached prompt after unique (default: 1)")
     parser.add_argument("--output-dir", type=str, default="./single_prompt_output",
                        help="Output directory (default: ./single_prompt_output)")
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -583,8 +672,15 @@ async def main():
                        help="Random seed for reproducibility (default: random based on timestamp)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose logging")
+    parser.add_argument("--brief", action="store_true",
+                       help="Brief output mode for agents - minimal, parseable output")
 
     args = parser.parse_args()
+
+    # Brief mode setup - suppress normal logging
+    brief_mode = args.brief
+    if brief_mode:
+        logger.setLevel(logging.WARNING)  # Only show warnings/errors
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -593,7 +689,6 @@ async def main():
     logger.info(f"{Colors.HEADER}{Colors.BOLD}Single Prompt Performance Tester{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}API Endpoint: {args.api_endpoint}{Colors.ENDC}")
-    logger.info(f"{Colors.OKBLUE}Context Range: {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling){Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Iterations per size: {args.num_iterations}{Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
 
@@ -615,23 +710,39 @@ async def main():
         base_seed = args.seed
         logger.info(f"{Colors.OKBLUE}Using provided seed: {base_seed}{Colors.ENDC}")
 
-    # Validate input parameters
-    if args.min_tokens > args.max_tokens:
-        logger.error(f"Invalid parameter range: min-tokens ({args.min_tokens}) must be <= max-tokens ({args.max_tokens})")
-        sys.exit(1)
+    # Generate context sizes
+    if args.context_sizes:
+        # Use explicitly specified context sizes
+        context_sizes = sorted(args.context_sizes)
+        logger.info(f"{Colors.OKBLUE}Using specified context sizes: {context_sizes}{Colors.ENDC}")
+    else:
+        # Validate input parameters for doubling mode
+        if args.min_tokens > args.max_tokens:
+            logger.error(f"Invalid parameter range: min-tokens ({args.min_tokens}) must be <= max-tokens ({args.max_tokens})")
+            sys.exit(1)
 
-    # Generate context sizes (doubling)
-    context_sizes = []
-    size = args.min_tokens
-    while size <= args.max_tokens:
-        context_sizes.append(size)
-        size *= 2
+        # Generate context sizes (doubling)
+        context_sizes = []
+        size = args.min_tokens
+        while size <= args.max_tokens:
+            context_sizes.append(size)
+            size *= 2
+        logger.info(f"{Colors.OKBLUE}Context Range: {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling){Colors.ENDC}")
 
     if len(context_sizes) == 0:
-        logger.error("No context sizes to test. Check --min-tokens and --max-tokens parameters.")
+        logger.error("No context sizes to test. Specify --context-sizes or check --min-tokens and --max-tokens parameters.")
         sys.exit(1)
 
-    logger.info(f"\n{Colors.PHASE}Testing {len(context_sizes)} context sizes: {context_sizes}{Colors.ENDC}\n")
+    concurrent_prompts = args.concurrent_prompts
+    cached_repeats = args.cached_repeats
+    if concurrent_prompts > 1:
+        logger.info(f"{Colors.OKBLUE}Concurrent prompts per test: {concurrent_prompts}{Colors.ENDC}")
+    if cached_repeats > 1:
+        logger.info(f"{Colors.OKBLUE}Cached repeats per iteration: {cached_repeats}{Colors.ENDC}")
+
+    logger.info("")
+    logger.info(f"{Colors.PHASE}Testing {len(context_sizes)} context sizes: {context_sizes}{Colors.ENDC}")
+    logger.info("")
 
     # Run tests
     all_results = []
@@ -639,13 +750,31 @@ async def main():
     for context_size in context_sizes:
         logger.info(f"{Colors.OKCYAN}Testing context size: {context_size:,} tokens{Colors.ENDC}")
 
-        for iteration in range(args.num_iterations):
-            unique_metrics, cached_metrics = await test_single_prompt_pair(
-                api_client, tokenizer, context_size, args.output_tokens, iteration, base_seed
-            )
-            all_results.extend([unique_metrics, cached_metrics])
+        context_unique_metrics = []
+        context_cached_metrics = []
 
+        for iteration in range(args.num_iterations):
+            unique_metrics_list, cached_metrics_list = await test_single_prompt_pair(
+                api_client, tokenizer, context_size, args.output_tokens, iteration, base_seed,
+                concurrent_prompts=concurrent_prompts, cached_repeats=cached_repeats
+            )
+            all_results.extend(unique_metrics_list)
+            all_results.extend(cached_metrics_list)
+            context_unique_metrics.extend(unique_metrics_list)
+            context_cached_metrics.extend(cached_metrics_list)
+            logger.info("")  # Blank line between iterations
+
+        # Per-context-size summary
+        avg_unique_ttft = np.mean([m.ttft for m in context_unique_metrics])
+        avg_cached_ttft = np.mean([m.ttft for m in context_cached_metrics])
+        speedup = avg_unique_ttft / avg_cached_ttft if avg_cached_ttft > 0 else 0
+        logger.info(f"{Colors.OKGREEN}  Summary for {context_size:,} tokens:{Colors.ENDC}")
+        logger.info(f"{Colors.OKGREEN}    Avg Unique TTFT: {avg_unique_ttft:.3f}s | Avg Cached TTFT: {avg_cached_ttft:.3f}s | Speedup: {speedup:.2f}x{Colors.ENDC}")
         logger.info("")
+
+        # Brief mode per-context summary
+        if brief_mode:
+            print(f"[{context_size:,}] unique={avg_unique_ttft:.3f}s cached={avg_cached_ttft:.3f}s speedup={speedup:.2f}x")
 
     # Save results
     output_path = Path(args.output_dir)
@@ -659,97 +788,90 @@ async def main():
     logger.info(f"Saved results to {csv_file}")
 
     # Generate graphs
-    logger.info(f"\n{Colors.PHASE}Generating visualizations...{Colors.ENDC}")
+    logger.info("")
+    logger.info(f"{Colors.PHASE}Generating visualizations...{Colors.ENDC}")
     generate_graphs(all_results, args.output_dir)
     generate_summary_table(all_results, args.output_dir)
 
-    # Generate index.html
+    # Save metadata for index.html generator
+    metadata = {
+        "test_type": "single_prompt",
+        "api_endpoint": args.api_endpoint,
+        "detected_model": model,
+        "context_sizes": context_sizes,
+        "num_iterations": args.num_iterations,
+        "concurrent_prompts": concurrent_prompts,
+        "output_tokens": args.output_tokens,
+        "seed": base_seed
+    }
+    metadata_file = output_path / "metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    # Generate index.html using unified generator
     logger.info(f"{Colors.PHASE}Generating index.html dashboard...{Colors.ENDC}")
-    output_path = Path(args.output_dir)
-    index_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Single Prompt Performance Test Results</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f5f5f5;
-        }}
-        h1 {{
-            color: #333;
-        }}
-        .link-section {{
-            background-color: white;
-            padding: 20px;
-            border-radius: 5px;
-            margin: 20px 0;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        .graph-link {{
-            display: block;
-            padding: 15px;
-            margin: 10px 0;
-            background-color: #4CAF50;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
-            font-size: 18px;
-            transition: background-color 0.3s;
-        }}
-        .graph-link:hover {{
-            background-color: #45a049;
-        }}
-        .info {{
-            background-color: #e3f2fd;
-            padding: 15px;
-            border-left: 4px solid #2196F3;
-            margin: 20px 0;
-        }}
-    </style>
-</head>
-<body>
-    <h1>Single Prompt Performance Test Results</h1>
+    try:
+        import subprocess
+        subprocess.run([
+            sys.executable, "generate_index.py",
+            str(output_path)
+        ], check=True, cwd=Path(__file__).parent)
+        logger.info(f"{Colors.SUCCESS}✓ Generated index.html dashboard{Colors.ENDC}")
+    except Exception as e:
+        logger.warning(f"Failed to generate index.html: {e}")
 
-    <div class="info">
-        <h3>Test Overview</h3>
-        <p><strong>Test Pattern:</strong> For each context size, send a unique prompt (cold start),
-        then immediately send the same prompt again (100% cache hit). Repeat {args.num_iterations} times.</p>
-        <p><strong>Context Sizes Tested:</strong> {args.min_tokens:,} to {args.max_tokens:,} tokens (doubling)</p>
-        <p><strong>Model:</strong> {model}</p>
-        <p><strong>Random Seed:</strong> {base_seed} (for reproducibility)</p>
-    </div>
+    # Final summary table
+    logger.info("")
+    logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
+    logger.info(f"{Colors.HEADER}{Colors.BOLD}Final Summary - All Context Sizes{Colors.ENDC}")
+    logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
+    logger.info(f"{'Context Size':>14} | {'Unique TTFT':>12} | {'Cached TTFT':>12} | {'Speedup':>8}")
+    logger.info(f"{'-'*14}-+-{'-'*12}-+-{'-'*12}-+-{'-'*8}")
 
-    <div class="link-section">
-        <h2>Results</h2>
-        <a class="graph-link" href="single_prompt_performance.html">📊 Performance Graphs (TTFT Bar Chart + Speedup)</a>
-        <a class="graph-link" href="summary_table.html">📋 Summary Table</a>
-    </div>
+    df_summary = pd.DataFrame([m.to_dict() for m in all_results])
+    for ctx in sorted(df_summary['context_size'].unique()):
+        unique_data = df_summary[(df_summary['context_size'] == ctx) & (df_summary['prompt_type'] == 'unique')]
+        cached_data = df_summary[(df_summary['context_size'] == ctx) & (df_summary['prompt_type'].str.startswith('cached'))]
+        if len(unique_data) > 0 and len(cached_data) > 0:
+            u_ttft = unique_data['ttft'].mean()
+            c_ttft = cached_data['ttft'].mean()
+            speedup = u_ttft / c_ttft if c_ttft > 0 else 0
+            logger.info(f"{ctx:>14,} | {u_ttft:>11.3f}s | {c_ttft:>11.3f}s | {speedup:>7.2f}x")
 
-    <div class="info">
-        <h3>How to Interpret</h3>
-        <ul>
-            <li><strong>Unique (Cold Start):</strong> First time seeing this prompt - no cache benefit</li>
-            <li><strong>Cached (100% Hit):</strong> Same prompt sent again - should use cached KV</li>
-            <li><strong>Speedup:</strong> Unique TTFT / Cached TTFT - higher is better</li>
-        </ul>
-        <p>A speedup of 2-10x for cached prompts indicates effective caching.
-        Speedup typically increases with context size.</p>
-    </div>
-</body>
-</html>
-"""
-
-    index_file = output_path / "index.html"
-    with open(index_file, 'w') as f:
-        f.write(index_html)
-    logger.info(f"Generated index: {index_file}")
-
-    logger.info(f"\n{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
+    logger.info(f"{'-'*14}-+-{'-'*12}-+-{'-'*12}-+-{'-'*8}")
+    logger.info("")
+    logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}✓ Testing complete!{Colors.ENDC}")
     logger.info(f"{Colors.SUCCESS}{Colors.BOLD}{'='*80}{Colors.ENDC}")
-    logger.info(f"{Colors.OKGREEN}Results saved to: {args.output_dir}{Colors.ENDC}\n")
+    logger.info(f"{Colors.OKGREEN}Results saved to: {args.output_dir}{Colors.ENDC}")
+    logger.info("")
+
+    # Brief mode final output
+    if brief_mode:
+        print()
+        print("=" * 60)
+        print("RESULTS SUMMARY")
+        print("=" * 60)
+        print(f"model: {model}")
+        print(f"endpoint: {args.api_endpoint}")
+        print(f"seed: {base_seed}")
+        print(f"output: {args.output_dir}")
+        print()
+        print(f"{'Context':>10} | {'Unique TTFT':>12} | {'Cached TTFT':>12} | {'Speedup':>8}")
+        print(f"{'-'*10}-+-{'-'*12}-+-{'-'*12}-+-{'-'*8}")
+
+        # Calculate averages per context size
+        df = pd.DataFrame([m.to_dict() for m in all_results])
+        for ctx in sorted(df['context_size'].unique()):
+            unique_data = df[(df['context_size'] == ctx) & (df['prompt_type'] == 'unique')]
+            cached_data = df[(df['context_size'] == ctx) & (df['prompt_type'].str.startswith('cached'))]
+            if len(unique_data) > 0 and len(cached_data) > 0:
+                u_ttft = unique_data['ttft'].mean()
+                c_ttft = cached_data['ttft'].mean()
+                speedup = u_ttft / c_ttft if c_ttft > 0 else 0
+                print(f"{ctx:>10,} | {u_ttft:>11.3f}s | {c_ttft:>11.3f}s | {speedup:>7.2f}x")
+
+        print(f"{'-'*10}-+-{'-'*12}-+-{'-'*12}-+-{'-'*8}")
 
 
 if __name__ == "__main__":

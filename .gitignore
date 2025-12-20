@@ -19,6 +19,10 @@ ENV/
 
 # Test outputs
 output/
+output_*/
+single_prompt_output/
+cacherate_*/
+workingset_*/
 *.log
 
 # Local configuration (contains machine-specific paths)
