@@ -90,7 +90,7 @@ At least one threshold is required:
 
 ```bash
 # Sustained mode (default) - production capacity planning
-python cache_rate_tester.py \
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 \
     --working-set-size 2000000 \
@@ -98,7 +98,7 @@ python cache_rate_tester.py \
     --output-dir test_output
 
 # Fixed mode - test specific concurrency levels
-python cache_rate_tester.py \
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 \
     --working-set-size 2000000 \
@@ -108,7 +108,7 @@ python cache_rate_tester.py \
     --output-dir fixed_output
 
 # Multiple context sizes with custom cache rates
-python cache_rate_tester.py \
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 8000 32000 64000 128000 \
     --working-set-size 5000000 \
@@ -117,7 +117,7 @@ python cache_rate_tester.py \
     --output-dir multi_context
 
 # High concurrency test with stricter TTFT
-python cache_rate_tester.py \
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 30000 \
     --working-set-size 10000000 \
@@ -128,7 +128,7 @@ python cache_rate_tester.py \
     --output-dir high_load
 
 # Resume from previous run (automatic if progress.json exists)
-python cache_rate_tester.py \
+uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 64000 \
     --working-set-size 2000000 \
