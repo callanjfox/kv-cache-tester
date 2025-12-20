@@ -270,10 +270,11 @@ class TestConfig:
     seed: Optional[int] = None
     kv_cache_bytes: int = 2  # 1 or 2 bytes per element for KV cache calculation
     strict_time_window: bool = False  # Only include requests completed within duration window
-    mode: str = "adaptive"  # "adaptive" or "sustained"
+    mode: str = "sustained"  # "sustained" or "fixed"
     assessment_period: int = 30  # For sustained mode: duration of each assessment period
     min_tokens_per_req: Optional[float] = None  # Minimum average output tokens/s per request threshold
     init_strategy: str = "min"  # "min" or "max" - for sustained mode: initialize min or max working set
+    fixed_concurrency_levels: Optional[List[int]] = None  # For fixed mode: specific concurrency levels to test
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -804,8 +805,9 @@ def parse_arguments() -> argparse.Namespace:
     # Optional arguments
     parser.add_argument("--output-tokens", type=int, default=256,
                        help="Output tokens per request (default: 256)")
-    parser.add_argument("--max-ttft", type=float, default=2.0,
-                       help="TTFT threshold in seconds (default: 2.0)")
+    parser.add_argument("--max-ttft", type=float, default=None,
+                       help="TTFT threshold in seconds (e.g., 2.0). Required for sustained mode (or --min-tokens-per-req). "
+                            "Limits Time To First Token to ensure good prefill performance.")
     parser.add_argument("--ttft-metric", type=str, default="p95",
                        choices=["max", "avg", "p95"],
                        help="TTFT metric to use for threshold: max (maximum), avg (average), p95 (95th percentile). Default: p95")
@@ -859,11 +861,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--strict-time-window", action="store_true",
                        help="Calculate throughput using only requests that launched AND completed within the ramp-duration window. "
                             "Default behavior includes all requests in throughput calculation (including cleanup time).")
-    parser.add_argument("--mode", type=str, default="adaptive",
-                       choices=["adaptive", "sustained"],
-                       help="Test mode (default: adaptive). "
-                            "'sustained' = sustained load testing with continuous concurrency adjustment (recommended for production capacity planning), "
-                            "'adaptive' = burst testing to find peak concurrency with retry phases")
+    parser.add_argument("--mode", type=str, default="sustained",
+                       choices=["sustained", "fixed"],
+                       help="Test mode (default: sustained). "
+                            "'sustained' = sustained load testing with continuous concurrency adjustment and dynamic working set growth (recommended for production capacity planning), "
+                            "'fixed' = test each working set size at specific concurrency levels")
+    parser.add_argument("--fixed-concurrency-levels", type=int, nargs='+',
+                       help="Concurrency levels to test in fixed mode (e.g., 10 20 40 80). Required for fixed mode.")
     parser.add_argument("--assessment-period", type=int, default=30,
                        help="Assessment period duration in seconds for sustained mode (default: 30, sustained mode only)")
     parser.add_argument("--init-strategy", type=str, default="min",
@@ -899,6 +903,24 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
     # Validate min_tokens_per_req
     if args.min_tokens_per_req is not None and args.min_tokens_per_req <= 0:
         raise ValueError(f"--min-tokens-per-req must be > 0 (got {args.min_tokens_per_req})")
+
+    # Validate max_ttft
+    if args.max_ttft is not None and args.max_ttft <= 0:
+        raise ValueError(f"--max-ttft must be > 0 (got {args.max_ttft})")
+
+    # Mode-specific validation
+    if args.mode == "sustained":
+        # Sustained mode requires at least one threshold
+        if args.max_ttft is None and args.min_tokens_per_req is None:
+            raise ValueError("At least one performance threshold is required for sustained mode: --max-ttft OR --min-tokens-per-req (or both)")
+        if args.assessment_period < 1:
+            raise ValueError(f"assessment-period must be >= 1 second (got {args.assessment_period})")
+    elif args.mode == "fixed":
+        # Fixed mode requires concurrency levels
+        if args.fixed_concurrency_levels is None or len(args.fixed_concurrency_levels) == 0:
+            raise ValueError("--fixed-concurrency-levels is required when --mode=fixed")
+        if args.test_duration < args.ramp_duration:
+            raise ValueError(f"test-duration ({args.test_duration}) should be >= ramp-duration ({args.ramp_duration}) in fixed mode")
 
     # Generate working set sizes (linear interpolation)
     min_size = args.min_working_set_size
@@ -952,7 +974,8 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         mode=args.mode,
         assessment_period=args.assessment_period,
         min_tokens_per_req=args.min_tokens_per_req,
-        init_strategy=args.init_strategy
+        init_strategy=args.init_strategy,
+        fixed_concurrency_levels=args.fixed_concurrency_levels
     )
 
 
@@ -1791,6 +1814,136 @@ async def run_working_set_size_test(config: TestConfig, api_client: APIClient,
         logger.info(f"")
 
     # Calculate aggregated metrics
+    aggregated = calculate_aggregated_metrics(
+        all_metrics, context_size, working_set_size, cache_hit_rate, peak_concurrency, config, model
+    )
+
+    return all_metrics, aggregated, all_phases
+
+
+async def run_fixed_concurrency_mode(config: TestConfig, api_client: APIClient,
+                                     working_set: WorkingSet, tokenizer: TokenizerManager,
+                                     context_size: int, working_set_size: int, cache_hit_rate: int,
+                                     model: str) -> Tuple[List[RequestMetrics], AggregatedMetrics, List[PhaseMetadata]]:
+    """
+    Run fixed concurrency mode - test specific concurrency levels
+    Returns: (detailed_metrics, aggregated_metrics, phase_metadata_list)
+    """
+    all_metrics = []
+    all_phases = []
+
+    logger.info(f"{Colors.PHASE}  Fixed Concurrency Mode: Testing levels {config.fixed_concurrency_levels}{Colors.ENDC}")
+
+    # Test each specified concurrency level
+    for concurrency_level in config.fixed_concurrency_levels:
+        logger.info(f"")
+        logger.info(f"{Colors.OKCYAN}  Testing fixed concurrency level: {concurrency_level}{Colors.ENDC}")
+        logger.info(f"{Colors.OKCYAN}  {'-'*60}{Colors.ENDC}")
+
+        # Reinitialize if per_test strategy
+        if config.reinit_strategy == "per_test":
+            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+
+        # Run initial test at this concurrency level
+        phase_id = f"FIXED_c{concurrency_level}_run0"
+        logger.info(f"    Testing concurrency {concurrency_level}... (phase: {phase_id})")
+
+        metrics, phase_metadata = await run_concurrency_level(
+            api_client, working_set, tokenizer, config, context_size, working_set_size,
+            cache_hit_rate, concurrency_level, config.ramp_duration, phase_id
+        )
+
+        all_metrics.extend(metrics)
+        all_phases.append(phase_metadata)
+
+        # Calculate TTFT metrics
+        ttfts = [m.ttft for m in metrics if m.ttft > 0]
+        avg_ttft = np.mean(ttfts) if ttfts else 0
+        max_ttft_val = np.max(ttfts) if ttfts else 0
+        p95_ttft = np.percentile(ttfts, 95) if ttfts else 0
+
+        # Choose TTFT metric based on config
+        if config.ttft_metric == "max":
+            measured_ttft = max_ttft_val
+            ttft_metric_name = "Max TTFT"
+        elif config.ttft_metric == "avg":
+            measured_ttft = avg_ttft
+            ttft_metric_name = "Avg TTFT"
+        else:  # p95
+            measured_ttft = p95_ttft
+            ttft_metric_name = "P95 TTFT"
+
+        # Calculate tokens-per-req metric
+        tokens_per_req_values = [
+            m.output_tokens / m.generation_time
+            for m in metrics
+            if m.output_tokens > 0 and m.generation_time > 0
+        ]
+        avg_tokens_per_req = np.mean(tokens_per_req_values) if tokens_per_req_values else 0
+        p5_tokens_per_req = np.percentile(tokens_per_req_values, 5) if tokens_per_req_values else 0
+        p10_tokens_per_req = np.percentile(tokens_per_req_values, 10) if tokens_per_req_values else 0
+
+        # Choose tokens-per-req metric based on config
+        if hasattr(config, 'tokens_per_req_metric') and config.tokens_per_req_metric == "p5":
+            measured_tokens_per_req = p5_tokens_per_req
+            tokens_metric_name = "P5 Tokens/Req"
+        elif hasattr(config, 'tokens_per_req_metric') and config.tokens_per_req_metric == "p10":
+            measured_tokens_per_req = p10_tokens_per_req
+            tokens_metric_name = "P10 Tokens/Req"
+        else:  # avg (default)
+            measured_tokens_per_req = avg_tokens_per_req
+            tokens_metric_name = "Avg Tokens/Req"
+
+        # Calculate throughput for this level
+        start_time = min(m.launch_time for m in metrics)
+        end_time = max(m.finish_time for m in metrics)
+        test_duration = end_time - start_time
+
+        total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in metrics)
+        total_output_tokens = sum(m.output_tokens for m in metrics)
+
+        input_tps = total_input_tokens / test_duration if test_duration > 0 else 0
+        output_tps = total_output_tokens / test_duration if test_duration > 0 else 0
+
+        logger.info(f"      Avg TTFT: {avg_ttft:.3f}s, P95 TTFT: {p95_ttft:.3f}s, Max TTFT: {max_ttft_val:.3f}s ({ttft_metric_name}: {measured_ttft:.3f}s)")
+        logger.info(f"      Throughput: Input={input_tps:,.0f} tok/s, Output={output_tps:,.0f} tok/s")
+        logger.info(f"      Avg Tokens/Req: {avg_tokens_per_req:.1f} tok/s, P5: {p5_tokens_per_req:.1f}, P10: {p10_tokens_per_req:.1f} ({tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s)")
+
+        # Check if either threshold exceeded (only if thresholds are specified)
+        ttft_exceeded = (config.max_ttft is not None) and (measured_ttft > config.max_ttft)
+        tokens_per_req_exceeded = (config.min_tokens_per_req is not None) and (measured_tokens_per_req < config.min_tokens_per_req)
+        threshold_exceeded = ttft_exceeded or tokens_per_req_exceeded
+
+        if threshold_exceeded:
+            logger.warning(f"    ⚠️  Performance threshold exceeded at concurrency {concurrency_level}!")
+            if ttft_exceeded:
+                logger.warning(f"      {ttft_metric_name}: {measured_ttft:.3f}s > {config.max_ttft}s threshold")
+            if tokens_per_req_exceeded:
+                logger.warning(f"      {tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s < {config.min_tokens_per_req} tok/s threshold")
+            logger.warning(f"    Stopping fixed concurrency testing (tested {config.fixed_concurrency_levels.index(concurrency_level) + 1} of {len(config.fixed_concurrency_levels)} levels)")
+            break
+
+        # This level passed - run retries
+        logger.info(f"{Colors.PHASE}    Running {config.num_retries} retries at concurrency {concurrency_level}{Colors.ENDC}")
+
+        for retry in range(config.num_retries):
+            retry_phase_id = f"FIXED_c{concurrency_level}_run{retry + 1}"
+            logger.info(f"      Retry {retry + 1}/{config.num_retries}... (phase: {retry_phase_id})")
+
+            retry_metrics, retry_phase = await run_concurrency_level(
+                api_client, working_set, tokenizer, config, context_size, working_set_size,
+                cache_hit_rate, concurrency_level, config.ramp_duration, retry_phase_id
+            )
+
+            all_metrics.extend(retry_metrics)
+            all_phases.append(retry_phase)
+
+        logger.info(f"{Colors.SUCCESS}  ✓ Concurrency level {concurrency_level} complete{Colors.ENDC}")
+
+    # Calculate aggregated metrics using the last concurrency level tested as "peak"
+    peak_concurrency = config.fixed_concurrency_levels[-1] if config.fixed_concurrency_levels else config.start_concurrency
+
+    # Use only the metrics from run phases (not retries) for aggregation - or all if no filtering
     aggregated = calculate_aggregated_metrics(
         all_metrics, context_size, working_set_size, cache_hit_rate, peak_concurrency, config, model
     )
@@ -3199,15 +3352,17 @@ def save_run_command(args: argparse.Namespace, output_dir: str):
 
 
 def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: int,
-                       working_set_size: int, cache_hit_rate: int, max_ttft: float, peak_concurrency: int, output_dir: str):
+                       working_set_size: int, cache_hit_rate: int, max_ttft: float, peak_concurrency: int, output_dir: str,
+                       mode: str = "fixed"):
     """
-    Generate detailed concurrency ramp visualization for a single working set size test
+    Generate detailed concurrency visualization for a single working set size test
 
-    Shows ONLY the ramp phase data (excludes retry runs) to make it clear why each
-    concurrency level was chosen or rejected during the ramp.
+    Shows ONLY the run phase data (excludes retry runs) to show performance at each
+    concurrency level.
 
-    Naming scheme: ramp_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html
-    Example: ramp_ctx30000_ws2000000_cache100.html (30K context, 2M working set, 100% cache)
+    Naming scheme:
+    - Fixed mode: fixed_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html
+    - Other modes: ramp_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html
     """
     if not detailed_metrics:
         return
@@ -3215,13 +3370,19 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Filter to ONLY RAMP phases (exclude RETRY phases)
-    # This shows the actual ramp behavior that determined peak concurrency
+    # Filter to ONLY run phases (exclude RETRY phases)
+    # For adaptive mode: RAMP_c{concurrency}
+    # For fixed mode: FIXED_c{concurrency}_run{n}
     df = pd.DataFrame([m.to_dict() for m in detailed_metrics])
-    ramp_df = df[df['phase_id'].str.startswith('RAMP')].copy()
+
+    # Include RAMP phases and FIXED run phases, exclude RETRY phases
+    ramp_df = df[
+        (df['phase_id'].str.startswith('RAMP')) |
+        (df['phase_id'].str.contains('_run') & ~df['phase_id'].str.contains('RETRY'))
+    ].copy()
 
     if len(ramp_df) == 0:
-        logger.warning(f"No RAMP phase data found for ramp graph (context={context_size}, ws={working_set_size}, cache_rate={cache_hit_rate})")
+        logger.warning(f"No run phase data found for graph (context={context_size}, ws={working_set_size}, cache_rate={cache_hit_rate})")
         return
 
     # Calculate metrics per concurrency level using ONLY ramp data
@@ -3341,14 +3502,15 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
         row=3, col=1
     )
 
-    # Add horizontal line for TTFT threshold
-    fig.add_hline(
-        y=max_ttft,
-        line=dict(color='red', width=2, dash='dash'),
-        annotation_text=f"TTFT Threshold ({max_ttft}s)",
-        annotation_position="right",
-        row=3, col=1
-    )
+    # Add horizontal line for TTFT threshold (if specified)
+    if max_ttft is not None:
+        fig.add_hline(
+            y=max_ttft,
+            line=dict(color='red', width=2, dash='dash'),
+            annotation_text=f"TTFT Threshold ({max_ttft}s)",
+            annotation_position="right",
+            row=3, col=1
+        )
 
     # Add vertical line for peak concurrency (across all subplots)
     for row in [1, 2, 3]:
@@ -3370,17 +3532,19 @@ def generate_ramp_graph(detailed_metrics: List[RequestMetrics], context_size: in
     fig.update_yaxes(title_text="TTFT (seconds)", row=3, col=1)
 
     # Update layout
+    mode_title = "Fixed Concurrency" if mode == "fixed" else "Concurrency Ramp"
     fig.update_layout(
-        title=f"Concurrency Ramp Analysis<br>Context: {context_size:,} tokens | Working Set: {working_set_size:,} tokens | Cache Hit Rate: {cache_hit_rate}%",
+        title=f"{mode_title} Analysis<br>Context: {context_size:,} tokens | Working Set: {working_set_size:,} tokens | Cache Hit Rate: {cache_hit_rate}%",
         height=900,
         showlegend=True,
         hovermode='x unified'
     )
 
-    # Save with naming scheme: ramp_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html
-    filename = output_path / f"ramp_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html"
+    # Save with naming scheme based on mode
+    prefix = "fixed" if mode == "fixed" else "ramp"
+    filename = output_path / f"{prefix}_ctx{context_size}_ws{working_set_size}_cache{cache_hit_rate}.html"
     fig.write_html(filename)
-    logger.debug(f"Generated ramp graph: {filename}")
+    logger.info(f"Generated {mode} mode graph: {filename}")
 
 
 def generate_graphs(metrics: List[AggregatedMetrics], output_dir: str, config: TestConfig):
@@ -4382,7 +4546,7 @@ async def main():
             previous_peak_concurrency = None
 
             # For sustained mode: only test the max working_set_size (growth happens inside test)
-            # For adaptive mode: test each working_set_size separately
+            # For fixed mode: test each working_set_size separately
             working_set_sizes_to_test = [config.working_set_sizes[-1]] if config.mode == "sustained" else config.working_set_sizes
 
             # Test each working set size
@@ -4400,7 +4564,7 @@ async def main():
                 working_set = WorkingSet(context_size, working_set_size, tokenizer, config.chunk_size, config.seed)
 
                 # For sustained mode: generate prompts based on init_strategy
-                # For adaptive mode: generate all prompts for the working_set_size
+                # For fixed mode: generate all prompts for the working_set_size
                 if config.mode == "sustained":
                     min_ws_size = config.working_set_sizes[0]  # Smallest working set size
                     initial_num_prompts = max(1, int(np.ceil(min_ws_size / working_set.rounded_context_size)))
@@ -4426,7 +4590,7 @@ async def main():
                             working_set.prompts.append(tokens)
                         logger.info(f"  Generated {len(working_set.prompts)} initial prompts")
                 else:
-                    # Adaptive mode: generate all prompts for this working set size
+                    # Fixed mode: generate all prompts for this working set size
                     working_set.generate_prompts()
 
                 # Initialize working set with API (pre-warm cache)
@@ -4460,8 +4624,8 @@ async def main():
                         # Mark as completed
                         progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
 
-                    else:  # adaptive mode
-                        detailed_metrics, aggregated, phase_metadata_list = await run_working_set_size_test(
+                    else:  # fixed mode
+                        detailed_metrics, aggregated, phase_metadata_list = await run_fixed_concurrency_mode(
                             config=config,
                             api_client=api_client,
                             working_set=working_set,
@@ -4469,16 +4633,12 @@ async def main():
                             context_size=context_size,
                             working_set_size=working_set_size,
                             cache_hit_rate=cache_hit_rate,
-                            model=model,
-                            previous_peak=previous_peak_concurrency
+                            model=model
                         )
 
                         # Save results
                         all_detailed_results.extend(detailed_metrics)
                         all_aggregated_results.append(aggregated)
-
-                        # Update previous peak for next working set size
-                        previous_peak_concurrency = aggregated.peak_concurrency
 
                         # Mark as completed
                         progress.mark_test_completed(context_size, working_set_size, cache_hit_rate)
@@ -4488,20 +4648,21 @@ async def main():
                         save_aggregated_results(all_aggregated_results, config.output_dir)
                         save_phase_metadata(phase_metadata_list, config.output_dir)
 
-                        # Generate ramp graph for this test
+                        # Generate fixed mode graph for this test
                         if not config.skip_graphs:
                             generate_ramp_graph(detailed_metrics, context_size, working_set_size, cache_hit_rate,
-                                               config.max_ttft, aggregated.peak_concurrency, config.output_dir)
+                                               config.max_ttft, aggregated.peak_concurrency, config.output_dir,
+                                               mode="fixed")
 
                         # Calculate total tokens processed (aligned with graph calculations)
                         total_input_tokens = sum(m.cached_tokens + m.unique_tokens for m in detailed_metrics)
                         total_output_tokens = sum(m.output_tokens for m in detailed_metrics)
 
                         logger.info(f"{Colors.SUCCESS}    ✓ Working set size {working_set_size:,} complete{Colors.ENDC}")
+                        logger.info(f"{Colors.METRIC}      Tested concurrency levels: {config.fixed_concurrency_levels}{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Total requests: {len(detailed_metrics):,}{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Total input tokens: {total_input_tokens:,} ({total_input_tokens/1e6:.2f}M){Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Total output tokens: {total_output_tokens:,} ({total_output_tokens/1e6:.2f}M){Colors.ENDC}")
-                        logger.info(f"{Colors.METRIC}      Peak concurrency: {aggregated.peak_concurrency}{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Avg TTFT: {aggregated.avg_ttft:.3f}s{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Avg TTLT: {aggregated.avg_ttlt:.3f}s{Colors.ENDC}")
                         logger.info(f"{Colors.METRIC}      Avg ITL: {aggregated.avg_itl*1000:.2f}ms{Colors.ENDC}")
