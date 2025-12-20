@@ -3576,14 +3576,15 @@ def generate_continuous_graphs(periods: List[AssessmentPeriodMetrics], output_di
         row=3, col=1, secondary_y=False
     )
 
-    # Add TTFT threshold line
-    fig.add_hline(
-        y=max_ttft,
-        line=dict(color='red', width=2, dash='dash'),
-        annotation_text=f"Threshold ({max_ttft}s)",
-        annotation_position="right",
-        row=3, col=1, secondary_y=False
-    )
+    # Add TTFT threshold line (if specified)
+    if max_ttft is not None:
+        fig.add_hline(
+            y=max_ttft,
+            line=dict(color='red', width=2, dash='dash'),
+            annotation_text=f"Threshold ({max_ttft}s)",
+            annotation_position="right",
+            row=3, col=1, secondary_y=False
+        )
 
     fig.add_trace(
         go.Scatter(
