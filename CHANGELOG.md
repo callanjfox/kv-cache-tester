@@ -29,6 +29,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Useful for testing server behavior under concurrent load
   - Reports per-prompt metrics plus batch-level statistics (avg TTFT, batch time)
   - Both unique (cold) and cached (warm) tests send all N prompts concurrently
+- **`--cached-repeats` / `-r` option for single_prompt_tester.py**: Run cached prompt multiple times
+  - After the unique prompt, repeat the cached prompt N times (default: 1)
+  - Useful for measuring cache hit consistency and warm-up effects
+  - Each repeat is labeled `(repeat 1/N)`, `(repeat 2/N)`, etc.
+  - All cached repeats are aggregated together in summaries and graphs
+- **Improved CLI output for single_prompt_tester.py**:
+  - Added per-context-size summary after all iterations complete
+  - Added final summary table at end showing all context sizes
+  - Added blank lines between iterations for better readability
+  - Brief mode now shows per-context summaries during testing and formatted final table
 
 ### Fixed
 - **Critical: `--strict-time-window` flag now works correctly**
