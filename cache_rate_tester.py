@@ -5189,18 +5189,36 @@ async def main():
         print(f"endpoint: {config.api_endpoints[0]}")
         print(f"working_set: {config.working_set_size}")
         print()
-        print("context_size,cache_rate,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+        print("context_size,cache_rate,requests,input_tokens,output_tokens,input_tps,output_tps,avg_ttft,p95_ttft,concurrency")
+
+        # Calculate totals
+        brief_total_requests = 0
+        brief_total_input = 0
+        brief_total_output = 0
 
         # Output results from aggregated data
         if config.mode in ["adaptive", "fixed"]:
             for m in sorted(all_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate)):
-                print(f"{m.context_size},{m.cache_hit_rate},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+                est_input = int(m.input_tokens_per_sec * m.test_duration)
+                est_output = int(m.output_tokens_per_sec * m.test_duration)
+                brief_total_requests += m.total_requests
+                brief_total_input += est_input
+                brief_total_output += est_output
+                print(f"{m.context_size},{m.cache_hit_rate},{m.total_requests},{est_input},{est_output},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
         else:
             # For sustained mode, use aggregated results calculated from period data
             for m in sorted(continuous_aggregated_results, key=lambda x: (x.context_size, x.cache_hit_rate)):
-                print(f"{m.context_size},{m.cache_hit_rate},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
+                est_input = int(m.input_tokens_per_sec * m.test_duration)
+                est_output = int(m.output_tokens_per_sec * m.test_duration)
+                brief_total_requests += m.total_requests
+                brief_total_input += est_input
+                brief_total_output += est_output
+                print(f"{m.context_size},{m.cache_hit_rate},{m.total_requests},{est_input},{est_output},{m.input_tokens_per_sec:.0f},{m.output_tokens_per_sec:.0f},{m.avg_ttft:.3f},{m.p95_ttft:.3f},{m.peak_concurrency}")
 
         print()
+        print(f"total_requests: {brief_total_requests}")
+        print(f"total_input_tokens: {brief_total_input}")
+        print(f"total_output_tokens: {brief_total_output}")
         print(f"output: {config.output_dir}")
 
 

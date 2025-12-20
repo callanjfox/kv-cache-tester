@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Columns: Context, Cache%, Requests, Input Tok, Output Tok, Input/s, Output/s, Avg TTFT, Concurrency
   - Includes grand totals for requests and tokens processed
   - Provides quick overview of entire test run
+- **Brief mode token totals**: Extended `--brief` output with token statistics
+  - Added requests, input_tokens, output_tokens columns to CSV
+  - Added total_requests, total_input_tokens, total_output_tokens summary lines
 
 - **Documentation restructure**: Moved detailed tool documentation to `docs/` directory
   - `docs/single_prompt_tester.md` - single_prompt_tester usage
