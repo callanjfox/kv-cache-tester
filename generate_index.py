@@ -711,8 +711,6 @@ def generate_info_section(test_type: str, config: Dict) -> str:
         notes = []
         if config.get('max_ttft'):
             notes.append(f"Concurrency ramped until TTFT exceeded {config['max_ttft']}s threshold")
-        if config.get('num_retries'):
-            notes.append(f"Retried {config['num_retries']}x at peak concurrency for stable measurements")
         if config.get('test_duration'):
             notes.append(f"Each test limited to {config['test_duration']} seconds")
 
