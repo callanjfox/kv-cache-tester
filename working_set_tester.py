@@ -335,7 +335,7 @@ class PhaseMetadata:
 class AggregatedMetrics:
     """Aggregated metrics for a working set size test"""
     context_size: int
-    working_set_size: int
+    working_set_size: int  # Max working set size (or single value for fixed mode)
     cache_hit_rate: int
     model: str
     input_tokens_per_sec: float
@@ -356,6 +356,7 @@ class AggregatedMetrics:
     peak_concurrency: int
     total_requests: int
     test_duration: float
+    min_working_set_size: Optional[int] = None  # For sustained mode: min working set size
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -4213,20 +4214,18 @@ async def main():
             try:
                 df_periods = pd.read_csv(period_file)
                 if len(df_periods) > 0:
-                    # Extract context, working_set, and cache rate from filename
-                    # Format: sustained_periods_ctx{context}_ws{ws_size}_cache{rate}_{timestamp}.csv
-                    filename = period_file.stem
-                    context_str = filename.split('ctx')[1].split('_')[0]
-                    ws_str = filename.split('ws')[1].split('_')[0]
-                    cache_str = filename.split('cache')[1].split('_')[0]
-                    ctx_size = int(context_str)
-                    ws_size = int(ws_str)
-                    cache_rate = int(cache_str)
+                    # Get context_size and cache_hit_rate from CSV data
+                    ctx_size = int(df_periods['context_size'].iloc[0])
+                    cache_rate = int(df_periods['cache_hit_rate'].iloc[0])
+
+                    # Get min and max working_set_size from the data (sustained mode grows over time)
+                    min_ws_size = int(df_periods['working_set_size'].min())
+                    max_ws_size = int(df_periods['working_set_size'].max())
 
                     # Create aggregated metrics from period data
                     aggregated = AggregatedMetrics(
                         context_size=ctx_size,
-                        working_set_size=ws_size,
+                        working_set_size=max_ws_size,
                         cache_hit_rate=cache_rate,
                         model=model,
                         input_tokens_per_sec=df_periods['input_tokens_per_sec'].mean(),
@@ -4246,7 +4245,8 @@ async def main():
                         p99_itl=df_periods['p99_itl'].mean(),
                         peak_concurrency=int(df_periods['concurrency_level'].max()),
                         total_requests=int(df_periods['num_requests_completed'].sum()),
-                        test_duration=df_periods['duration'].sum()
+                        test_duration=df_periods['duration'].sum(),
+                        min_working_set_size=min_ws_size
                     )
                     sustained_aggregated_results.append(aggregated)
             except Exception as e:
@@ -4290,7 +4290,21 @@ async def main():
             grand_total_output += est_output_tokens
             grand_total_requests += m.total_requests
 
-            logger.info(f"{m.context_size:>10,} {m.working_set_size:>12,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
+            # Format working set size - show range for sustained mode (min-max)
+            if m.min_working_set_size is not None and m.min_working_set_size != m.working_set_size:
+                # Format as "minK-maxK" or "minM-maxM" for readability
+                def format_ws(val):
+                    if val >= 1_000_000:
+                        return f"{val/1_000_000:.1f}M"
+                    elif val >= 1_000:
+                        return f"{val/1_000:.0f}K"
+                    else:
+                        return str(val)
+                ws_display = f"{format_ws(m.min_working_set_size)}-{format_ws(m.working_set_size)}"
+            else:
+                ws_display = f"{m.working_set_size:,}"
+
+            logger.info(f"{m.context_size:>10,} {ws_display:>12} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
                        f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
                        f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
                        f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
