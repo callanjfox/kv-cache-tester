@@ -2,12 +2,19 @@
 
 The primary testing tool. Measures performance at various cache hit rates (0%, 5%, 10%, ..., 100%) with fixed working set size. This reveals how performance scales with cache efficiency.
 
+## Test Modes
+
+| Mode | Description |
+|------|-------------|
+| `sustained` (default) | Sustained load testing with continuous concurrency adjustment. Recommended for production capacity planning. |
+| `fixed` | Test specific concurrency levels with retries. Useful for benchmarking at known concurrency points. |
+
 ## What it does
 
 - Pre-warms a working set of prompts
 - Tests each cache hit rate by mixing cached prefixes with unique suffixes
-- Automatically ramps concurrency to find peak throughput
-- Retries at peak concurrency for stable measurement
+- **Sustained mode**: Continuously adjusts concurrency based on performance thresholds
+- **Fixed mode**: Tests specified concurrency levels with retries for stable measurements
 
 ## Options
 
@@ -19,16 +26,32 @@ The primary testing tool. Measures performance at various cache hit rates (0%, 5
 | `--context-sizes` | Context lengths to test (e.g., `8000 32000 64000`) |
 | `--working-set-size` | Total tokens in working set (e.g., 2000000) |
 
-### Inference Session Tuning
+### Mode Selection
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--output-tokens` | Tokens per request | 256 |
-| `--max-ttft` | TTFT threshold in seconds | 2.0 |
-| `--ttft-metric` | Metric for threshold (`max`, `avg`, `p95`) | p95 |
+| `--mode` | Test mode (`sustained` or `fixed`) | sustained |
+| `--fixed-concurrency-levels` | Concurrency levels for fixed mode (e.g., `10 20 40 80`) | - |
+
+### Performance Thresholds
+
+At least one threshold is required:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--max-ttft` | TTFT threshold in seconds (e.g., 2.0) | - |
+| `--ttft-metric` | Metric for TTFT threshold (`max`, `avg`, `p95`) | p95 |
+| `--min-tokens-per-req` | Minimum output tokens/s per request | - |
+| `--tokens-per-req-metric` | Metric for tokens/req (`avg`, `p5`, `p10`) | avg |
+
+### Timing
+
+| Option | Description | Default |
+|--------|-------------|---------|
 | `--test-duration` | Max seconds per cache rate test | 300 |
-| `--ramp-duration` | Seconds per concurrency level during ramp | 60 |
-| `--num-retries` | Retry runs at peak concurrency | 3 |
+| `--ramp-duration` | Seconds per concurrency level (fixed mode) | 60 |
+| `--assessment-period` | Seconds per assessment period (sustained mode) | 30 |
+| `--num-retries` | Retry runs at each concurrency level (fixed mode) | 3 |
 
 ### Concurrency Control
 
@@ -53,6 +76,7 @@ The primary testing tool. Measures performance at various cache hit rates (0%, 5
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--output-dir` | Output directory | ./output |
+| `--output-tokens` | Output tokens per request | 256 |
 | `--tokenizer` | Tokenizer model ID | - |
 | `--seed` | Random seed for reproducibility | - |
 | `--kv-cache-quantization` | 1 for FP8, 2 for FP16 estimation | 2 |
@@ -60,23 +84,36 @@ The primary testing tool. Measures performance at various cache hit rates (0%, 5
 | `--skip-graphs` | Don't generate graphs | false |
 | `--force-restart` | Ignore progress and restart | false |
 | `--verbose` | Enable debug logging | false |
+| `--brief` | Agent-friendly minimal output | false |
 
 ## Example Usage
 
 ```bash
-# Basic test with single context size
+# Sustained mode (default) - production capacity planning
 python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 \
     --working-set-size 2000000 \
+    --max-ttft 2.0 \
     --output-dir test_output
 
-# Test multiple context sizes with custom cache rates
+# Fixed mode - test specific concurrency levels
+python cache_rate_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --context-sizes 32000 \
+    --working-set-size 2000000 \
+    --mode fixed \
+    --fixed-concurrency-levels 10 20 40 80 \
+    --max-ttft 2.0 \
+    --output-dir fixed_output
+
+# Multiple context sizes with custom cache rates
 python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 8000 32000 64000 128000 \
     --working-set-size 5000000 \
     --cache-hit-rates 0 25 50 75 100 \
+    --max-ttft 2.0 \
     --output-dir multi_context
 
 # High concurrency test with stricter TTFT
@@ -95,6 +132,7 @@ python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
     --context-sizes 32000 64000 \
     --working-set-size 2000000 \
+    --max-ttft 2.0 \
     --output-dir test_output
 ```
 
@@ -111,19 +149,21 @@ python cache_rate_tester.py \
 | `summary_*.csv` | Aggregated metrics |
 | `detailed_results_*.csv` | Per-request data |
 | `phase_metadata_*.csv` | Per-phase timing data |
+| `sustained_periods_*.csv` | Period data (sustained mode) |
 | `index.html` | Dashboard |
 | `run_command_*.sh` | Executable script to reproduce test |
 
 ## When to use
 
-- Primary tool for comprehensive cache testing
+- **Sustained mode**: Production capacity planning, understanding sustainable throughput
+- **Fixed mode**: Benchmarking at specific concurrency points, comparing configurations
 - Understanding performance across cache efficiency spectrum
 - Finding optimal working set size for your memory tier
-- Comparing different server configurations
 
 ## Pro Tips
 
 - Start with smaller `--working-set-size` to verify setup
 - Use `--cache-hit-rates 0 50 100` for quick tests
-- Increase `--num-retries` for more stable measurements
+- In fixed mode, increase `--num-retries` for more stable measurements
 - Resume capability lets you add more context sizes later
+- Use `--brief` for automation and agent integration

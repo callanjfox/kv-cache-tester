@@ -7,7 +7,7 @@ A toolkit for testing LLM inference server KV cache performance.
 ### Core Testing Tools
 
 - **single_prompt_tester.py** - Baseline cache test: cold start vs 100% cached. Simple smoke test for cache functionality.
-- **cache_rate_tester.py** - Primary tool: tests performance across cache hit rates (0-100%) with fixed working set. Finds peak throughput via concurrency ramping.
+- **cache_rate_tester.py** - Primary tool: tests performance across cache hit rates (0-100%) with fixed working set. Two modes: sustained (continuous load) and fixed (specific concurrency levels).
 - **working_set_tester.py** - Memory tier testing: varies working set size to observe HBM/DRAM/SSD transitions.
 
 ### Utilities
