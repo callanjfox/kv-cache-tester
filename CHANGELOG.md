@@ -68,6 +68,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Provides clean, consistent data and prevents duplicate entries
 
 ### Fixed
+- **working_set_tester index.html now shows all context sizes**
+  - Previously, when testing multiple context sizes with multiple cache hit rates, only the last context size would appear in the dashboard
+  - Now uses unified `generate_index.py` like other tools for consistent behavior
 - **Critical: `--strict-time-window` flag now works correctly**
   - Fixed throughput calculations to filter requests BEFORE calculation when `--strict-time-window` is enabled
   - Previously, the flag would filter requests but throughput was calculated from unfiltered data, causing incorrect metrics
@@ -96,6 +99,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Was superseded by unified `generate_index.py` which auto-detects test type
 - **Redundant working_set_tester code**: Removed ~130 lines of `run_fixed_concurrency_mode` function
   - Fixed mode now uses the same `run_continuous_mode` function as sustained mode
+- **Duplicate index generation**: Removed `generate_sustained_index_html` function (~250 lines)
+  - Was causing index.html to only show last context size when testing multiple
+  - All tools now use unified `generate_index.py` for dashboard generation
 
 ## Notes
 
