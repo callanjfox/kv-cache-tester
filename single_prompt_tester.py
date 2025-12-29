@@ -59,23 +59,40 @@ class Colors:
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
-    INFO = '\033[97m'
+    INFO = ''                # Default terminal color
     DEBUG = '\033[90m'
-    METRIC = '\033[96m'
-    SUCCESS = '\033[92m'
-    PHASE = '\033[95m'
+    METRIC = '\033[96m'      # Cyan for metrics
+    SUCCESS = '\033[92m'     # Green for success
+    PHASE = '\033[95m'       # Magenta for phase headers
+
+    @classmethod
+    def disable(cls):
+        """Disable all colors for terminals where colors are hard to read"""
+        cls.HEADER = ''
+        cls.OKBLUE = ''
+        cls.OKCYAN = ''
+        cls.OKGREEN = ''
+        cls.WARNING = ''
+        cls.FAIL = ''
+        cls.ENDC = ''
+        cls.BOLD = ''
+        cls.INFO = ''
+        cls.DEBUG = ''
+        cls.METRIC = ''
+        cls.SUCCESS = ''
+        cls.PHASE = ''
 
 
 class ColoredFormatter(logging.Formatter):
-    FORMATS = {
-        logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
-        logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
-        logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
-        logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
-    }
-
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        # Read colors dynamically to support --no-color flag
+        formats = {
+            logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
+            logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
+            logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
+            logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
+        }
+        log_fmt = formats.get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
@@ -674,8 +691,14 @@ async def main():
                        help="Enable verbose logging")
     parser.add_argument("--brief", action="store_true",
                        help="Brief output mode for agents - minimal, parseable output")
+    parser.add_argument("--no-color", action="store_true",
+                       help="Disable colored output (useful for light terminal backgrounds)")
 
     args = parser.parse_args()
+
+    # Disable colors if requested
+    if args.no_color:
+        Colors.disable()
 
     # Brief mode setup - suppress normal logging
     brief_mode = args.brief

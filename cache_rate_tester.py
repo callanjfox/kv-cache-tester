@@ -56,11 +56,29 @@ class Colors:
     UNDERLINE = '\033[4m'
 
     # Specific colors for our use case
-    INFO = '\033[97m'        # Bright white
+    INFO = ''                # Default terminal color
     DEBUG = '\033[90m'       # Dark gray
     METRIC = '\033[96m'      # Cyan for metrics
     SUCCESS = '\033[92m'     # Green for success
     PHASE = '\033[95m'       # Magenta for phase headers
+
+    @classmethod
+    def disable(cls):
+        """Disable all colors for terminals where colors are hard to read"""
+        cls.HEADER = ''
+        cls.OKBLUE = ''
+        cls.OKCYAN = ''
+        cls.OKGREEN = ''
+        cls.WARNING = ''
+        cls.FAIL = ''
+        cls.ENDC = ''
+        cls.BOLD = ''
+        cls.UNDERLINE = ''
+        cls.INFO = ''
+        cls.DEBUG = ''
+        cls.METRIC = ''
+        cls.SUCCESS = ''
+        cls.PHASE = ''
 
 
 # Question bank to ensure long responses from the model
@@ -128,15 +146,15 @@ QUESTION_BANK = [
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors for console output"""
 
-    FORMATS = {
-        logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
-        logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
-        logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
-        logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
-    }
-
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        # Read colors dynamically to support --no-color flag
+        formats = {
+            logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
+            logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
+            logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
+            logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
+        }
+        log_fmt = formats.get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
@@ -894,6 +912,8 @@ def parse_arguments() -> argparse.Namespace:
                             "Default behavior includes all requests in throughput calculation (including cleanup time).")
     parser.add_argument("--brief", action="store_true",
                        help="Brief output mode for agents - minimal, parseable output")
+    parser.add_argument("--no-color", action="store_true",
+                       help="Disable colored output (useful for light terminal backgrounds)")
 
     return parser.parse_args()
 
@@ -3889,6 +3909,10 @@ def generate_sustained_comparison_graphs(output_dir: str):
 async def main():
     """Main entry point"""
     args = parse_arguments()
+
+    # Disable colors if requested
+    if args.no_color:
+        Colors.disable()
 
     # Brief mode setup - suppress normal logging
     brief_mode = args.brief
