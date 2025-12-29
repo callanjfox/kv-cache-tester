@@ -85,6 +85,7 @@ At least one threshold is required for **sustained mode**. In **fixed mode**, th
 | `--force-restart` | Ignore progress and restart | false |
 | `--verbose` | Enable debug logging | false |
 | `--brief` | Agent-friendly minimal output | false |
+| `--no-color` | Disable colored output (for light terminals) | false |
 
 ## Example Usage
 

@@ -46,7 +46,24 @@ Test performance across varying working set sizes to understand memory tier tran
 |--------|-------------|---------|
 | `--cache-hit-rates` | Rates to test | [100] |
 
-Other options are similar to cache_rate_tester.py (output tokens, test duration, etc.)
+### Working Set Initialization
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--init-strategy` | Initialize working set at `min` or `max` size | min |
+
+### Other
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--output-dir` | Output directory | ./output |
+| `--output-tokens` | Output tokens per request | 256 |
+| `--test-duration` | Max seconds per cache rate test | 300 |
+| `--verbose` | Enable debug logging | false |
+| `--brief` | Agent-friendly minimal output | false |
+| `--no-color` | Disable colored output (for light terminals) | false |
+
+Other options are similar to cache_rate_tester.py (concurrency control, cache behavior, etc.)
 
 ## Example Usage
 

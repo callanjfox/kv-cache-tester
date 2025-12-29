@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **`--no-color` option for all tools**: Disable colored output for light terminal backgrounds
+  - Works with single_prompt_tester, cache_rate_tester, and working_set_tester
+  - Useful when terminal colors are hard to read on light backgrounds
 - **Unified working_set_tester modes**: Fixed mode now behaves like sustained mode
   - Both modes use assessment periods for stats collection
   - Both modes support working set growth during the test

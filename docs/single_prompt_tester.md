@@ -26,6 +26,7 @@ Measure baseline cache performance with simple cold start vs. cached prompt comp
 | `--seed` | Random seed for reproducibility | - |
 | `--verbose` | Enable debug logging | false |
 | `--brief` | Agent-friendly minimal output | false |
+| `--no-color` | Disable colored output (for light terminals) | false |
 
 ## Example Usage
 
