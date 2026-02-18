@@ -1461,33 +1461,16 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                     except Exception as e:
                         logger.error(f"Task failed: {e}")
 
-        # Wait for remaining tasks (with timeout)
-        CLEANUP_TIMEOUT = 60.0  # seconds
+        # Wait for remaining tasks
         if active_tasks:
-            cleanup_start = time.time()
-            logger.debug(f"    Waiting for {len(active_tasks)} remaining tasks (timeout {CLEANUP_TIMEOUT:.0f}s)...")
-            try:
-                remaining_results = await asyncio.wait_for(
-                    asyncio.gather(*active_tasks, return_exceptions=True),
-                    timeout=CLEANUP_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup timed out after {CLEANUP_TIMEOUT:.0f}s with {len(active_tasks)} outstanding requests \u2014 cancelling{Colors.ENDC}")
-                for task in active_tasks:
-                    task.cancel()
-                remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
-            cleanup_time = time.time() - cleanup_start
-
-            # Warn if cleanup took too long
-            if cleanup_time > 15:
-                logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup took {cleanup_time:.1f}s to complete {len(active_tasks)} outstanding requests{Colors.ENDC}")
+            logger.debug(f"    Waiting for {len(active_tasks)} remaining tasks...")
+            remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
 
             for result in remaining_results:
                 if isinstance(result, RequestMetrics):
                     results.append(result)
                 elif isinstance(result, Exception):
-                    if not isinstance(result, asyncio.CancelledError):
-                        logger.error(f"Task failed: {result}")
+                    logger.error(f"Task failed: {result}")
 
     except Exception as e:
         logger.error(f"Error during concurrency test: {e}")
@@ -1753,6 +1736,8 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
     endpoint_active_counts = [0] * num_endpoints
     task_endpoint_map = {}  # Map task to its endpoint index for decrementing on completion
 
+    active_tasks = []
+
     while time.time() - test_start_time < config.test_duration:
         period_number += 1
         period_start = time.time()
@@ -1770,7 +1755,6 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
         logger.info(f"{Colors.OKCYAN}  Period {period_number}: Running at concurrency {current_concurrency} for {period_duration:.1f}s{Colors.ENDC}")
 
         # Run requests at current concurrency for the assessment period
-        active_tasks = []
         request_counter = 0
         num_launched = 0
 
@@ -1841,39 +1825,30 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                         except Exception as e:
                             logger.error(f"Task failed: {e}")
 
-            # Period duration ended - wait for remaining tasks to complete (with timeout)
+            # Period duration ended - collect completed tasks, carry in-flight to next period
             period_end_time = period_start + period_duration
-            CLEANUP_TIMEOUT = 60.0  # seconds
 
             if active_tasks:
-                logger.debug(f"    Period {period_number}: Waiting for {len(active_tasks)} remaining tasks (timeout {CLEANUP_TIMEOUT:.0f}s)...")
+                # Collect any tasks that have completed without blocking
+                done_tasks = [t for t in active_tasks if t.done()]
+                active_tasks = [t for t in active_tasks if not t.done()]
 
-                # Clean up endpoint counts for remaining tasks before gathering
-                for task in active_tasks:
-                    task_id = id(task)
-                    if task_id in task_endpoint_map and task_endpoint_map[task_id] is not None:
-                        endpoint_active_counts[task_endpoint_map[task_id]] -= 1
-                        del task_endpoint_map[task_id]
+                if done_tasks:
+                    for task in done_tasks:
+                        # Decrement endpoint count for completed task
+                        task_id = id(task)
+                        if task_id in task_endpoint_map and task_endpoint_map[task_id] is not None:
+                            endpoint_active_counts[task_endpoint_map[task_id]] -= 1
+                            del task_endpoint_map[task_id]
 
-                try:
-                    remaining_results = await asyncio.wait_for(
-                        asyncio.gather(*active_tasks, return_exceptions=True),
-                        timeout=CLEANUP_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup timed out after {CLEANUP_TIMEOUT:.0f}s with {len(active_tasks)} outstanding requests \u2014 cancelling{Colors.ENDC}")
-                    for task in active_tasks:
-                        task.cancel()
-                    # Gather cancelled tasks to suppress warnings
-                    remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
+                        try:
+                            result = await task
+                            all_requests.append(result)
+                        except Exception as e:
+                            logger.error(f"Task failed: {e}")
 
-                for result in remaining_results:
-                    if isinstance(result, RequestMetrics):
-                        # Add to all_requests for detailed CSV
-                        all_requests.append(result)
-                    elif isinstance(result, Exception):
-                        if not isinstance(result, asyncio.CancelledError):
-                            logger.error(f"Task failed: {result}")
+                if active_tasks:
+                    logger.debug(f"    Period {period_number}: {len(active_tasks)} requests still in-flight, carrying to next period")
 
         except Exception as e:
             logger.error(f"Error during period {period_number}: {e}")
@@ -2165,6 +2140,23 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
 
         # Update concurrency for next period
         current_concurrency = next_concurrency
+
+    # Wait for any remaining in-flight requests at end of test (with timeout)
+    if active_tasks:
+        logger.info(f"  Waiting for {len(active_tasks)} remaining in-flight requests...")
+        done, pending = await asyncio.wait(active_tasks, timeout=60)
+        for task in done:
+            try:
+                result = await task
+                if isinstance(result, RequestMetrics):
+                    all_requests.append(result)
+            except Exception as e:
+                logger.error(f"Task failed: {e}")
+        if pending:
+            logger.warning(f"  {len(pending)} requests still outstanding after 60s timeout — skipping")
+            for task in pending:
+                task.cancel()
+        active_tasks = []
 
     # Summary
     total_elapsed = time.time() - test_start_time

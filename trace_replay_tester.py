@@ -54,12 +54,31 @@ class Colors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
-    INFO = '\033[97m'
+    INFO = ''                # Default terminal color
     DEBUG = '\033[90m'
     METRIC = '\033[96m'
     SUCCESS = '\033[92m'
     PHASE = '\033[95m'
     USER = '\033[94m'
+
+    @classmethod
+    def disable(cls):
+        """Disable all colors for terminals where colors are hard to read"""
+        cls.HEADER = ''
+        cls.OKBLUE = ''
+        cls.OKCYAN = ''
+        cls.OKGREEN = ''
+        cls.WARNING = ''
+        cls.FAIL = ''
+        cls.ENDC = ''
+        cls.BOLD = ''
+        cls.UNDERLINE = ''
+        cls.INFO = ''
+        cls.DEBUG = ''
+        cls.METRIC = ''
+        cls.SUCCESS = ''
+        cls.PHASE = ''
+        cls.USER = ''
 
 
 # =============================================================================
@@ -135,15 +154,15 @@ QUESTION_BANK = [
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors for console output"""
 
-    FORMATS = {
-        logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
-        logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
-        logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
-        logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
-    }
-
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        # Read colors dynamically to support --no-color flag
+        formats = {
+            logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
+            logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
+            logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
+            logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
+        }
+        log_fmt = formats.get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
@@ -2258,7 +2277,7 @@ class TestOrchestrator:
         # Wait for remaining in-flight requests to complete
         if pending_tasks:
             logger.info(f"Waiting for {len(pending_tasks)} in-flight requests to complete...")
-            done, _ = await asyncio.wait(pending_tasks.keys(), timeout=60)
+            done, pending = await asyncio.wait(pending_tasks.keys(), timeout=60)
             for task in done:
                 try:
                     result = await task
@@ -2266,6 +2285,10 @@ class TestOrchestrator:
                         self.all_metrics.append(result)
                 except Exception as e:
                     logger.error(f"Task failed during cleanup: {e}")
+            if pending:
+                logger.warning(f"{len(pending)} requests still outstanding after 60s timeout — cancelling")
+                for task in pending:
+                    task.cancel()
 
         self.running = False
         self.print_summary()
@@ -2620,6 +2643,8 @@ def parse_arguments():
                         help="Cache block size in tokens (default: 256)")
 
     # Output control
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable colored output (useful for light terminal backgrounds)")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging")
     parser.add_argument("--skip-graphs", action="store_true",
@@ -2664,6 +2689,10 @@ def parse_arguments():
 
 async def main():
     args = parse_arguments()
+
+    # Disable colors if requested
+    if args.no_color:
+        Colors.disable()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
