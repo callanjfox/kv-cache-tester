@@ -42,6 +42,18 @@ uv run python working_set_tester.py \
 | **single_prompt_tester.py** | Baseline cache performance with cold start vs cached comparisons | [Docs](docs/single_prompt_tester.md) |
 | **cache_rate_tester.py** | Performance at various cache hit rates (0-100%) with fixed working set | [Docs](docs/cache_rate_tester.md) |
 | **working_set_tester.py** | Performance across varying working set sizes for memory tier analysis | [Docs](docs/working_set_tester.md) |
+| **trace_replay_tester.py** | Replay real agentic coding traces with realistic cache patterns and timing (beta) | [Docs](docs/trace_replay_tester.md) |
+
+### Included Traces
+
+The `traces/` directory contains real-world agentic coding traces for use with `trace_replay_tester.py`. This is a curated subset of a larger dataset: **642 coding conversations with subagents**, totaling **112,176 requests** and **13,675,350,647 tokens**.
+
+| Metric | Min | P25 | Median | P75 | Max | Mean |
+|---|---|---|---|---|---|---|
+| Starting input tokens | 8,832 | 16,512 | 20,160 | 71,168 | 639,552 | 61,529 |
+| Ending input tokens | 10,304 | 65,600 | 115,008 | 149,632 | 785,280 | 133,471 |
+| Cache hit rate (per conv) | 38.3% | 91.1% | 96.9% | 98.5% | 99.6% | 93.6% |
+| Conversation duration (min) | 0.2 | 11.9 | 60.2 | 163.0 | 11,105.6 | 283.9 |
 
 ## Utility Scripts
 
@@ -85,12 +97,8 @@ uv run python single_prompt_tester.py --help
 For a detailed guide on testing methodology and how to use these tools effectively, see:
 [Evaluating Management of KV Cache within an Inference System](https://medium.com/@callan.j.fox/evaluating-management-of-kv-cache-within-an-inference-system-2d7c3d266c3a)
 
-## Roadmap
+## Real-World Trace Replay
 
-**Next Up: Real-World Trace Replay**
+> **Beta:** `trace_replay_tester.py` is currently in beta with active development underway. Updates to come.
 
-Update `cache_rate_tester.py` and `working_set_tester.py` to consume real traces from agentic coding workloads. This will enable:
-
-- Real-world benchmarking using actual production traces
-- Honoring the real delay between prompts for accurate load simulation
-- Adherence to trace patterns for realistic cache behavior testing
+The `trace_replay_tester.py` tool replays real agentic coding traces to benchmark inference performance with realistic cache hit patterns, timing, and message structures. See the [Trace Replay Documentation](docs/trace_replay_tester.md) for full details.

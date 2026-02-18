@@ -296,6 +296,7 @@ class TestConfig:
     kv_cache_bytes: int = 2  # 1 or 2 bytes per element for KV cache calculation
     strict_time_window: bool = False  # Only include requests completed within duration window
     fixed_concurrency_levels: Optional[List[int]] = None  # For fixed mode
+    endpoint_selection: str = "round-robin"  # "round-robin" or "pinned" for multi-endpoint routing
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -683,16 +684,66 @@ class WorkingSet:
 
         logger.info(f"Working set generation complete")
 
-    def get_next_prompt(self, random_selection: bool = False) -> List[int]:
-        """Get next prompt from working set"""
+    def get_next_prompt(self, random_selection: bool = False) -> Tuple[List[int], int]:
+        """Get next prompt from working set
+        Returns: (prompt_tokens, prompt_index)
+        """
         if random_selection:
             import random
-            return random.choice(self.prompts)
+            idx = random.randint(0, len(self.prompts) - 1)
+            return self.prompts[idx], idx
         else:
             # Cycle through deterministically
             prompt = self.prompts[self.current_index]
+            idx = self.current_index
             self.current_index = (self.current_index + 1) % len(self.prompts)
-            return prompt
+            return prompt, idx
+
+    def get_balanced_random_prompt(self, endpoint_request_counts: List[int]) -> Tuple[List[int], int]:
+        """
+        Select a random prompt, biased toward underloaded endpoints.
+
+        This ensures:
+        1. Prompt affinity: same prompt_index always maps to same endpoint (via prompt_index % num_endpoints)
+        2. Balanced load: selection is biased toward endpoints with fewer pending requests
+        3. Async-safe: no race conditions since prompt_index determines endpoint deterministically
+
+        Args:
+            endpoint_request_counts: List of current request counts for each endpoint
+
+        Returns: (prompt_tokens, prompt_index)
+        """
+        import random
+        from collections import defaultdict
+
+        num_endpoints = len(endpoint_request_counts)
+
+        if num_endpoints <= 1:
+            # Single endpoint: just use plain random selection
+            idx = random.randint(0, len(self.prompts) - 1)
+            return self.prompts[idx], idx
+
+        # Group prompts by their target endpoint
+        prompts_by_endpoint = defaultdict(list)
+        for i in range(len(self.prompts)):
+            target_endpoint = i % num_endpoints
+            prompts_by_endpoint[target_endpoint].append(i)
+
+        # Find the endpoint(s) with fewest requests
+        min_count = min(endpoint_request_counts)
+        underloaded_endpoints = [i for i, c in enumerate(endpoint_request_counts) if c == min_count]
+
+        # Select from an underloaded endpoint's prompts
+        target_endpoint = random.choice(underloaded_endpoints)
+
+        # Get a random prompt that maps to this endpoint
+        if prompts_by_endpoint[target_endpoint]:
+            prompt_index = random.choice(prompts_by_endpoint[target_endpoint])
+        else:
+            # Fallback: if no prompts map to this endpoint (unlikely), use any prompt
+            prompt_index = random.randint(0, len(self.prompts) - 1)
+
+        return self.prompts[prompt_index], prompt_index
 
 
 class APIClient:
@@ -729,6 +780,42 @@ class APIClient:
         self.current_index = (self.current_index + 1) % len(self.clients)
         return client_info
 
+    def get_client_for_session(self, session_id: int):
+        """Get client for a specific session ID (consistent hashing for session pinning)
+
+        This ensures that requests for the same session (e.g., same prompt prefix)
+        always go to the same endpoint, which is critical for KV cache efficiency.
+        """
+        if len(self.clients) == 1:
+            return self.clients[0]
+        # Use modulo to consistently map session IDs to endpoints
+        client_index = session_id % len(self.clients)
+        return self.clients[client_index]
+
+    def get_client_for_prompt(self, prompt_index: int) -> Tuple[dict, int]:
+        """Get client using hash-based affinity for a prompt index.
+
+        This is the primary method for endpoint selection when using balanced load distribution.
+        The prompt_index determines which endpoint to use (via modulo), ensuring:
+        1. Same prompt always goes to same endpoint (critical for KV cache hits)
+        2. No race conditions - endpoint is determined synchronously before async task starts
+        3. Even distribution of prompts across endpoints when combined with balanced selection
+
+        Args:
+            prompt_index: The index of the prompt in the working set
+
+        Returns:
+            (client_info, endpoint_index): The client info dict and the endpoint index
+        """
+        if len(self.clients) == 1:
+            return self.clients[0], 0
+        endpoint_index = prompt_index % len(self.clients)
+        return self.clients[endpoint_index], endpoint_index
+
+    def get_num_endpoints(self) -> int:
+        """Return the number of configured endpoints"""
+        return len(self.clients)
+
     async def detect_model(self) -> str:
         """Auto-detect model from API (uses first endpoint)"""
         try:
@@ -752,10 +839,18 @@ class APIClient:
             logger.error(f"Failed to auto-detect model: {e}")
             raise ValueError(f"Could not detect model from {first_endpoint}/v1/models")
 
-    async def send_request(self, prompt: str, max_tokens: int, tokenizer=None) -> Tuple[str, float, float, float, int, int, List[float], List[int]]:
+    async def send_request(self, prompt: str, max_tokens: int, tokenizer=None, session_id: Optional[int] = None) -> Tuple[str, float, float, float, int, int, List[float], List[int]]:
         """
         Send a single request and return metrics with streaming token timeline
-        Uses round-robin load balancing across multiple endpoints if configured.
+
+        Args:
+            prompt: The prompt text to send
+            max_tokens: Maximum tokens to generate
+            tokenizer: Optional tokenizer for chunk token counting
+            session_id: Optional session ID for endpoint pinning. If provided, requests with
+                       the same session_id will always be routed to the same endpoint.
+                       This is critical for KV cache efficiency when using multiple endpoints.
+
         Returns: (response_text, ttft, ttlt, generation_time, prompt_tokens, completion_tokens,
                   token_timestamps, tokens_per_chunk)
         """
@@ -768,8 +863,11 @@ class APIClient:
         chunk_timestamps = []  # Timestamp when each chunk arrived
         tokens_per_chunk = []  # Exact token count per chunk (using tokenizer)
 
-        # Get next client using round-robin load balancing
-        client_info = self.get_next_client()
+        # Get client - use session pinning if session_id provided, otherwise round-robin
+        if session_id is not None:
+            client_info = self.get_client_for_session(session_id)
+        else:
+            client_info = self.get_next_client()
         client = client_info['client']
 
         try:
@@ -832,6 +930,11 @@ def parse_arguments() -> argparse.Namespace:
     # Required arguments
     parser.add_argument("--api-endpoint", type=str, nargs='+', required=True,
                        help="OpenAI-compatible API endpoint(s). Can specify multiple for load balancing (e.g., http://localhost:8125 http://localhost:8126)")
+    parser.add_argument("--endpoint-selection", type=str, default="round-robin",
+                       choices=["round-robin", "pinned"],
+                       help="Endpoint selection strategy when multiple endpoints are specified (default: round-robin). "
+                            "'round-robin' = distribute requests across endpoints in rotation, "
+                            "'pinned' = pin each session (prompt prefix) to a consistent endpoint for KV cache efficiency")
     parser.add_argument("--context-sizes", type=int, nargs='+', required=True,
                        help="Context lengths to test (e.g., 8000 32000 64000)")
     parser.add_argument("--working-set-size", type=int, required=True,
@@ -1004,7 +1107,8 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         seed=args.seed,
         kv_cache_bytes=args.kv_cache_quantization,
         strict_time_window=args.strict_time_window,
-        fixed_concurrency_levels=fixed_concurrency_levels
+        fixed_concurrency_levels=fixed_concurrency_levels,
+        endpoint_selection=args.endpoint_selection
     )
 
 
@@ -1063,15 +1167,21 @@ def calculate_kv_cache_size(context_size: int, bytes_per_element: int,
 
 
 async def initialize_working_set(api_client: APIClient, working_set: WorkingSet,
-                                output_tokens: int, max_concurrency: int = 16):
+                                output_tokens: int, max_concurrency: int = 16,
+                                endpoint_selection: str = "round-robin"):
     """
     Initialize working set by sending all prompts to API with adaptive concurrency
+
+    When endpoint_selection is "pinned", each prompt is sent to its designated endpoint
+    using session pinning. This ensures that when the prompt is used later in the test,
+    requests go to the same endpoint where the cache was warmed up.
 
     Args:
         api_client: API client
         working_set: Working set to initialize
         output_tokens: Output tokens per request
         max_concurrency: Maximum concurrent initialization requests (default: 16)
+        endpoint_selection: "round-robin" or "pinned" for endpoint selection strategy
     """
     num_prompts = len(working_set.prompts)
     logger.info(f"Initializing working set: sending {num_prompts} prompts to API (max concurrency: {max_concurrency})...")
@@ -1088,7 +1198,9 @@ async def initialize_working_set(api_client: APIClient, working_set: WorkingSet,
         """Initialize a single prompt"""
         prompt_text = working_set.tokenizer.decode(prompt_tokens)
         try:
-            await api_client.send_request(prompt_text, output_tokens, tokenizer=None)
+            # Use session pinning only if endpoint_selection is "pinned"
+            session_id = i if endpoint_selection == "pinned" else None
+            await api_client.send_request(prompt_text, output_tokens, tokenizer=None, session_id=session_id)
             return i, True
         except Exception as e:
             logger.error(f"  Failed to initialize prompt {i + 1}: {e}")
@@ -1137,10 +1249,22 @@ async def initialize_working_set(api_client: APIClient, working_set: WorkingSet,
 
 def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
                      cache_hit_rate: int, context_size: int, random_selection: bool,
-                     request_seed: Optional[int] = None, question_index: int = 0) -> Tuple[str, int, int]:
+                     request_seed: Optional[int] = None, question_index: int = 0,
+                     endpoint_request_counts: Optional[List[int]] = None) -> Tuple[str, int, int, Optional[int]]:
     """
     Construct a prompt with the specified cache hit rate
-    Returns: (prompt_text, cached_tokens, unique_tokens)
+    Returns: (prompt_text, cached_tokens, unique_tokens, session_id)
+
+    The session_id is the prompt index from the working set, used for endpoint pinning
+    when multiple API endpoints are configured. Requests with the same session_id should
+    go to the same endpoint to benefit from KV cache hits. For 0% cache rate, session_id
+    is None since there's no cached prefix to pin to.
+
+    Args:
+        endpoint_request_counts: Optional list of current request counts per endpoint.
+                                When provided with random_selection=True, uses balanced
+                                random selection that biases toward underloaded endpoints
+                                while maintaining prompt-to-endpoint affinity.
     """
     # Calculate token counts and round cached tokens to chunk boundary
     cached_tokens_raw = int(context_size * cache_hit_rate / 100)
@@ -1150,15 +1274,25 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
     cached_tokens = int(np.floor(cached_tokens_raw / chunk_size) * chunk_size)
     unique_tokens = context_size - cached_tokens
 
+    session_id = None  # Will be set if we use a working set prompt
+
+    # Helper function to get prompt with appropriate selection method
+    def get_prompt():
+        if random_selection and endpoint_request_counts is not None and len(endpoint_request_counts) > 1:
+            # Use balanced random selection for multi-endpoint scenarios
+            return working_set.get_balanced_random_prompt(endpoint_request_counts)
+        else:
+            return working_set.get_next_prompt(random_selection)
+
     if cache_hit_rate == 0:
-        # 0% cache: all unique tokens
+        # 0% cache: all unique tokens, no session pinning needed
         tokens = tokenizer.generate_dummy_tokens(context_size, seed=request_seed)
     elif cache_hit_rate == 100:
         # 100% cache: use complete working set prompt (already rounded)
-        tokens = working_set.get_next_prompt(random_selection)
+        tokens, session_id = get_prompt()
     else:
         # Mixed: cache prefix + unique suffix
-        base_prompt = working_set.get_next_prompt(random_selection)
+        base_prompt, session_id = get_prompt()
         cached_prefix = base_prompt[:cached_tokens]
         unique_suffix = tokenizer.generate_dummy_tokens(unique_tokens, seed=request_seed)
         tokens = cached_prefix + unique_suffix
@@ -1171,19 +1305,25 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
     question = QUESTION_BANK[question_index % len(QUESTION_BANK)]
     prompt_text = prompt_text + "\n\n" + question
 
-    return prompt_text, cached_tokens, unique_tokens
+    return prompt_text, cached_tokens, unique_tokens, session_id
 
 
 async def run_single_request(api_client: APIClient, prompt: str, max_tokens: int,
                             cache_hit_rate: int, context_size: int, cached_tokens: int,
                             unique_tokens: int, concurrency_level: int,
-                            request_id: str, phase_id: str, tokenizer=None, verbose: bool = False) -> RequestMetrics:
-    """Run a single request and return metrics with streaming token tracking"""
+                            request_id: str, phase_id: str, tokenizer=None, verbose: bool = False,
+                            session_id: Optional[int] = None) -> RequestMetrics:
+    """Run a single request and return metrics with streaming token tracking
+
+    Args:
+        session_id: Optional session ID for endpoint pinning. When using multiple API endpoints,
+                   requests with the same session_id will be routed to the same endpoint.
+    """
     launch_time = time.time()
 
     try:
         response_text, ttft, ttlt, gen_time, prompt_tok, completion_tok, chunk_timestamps, tokens_per_chunk = await api_client.send_request(
-            prompt, max_tokens, tokenizer
+            prompt, max_tokens, tokenizer, session_id=session_id
         )
 
         finish_time = time.time()
@@ -1252,6 +1392,11 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
     start_time = time.time()
     num_launched = 0
 
+    # Track active requests per endpoint for balanced load distribution
+    num_endpoints = api_client.get_num_endpoints()
+    endpoint_active_counts = [0] * num_endpoints
+    task_endpoint_map = {}  # Map task to its endpoint index for decrementing on completion
+
     logger.debug(f"    Running concurrency level {concurrency} for {duration:.1f}s (phase: {phase_id})")
 
     try:
@@ -1262,20 +1407,34 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                 request_seed = (config.seed + request_counter) if config.seed is not None else None
 
                 # Construct prompt with rotating question
-                prompt, cached_tok, unique_tok = construct_prompt(
+                # Pass endpoint counts for balanced random selection when using pinned endpoints
+                endpoint_counts_for_selection = endpoint_active_counts if config.endpoint_selection == "pinned" else None
+                prompt, cached_tok, unique_tok, session_id = construct_prompt(
                     working_set, tokenizer, cache_hit_rate, context_size,
-                    config.random_selection, request_seed, question_index=request_counter
+                    config.random_selection, request_seed, question_index=request_counter,
+                    endpoint_request_counts=endpoint_counts_for_selection
                 )
+
+                # Only use session pinning if endpoint_selection is "pinned"
+                effective_session_id = session_id if config.endpoint_selection == "pinned" else None
+
+                # Determine endpoint index for tracking (synchronously, before task is created)
+                if effective_session_id is not None:
+                    endpoint_index = effective_session_id % num_endpoints
+                    endpoint_active_counts[endpoint_index] += 1
+                else:
+                    endpoint_index = None
 
                 # Launch request
                 task = asyncio.create_task(
                     run_single_request(
                         api_client, prompt, config.output_tokens, cache_hit_rate,
                         context_size, cached_tok, unique_tok, concurrency, request_id, phase_id,
-                        tokenizer=tokenizer, verbose=config.verbose
+                        tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id
                     )
                 )
                 active_tasks.append(task)
+                task_endpoint_map[id(task)] = endpoint_index
                 request_counter += 1
                 num_launched += 1
 
@@ -1290,28 +1449,45 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                 active_tasks = list(pending)  # Convert set back to list
 
                 for task in done:
+                    # Decrement endpoint count for completed task
+                    task_id = id(task)
+                    if task_id in task_endpoint_map and task_endpoint_map[task_id] is not None:
+                        endpoint_active_counts[task_endpoint_map[task_id]] -= 1
+                        del task_endpoint_map[task_id]
+
                     try:
                         result = await task
                         results.append(result)
                     except Exception as e:
                         logger.error(f"Task failed: {e}")
 
-        # Wait for remaining tasks
+        # Wait for remaining tasks (with timeout)
+        CLEANUP_TIMEOUT = 60.0  # seconds
         if active_tasks:
             cleanup_start = time.time()
-            logger.debug(f"    Waiting for {len(active_tasks)} remaining tasks...")
-            remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
+            logger.debug(f"    Waiting for {len(active_tasks)} remaining tasks (timeout {CLEANUP_TIMEOUT:.0f}s)...")
+            try:
+                remaining_results = await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=CLEANUP_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup timed out after {CLEANUP_TIMEOUT:.0f}s with {len(active_tasks)} outstanding requests \u2014 cancelling{Colors.ENDC}")
+                for task in active_tasks:
+                    task.cancel()
+                remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
             cleanup_time = time.time() - cleanup_start
 
             # Warn if cleanup took too long
             if cleanup_time > 15:
-                logger.warning(f"    ⚠ Cleanup took {cleanup_time:.1f}s to complete {len(active_tasks)} outstanding requests")
+                logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup took {cleanup_time:.1f}s to complete {len(active_tasks)} outstanding requests{Colors.ENDC}")
 
             for result in remaining_results:
                 if isinstance(result, RequestMetrics):
                     results.append(result)
                 elif isinstance(result, Exception):
-                    logger.error(f"Task failed: {result}")
+                    if not isinstance(result, asyncio.CancelledError):
+                        logger.error(f"Task failed: {result}")
 
     except Exception as e:
         logger.error(f"Error during concurrency test: {e}")
@@ -1365,7 +1541,7 @@ async def run_fixed_concurrency_mode(config: TestConfig, api_client: APIClient,
 
         # Reinitialize if per_test strategy
         if config.reinit_strategy == "per_test":
-            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency, config.endpoint_selection)
 
         # Run initial test at this concurrency level
         phase_id = f"FIXED_c{concurrency_level}_run0"
@@ -1470,7 +1646,7 @@ async def run_fixed_concurrency_mode(config: TestConfig, api_client: APIClient,
 
             # Reinitialize if per_test strategy
             if config.reinit_strategy == "per_test":
-                await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+                await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency, config.endpoint_selection)
 
             retry_metrics, retry_phase_metadata = await run_concurrency_level(
                 api_client, working_set, tokenizer, config, context_size,
@@ -1568,10 +1744,14 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
     all_requests = []
 
     # Track throughput history for plateau detection
+    # Use sliding window approach: compare to peak of last N periods instead of all-time peak
     throughput_history = []  # List of (period_number, input_tps, output_tps)
-    peak_input_tps = 0
-    peak_output_tps = 0
-    peak_period = 0
+    SLIDING_WINDOW_SIZE = 5  # Compare to peak of last 5 periods
+
+    # Track active requests per endpoint for balanced load distribution (persists across periods)
+    num_endpoints = api_client.get_num_endpoints()
+    endpoint_active_counts = [0] * num_endpoints
+    task_endpoint_map = {}  # Map task to its endpoint index for decrementing on completion
 
     while time.time() - test_start_time < config.test_duration:
         period_number += 1
@@ -1605,21 +1785,36 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     phase_id = f"SUSTAINED_P{period_number}"
                     request_seed = (config.seed + request_counter) if config.seed is not None else None
 
-                    # Construct prompt
-                    prompt, cached_tok, unique_tok = construct_prompt(
+                    # Construct prompt with endpoint counts for balanced random selection
+                    endpoint_counts_for_selection = endpoint_active_counts if config.endpoint_selection == "pinned" else None
+                    prompt, cached_tok, unique_tok, session_id = construct_prompt(
                         working_set, tokenizer, cache_hit_rate, context_size,
-                        config.random_selection, request_seed, question_index=request_counter
+                        config.random_selection, request_seed, question_index=request_counter,
+                        endpoint_request_counts=endpoint_counts_for_selection
                     )
+
+                    # Only use session pinning if endpoint_selection is "pinned"
+                    effective_session_id = session_id if config.endpoint_selection == "pinned" else None
+
+                    # Determine endpoint index for tracking (synchronously, before task is created)
+                    if effective_session_id is not None:
+                        endpoint_index = effective_session_id % num_endpoints
+                        endpoint_active_counts[endpoint_index] += 1
+                        if config.verbose:
+                            logger.debug(f"      [{request_id}] Prompt {session_id} -> Endpoint {endpoint_index} (counts: {endpoint_active_counts})")
+                    else:
+                        endpoint_index = None
 
                     # Launch request
                     task = asyncio.create_task(
                         run_single_request(
                             api_client, prompt, config.output_tokens, cache_hit_rate,
                             context_size, cached_tok, unique_tok, current_concurrency, request_id, phase_id,
-                            tokenizer=tokenizer, verbose=config.verbose
+                            tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id
                         )
                     )
                     active_tasks.append(task)
+                    task_endpoint_map[id(task)] = endpoint_index
                     request_counter += 1
                     num_launched += 1
 
@@ -1634,25 +1829,51 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     active_tasks = list(pending)
 
                     for task in done:
+                        # Decrement endpoint count for completed task
+                        task_id = id(task)
+                        if task_id in task_endpoint_map and task_endpoint_map[task_id] is not None:
+                            endpoint_active_counts[task_endpoint_map[task_id]] -= 1
+                            del task_endpoint_map[task_id]
+
                         try:
                             result = await task
                             all_requests.append(result)
                         except Exception as e:
                             logger.error(f"Task failed: {e}")
 
-            # Period duration ended - wait for remaining tasks to complete
+            # Period duration ended - wait for remaining tasks to complete (with timeout)
             period_end_time = period_start + period_duration
+            CLEANUP_TIMEOUT = 60.0  # seconds
 
             if active_tasks:
-                logger.debug(f"    Period {period_number}: Waiting for {len(active_tasks)} remaining tasks...")
-                remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
+                logger.debug(f"    Period {period_number}: Waiting for {len(active_tasks)} remaining tasks (timeout {CLEANUP_TIMEOUT:.0f}s)...")
+
+                # Clean up endpoint counts for remaining tasks before gathering
+                for task in active_tasks:
+                    task_id = id(task)
+                    if task_id in task_endpoint_map and task_endpoint_map[task_id] is not None:
+                        endpoint_active_counts[task_endpoint_map[task_id]] -= 1
+                        del task_endpoint_map[task_id]
+
+                try:
+                    remaining_results = await asyncio.wait_for(
+                        asyncio.gather(*active_tasks, return_exceptions=True),
+                        timeout=CLEANUP_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"    {Colors.WARNING}\u26a0 Cleanup timed out after {CLEANUP_TIMEOUT:.0f}s with {len(active_tasks)} outstanding requests \u2014 cancelling{Colors.ENDC}")
+                    for task in active_tasks:
+                        task.cancel()
+                    # Gather cancelled tasks to suppress warnings
+                    remaining_results = await asyncio.gather(*active_tasks, return_exceptions=True)
 
                 for result in remaining_results:
                     if isinstance(result, RequestMetrics):
                         # Add to all_requests for detailed CSV
                         all_requests.append(result)
                     elif isinstance(result, Exception):
-                        logger.error(f"Task failed: {result}")
+                        if not isinstance(result, asyncio.CancelledError):
+                            logger.error(f"Task failed: {result}")
 
         except Exception as e:
             logger.error(f"Error during period {period_number}: {e}")
@@ -1803,23 +2024,26 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                 logger.info(f"    Performance thresholds OK BUT already at max concurrency {current_concurrency}")
             else:
                 # Check for throughput plateau/decline before ramping up
-                # Track peak and check if we're significantly below it
+                # Use sliding window peak: compare to peak of last N periods instead of all-time peak
+                # This adapts to changing cache conditions and prevents spiral-down from stale peaks
                 should_ramp_up = True
                 plateau_reason = ""
 
-                # Update peak tracking
-                if input_tps > peak_input_tps:
-                    peak_input_tps = input_tps
-                    peak_output_tps = output_tps
-                    peak_period = period_number
+                # Check plateau if we have enough history (need at least SLIDING_WINDOW_SIZE + 1 periods)
+                if len(throughput_history) >= SLIDING_WINDOW_SIZE + 1:
+                    # Get sliding window (last N periods, excluding current)
+                    window = throughput_history[-(SLIDING_WINDOW_SIZE + 1):-1]
 
-                # Check plateau if we have enough history (at least 2 periods after peak)
-                if len(throughput_history) >= 2 and period_number > peak_period + 1:
-                    # Calculate decline from peak (accounting for variance)
-                    decline_from_peak = ((peak_input_tps - input_tps) / peak_input_tps) * 100
+                    # Find peak in the sliding window
+                    window_peak_tps = max(h[1] for h in window)
+                    window_peak_period = [h[0] for h in window if h[1] == window_peak_tps][0]
 
-                    # If we've declined >15% from peak (beyond normal variance), ramp down to recover
-                    if decline_from_peak > 15:
+                    # Calculate decline from sliding window peak
+                    decline_from_peak = ((window_peak_tps - input_tps) / window_peak_tps) * 100
+
+                    # If we've declined >25% from sliding window peak, ramp down
+                    # More conservative threshold (25% vs 15%) to reduce false positives
+                    if decline_from_peak > 25:
                         should_ramp_up = False
                         decision = "PLATEAU_RAMP_DOWN"
 
@@ -1835,45 +2059,29 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                             down_increment = config.concurrency_increment
 
                         next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
-                        plateau_reason = f"Throughput {decline_from_peak:.1f}% below peak ({peak_input_tps:,.0f} tok/s @ period {peak_period})"
-                        logger.warning(f"    {Colors.WARNING}Plateau detected: Current {input_tps:,.0f} tok/s is {decline_from_peak:.1f}% below peak → RAMP DOWN: {current_concurrency} → {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
-                        logger.info(f"    Peak was {peak_input_tps:,.0f} tok/s at period {peak_period}, attempting to recover by reducing concurrency")
-
-                    # Also check recent trend (last 3 periods)
-                    elif len(throughput_history) >= 3:
-                        recent_throughputs = [h[1] for h in throughput_history[-3:]]  # Last 3 input_tps values
-                        recent_avg = np.mean(recent_throughputs)
-
-                        # If current is >10% below recent average, ramp down
-                        if input_tps < recent_avg * 0.90:
-                            should_ramp_up = False
-                            decision = "TREND_RAMP_DOWN"
-                            decline_pct = ((recent_avg - input_tps) / recent_avg) * 100
-
-                            # Adaptive ramp down based on trend decline severity
-                            if decline_pct > 30:
-                                down_increment = config.concurrency_increment * 3
-                            elif decline_pct > 20:
-                                down_increment = config.concurrency_increment * 2
-                            else:
-                                down_increment = config.concurrency_increment
-
-                            next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
-                            plateau_reason = f"Throughput {decline_pct:.1f}% below recent avg ({recent_avg:,.0f} tok/s)"
-                            logger.warning(f"    {Colors.WARNING}Decline detected: Current {input_tps:,.0f} tok/s is below recent trend → RAMP DOWN: {current_concurrency} → {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
+                        plateau_reason = f"Throughput {decline_from_peak:.1f}% below sliding window peak ({window_peak_tps:,.0f} tok/s @ period {window_peak_period})"
+                        logger.warning(f"    {Colors.WARNING}Plateau detected: Current {input_tps:,.0f} tok/s is {decline_from_peak:.1f}% below recent peak → RAMP DOWN: {current_concurrency} → {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
+                        logger.info(f"    Sliding window peak: {window_peak_tps:,.0f} tok/s at period {window_peak_period} (window size: {SLIDING_WINDOW_SIZE} periods)")
 
                 if should_ramp_up:
                     # Calculate headroom based on all active thresholds
                     min_headroom = 1.0  # Start with maximum headroom
+                    ttft_headroom = None
+                    tokens_headroom = None
+                    limiting_factor = "none"
 
                     if config.max_ttft is not None:
                         ttft_headroom = (config.max_ttft - measured_ttft) / config.max_ttft
-                        min_headroom = min(min_headroom, ttft_headroom)
+                        if ttft_headroom < min_headroom:
+                            min_headroom = ttft_headroom
+                            limiting_factor = "ttft"
 
                     if config.min_tokens_per_req is not None:
                         # For tokens-per-req, headroom is how much above threshold we are
                         tokens_headroom = (measured_tokens_per_req - config.min_tokens_per_req) / config.min_tokens_per_req
-                        min_headroom = min(min_headroom, tokens_headroom)
+                        if tokens_headroom < min_headroom:
+                            min_headroom = tokens_headroom
+                            limiting_factor = "tokens_per_req"
 
                     # Use the smallest headroom to determine increment (most conservative)
                     if min_headroom > 0.7:
@@ -1890,9 +2098,26 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     next_concurrency = min(config.max_concurrency, current_concurrency + adaptive_increment)
                     decision = "RAMP_UP"
 
-                    # Show peak info if we have it
-                    peak_info = f" (peak: {peak_input_tps:,.0f} tok/s @ P{peak_period})" if peak_input_tps > 0 else ""
-                    logger.info(f"    Performance thresholds OK (headroom: {min_headroom:.1%}) → RAMP UP: {current_concurrency} → {next_concurrency} (+{next_concurrency - current_concurrency}){peak_info}")
+                    # Build detailed headroom message
+                    headroom_details = []
+                    if ttft_headroom is not None:
+                        marker = " ←" if limiting_factor == "ttft" else ""
+                        headroom_details.append(f"TTFT: {ttft_headroom:.1%} ({measured_ttft:.3f}s / {config.max_ttft}s){marker}")
+                    if tokens_headroom is not None:
+                        marker = " ←" if limiting_factor == "tokens_per_req" else ""
+                        headroom_details.append(f"Tokens/req: {tokens_headroom:.1%} ({measured_tokens_per_req:.1f} / {config.min_tokens_per_req}){marker}")
+
+                    # Show sliding window peak info if we have enough history
+                    peak_info = ""
+                    if len(throughput_history) >= SLIDING_WINDOW_SIZE:
+                        window = throughput_history[-SLIDING_WINDOW_SIZE:]
+                        window_peak_tps = max(h[1] for h in window)
+                        window_peak_period = [h[0] for h in window if h[1] == window_peak_tps][0]
+                        peak_info = f" (window peak: {window_peak_tps:,.0f} tok/s @ P{window_peak_period})"
+
+                    logger.info(f"    Performance thresholds OK → RAMP UP: {current_concurrency} → {next_concurrency} (+{next_concurrency - current_concurrency}){peak_info}")
+                    if headroom_details:
+                        logger.info(f"      Headroom: {' | '.join(headroom_details)} | Using minimum: {min_headroom:.1%}")
 
         # Print period summary (streaming-based counts)
         logger.info(f"{Colors.METRIC}    Prefills: {len(prefill_requests)}, Contributing: {num_contributing}, Launched: {num_launched}{Colors.ENDC}")
@@ -1946,7 +2171,12 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
     logger.info(f"")
     logger.info(f"{Colors.SUCCESS}  Continuous mode complete: {period_number} periods in {total_elapsed:.1f}s{Colors.ENDC}")
     logger.info(f"{Colors.METRIC}    Total requests: {len(all_requests)}{Colors.ENDC}")
-    logger.info(f"{Colors.METRIC}    Peak throughput: {peak_input_tps:,.0f} input tok/s at period {peak_period}{Colors.ENDC}")
+
+    # Calculate peak from throughput history
+    if throughput_history:
+        peak_input_tps = max(h[1] for h in throughput_history)
+        peak_period = [h[0] for h in throughput_history if h[1] == peak_input_tps][0]
+        logger.info(f"{Colors.METRIC}    Peak throughput: {peak_input_tps:,.0f} input tok/s at period {peak_period}{Colors.ENDC}")
 
     # Save all requests to detailed CSV
     if all_requests:
@@ -4086,7 +4316,7 @@ async def main():
 
         # Initialize working set with API (pre-warm cache)
         if config.reinit_strategy == "once" or config.reinit_strategy == "per_cache_rate":
-            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+            await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency, config.endpoint_selection)
 
         # Test each cache hit rate
         for cache_hit_rate in config.cache_hit_rates:
@@ -4101,7 +4331,7 @@ async def main():
 
             # Reinitialize if strategy requires
             if config.reinit_strategy == "per_cache_rate":
-                await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency)
+                await initialize_working_set(api_client, working_set, config.output_tokens, config.init_concurrency, config.endpoint_selection)
 
             # Run the appropriate test mode
             try:
