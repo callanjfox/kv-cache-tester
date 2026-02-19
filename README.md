@@ -46,7 +46,9 @@ uv run python working_set_tester.py \
 
 ### Included Traces
 
-The `traces/` directory contains real-world agentic coding traces for use with `trace_replay_tester.py`. This is a curated subset of a larger dataset: **642 coding conversations with subagents**, totaling **112,176 requests** and **13,675,350,647 tokens**.
+The `traces/` directory contains real-world agentic coding traces for use with `trace_replay_tester.py`. This is a curated subset of a larger dataset: **642 coding conversations with embedded subagent usage**, totaling **112,176 requests** and **13,675,350,647 tokens**. The traces include subagent spawns just as a real user session would — the tool replays these as part of the conversation, capturing the realistic concurrency and cache pressure patterns they create.
+
+For privacy, conversation IDs have been anonymized and cache block hashes do not align across conversations. The trace replay tool accounts for this by generating a configurable shared prefix (`--warm-prefix-pct`) that simulates cross-conversation cache overlap from common tool definitions and system prompts — the default is calibrated to match patterns observed in real production data. We may release additional traces depending on community interest.
 
 | Metric | Min | P25 | Median | P75 | Max | Mean |
 |---|---|---|---|---|---|---|
