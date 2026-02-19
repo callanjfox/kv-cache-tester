@@ -109,6 +109,8 @@ uv run python single_prompt_tester.py --help
 For a detailed guide on testing methodology and how to use these tools effectively, see:
 [Evaluating Management of KV Cache within an Inference System](https://medium.com/@callan.j.fox/evaluating-management-of-kv-cache-within-an-inference-system-2d7c3d266c3a)
 
+> **Note:** This guide will be updated soon with the latest methodology covering trace replay testing and multi-endpoint support.
+
 ## Real-World Trace Replay
 
 > **Beta:** `trace_replay_tester.py` is currently in beta with active development underway. Updates to come.
