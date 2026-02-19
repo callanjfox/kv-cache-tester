@@ -33,6 +33,16 @@ uv run python working_set_tester.py \
     --min-working-set-size 100000 \
     --max-working-set-size 5000000 \
     --working-set-increments 10
+
+# Replay real agentic coding traces
+uv run python trace_replay_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --trace-directory traces \
+    --output-dir output \
+    --start-users 5 \
+    --max-users 50 \
+    --max-ttft 2.0 \
+    --test-duration 300
 ```
 
 ## Core Testing Tools
