@@ -1464,7 +1464,7 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
         # Wait for remaining tasks (with timeout)
         if active_tasks:
             logger.debug(f"    Waiting for {len(active_tasks)} remaining tasks...")
-            done, pending = await asyncio.wait(active_tasks, timeout=30)
+            done, pending = await asyncio.wait(active_tasks, timeout=5)
             for task in done:
                 try:
                     result = await task
@@ -1473,7 +1473,7 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                 except Exception as e:
                     logger.error(f"Task failed: {e}")
             if pending:
-                logger.warning(f"    {len(pending)} requests still outstanding after 30s timeout — cancelling")
+                logger.warning(f"    {len(pending)} requests still outstanding after 5s timeout — cancelling")
                 for task in pending:
                     task.cancel()
 
@@ -2162,7 +2162,7 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
             except Exception as e:
                 logger.error(f"Task failed: {e}")
         if pending:
-            logger.warning(f"  {len(pending)} requests still outstanding after 30s timeout — cancelling")
+            logger.warning(f"  {len(pending)} requests still outstanding after 5s timeout — cancelling")
             for task in pending:
                 task.cancel()
         active_tasks = []
