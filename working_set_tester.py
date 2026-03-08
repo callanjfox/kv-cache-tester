@@ -1402,7 +1402,9 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
     all_requests = []
 
     # Track throughput history for plateau detection
+    # Use sliding window approach: compare to peak of last N periods instead of all-time peak
     throughput_history = []  # List of (period_number, input_tps, output_tps)
+    SLIDING_WINDOW_SIZE = 5  # Compare to peak of last 5 periods
     peak_input_tps = 0
     peak_output_tps = 0
     peak_period = 0
@@ -1764,42 +1766,77 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     next_concurrency = current_concurrency
                     logger.info(f"    Performance thresholds OK BUT already at max concurrency {current_concurrency}")
                 else:
-                    # Update peak tracking (for informational purposes)
-                    if input_tps > peak_input_tps:
-                        peak_input_tps = input_tps
-                        peak_output_tps = output_tps
-                        peak_period = period_number
+                    # Check for throughput plateau/decline before ramping up
+                    # Use sliding window peak: compare to peak of last N periods instead of all-time peak
+                    # This adapts to changing cache conditions and prevents spiral-down from stale peaks
+                    should_ramp_up = True
 
-                    # Thresholds are OK - ramp up to increase throughput
-                    # Calculate headroom based on thresholds
-                    ttft_headroom = (config.max_ttft - measured_ttft) / config.max_ttft if config.max_ttft else 1.0
+                    if len(throughput_history) >= SLIDING_WINDOW_SIZE + 1:
+                        window = throughput_history[-(SLIDING_WINDOW_SIZE + 1):-1]
+                        window_peak_tps = max(h[1] for h in window)
+                        window_peak_period = [h[0] for h in window if h[1] == window_peak_tps][0]
+                        decline_from_peak = ((window_peak_tps - input_tps) / window_peak_tps) * 100
 
-                    # Also consider tokens/req headroom if configured
-                    tokens_headroom = 1.0
-                    if config.min_tokens_per_req and config.min_tokens_per_req > 0:
-                        tokens_headroom = (measured_tokens_per_req - config.min_tokens_per_req) / config.min_tokens_per_req
+                        if decline_from_peak > 25:
+                            should_ramp_up = False
+                            decision = "PLATEAU_RAMP_DOWN"
 
-                    # Use the minimum headroom (most constrained)
-                    min_headroom = min(ttft_headroom, tokens_headroom)
+                            if decline_from_peak > 40:
+                                down_increment = config.concurrency_increment * 4
+                            elif decline_from_peak > 30:
+                                down_increment = config.concurrency_increment * 3
+                            elif decline_from_peak > 20:
+                                down_increment = config.concurrency_increment * 2
+                            else:
+                                down_increment = config.concurrency_increment
 
-                    # Use headroom to determine increment (1x to 10x)
-                    if min_headroom > 0.7:
-                        adaptive_increment = config.concurrency_increment * 10
-                    elif min_headroom > 0.5:
-                        adaptive_increment = config.concurrency_increment * 5
-                    elif min_headroom > 0.3:
-                        adaptive_increment = config.concurrency_increment * 3
-                    elif min_headroom > 0.15:
-                        adaptive_increment = config.concurrency_increment * 2
-                    else:
-                        adaptive_increment = config.concurrency_increment
+                            next_concurrency = max(config.start_concurrency, current_concurrency - down_increment)
+                            logger.warning(f"    {Colors.WARNING}Plateau detected: Current {input_tps:,.0f} tok/s is {decline_from_peak:.1f}% below recent peak \u2192 RAMP DOWN: {current_concurrency} \u2192 {next_concurrency} (-{current_concurrency - next_concurrency}){Colors.ENDC}")
+                            logger.info(f"    Sliding window peak: {window_peak_tps:,.0f} tok/s at period {window_peak_period} (window size: {SLIDING_WINDOW_SIZE} periods)")
 
-                    next_concurrency = min(config.max_concurrency, current_concurrency + adaptive_increment)
-                    decision = "RAMP_UP"
+                    if should_ramp_up:
+                        # Update peak tracking
+                        if input_tps > peak_input_tps:
+                            peak_input_tps = input_tps
+                            peak_output_tps = output_tps
+                            peak_period = period_number
 
-                    # Show peak info if we have it
-                    peak_info = f" (peak: {peak_input_tps:,.0f} tok/s @ P{peak_period})" if peak_input_tps > 0 else ""
-                    logger.info(f"    Performance thresholds OK (headroom: {min_headroom:.1%}) -> RAMP UP: {current_concurrency} -> {next_concurrency} (+{next_concurrency - current_concurrency}){peak_info}")
+                        # Thresholds are OK - ramp up to increase throughput
+                        # Calculate headroom based on thresholds
+                        ttft_headroom = (config.max_ttft - measured_ttft) / config.max_ttft if config.max_ttft else 1.0
+
+                        # Also consider tokens/req headroom if configured
+                        tokens_headroom = 1.0
+                        if config.min_tokens_per_req and config.min_tokens_per_req > 0:
+                            tokens_headroom = (measured_tokens_per_req - config.min_tokens_per_req) / config.min_tokens_per_req
+
+                        # Use the minimum headroom (most constrained)
+                        min_headroom = min(ttft_headroom, tokens_headroom)
+
+                        # Use headroom to determine increment (1x to 10x)
+                        if min_headroom > 0.7:
+                            adaptive_increment = config.concurrency_increment * 10
+                        elif min_headroom > 0.5:
+                            adaptive_increment = config.concurrency_increment * 5
+                        elif min_headroom > 0.3:
+                            adaptive_increment = config.concurrency_increment * 3
+                        elif min_headroom > 0.15:
+                            adaptive_increment = config.concurrency_increment * 2
+                        else:
+                            adaptive_increment = config.concurrency_increment
+
+                        next_concurrency = min(config.max_concurrency, current_concurrency + adaptive_increment)
+                        decision = "RAMP_UP"
+
+                        # Show sliding window peak info if available
+                        peak_info = ""
+                        if len(throughput_history) >= SLIDING_WINDOW_SIZE:
+                            window = throughput_history[-SLIDING_WINDOW_SIZE:]
+                            window_peak_tps = max(h[1] for h in window)
+                            window_peak_period = [h[0] for h in window if h[1] == window_peak_tps][0]
+                            peak_info = f" (window peak: {window_peak_tps:,.0f} tok/s @ P{window_peak_period})"
+
+                        logger.info(f"    Performance thresholds OK (headroom: {min_headroom:.1%}) -> RAMP UP: {current_concurrency} -> {next_concurrency} (+{next_concurrency - current_concurrency}){peak_info}")
 
         # Print period summary
         logger.info(f"{Colors.METRIC}    Completed: {num_completed}, Launched: {num_launched}{Colors.ENDC}")
