@@ -329,7 +329,7 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
     # Generate unique prompts with seed offset for this iteration
     prompts = []
     for i in range(concurrent_prompts):
-        prompt_seed = base_seed + iteration * 1000 + i * 100
+        prompt_seed = base_seed + iteration * 100000 + i * 100 + context_size
         unique_tokens = tokenizer.generate_dummy_tokens(context_size, seed=prompt_seed)
         unique_prompt = tokenizer.decode(unique_tokens) + "\n\nTell me a story."
         prompts.append(unique_prompt)
