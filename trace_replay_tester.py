@@ -238,6 +238,9 @@ class TestConfig:
     max_concurrent_requests: Optional[int] = None  # None = unlimited
     # Warm prefix for cross-conversation cache sharing
     warm_prefix_pct: float = 0.5  # Default 50% of tool+system tokens warm
+    # Trace advancement: start users partway through their traces
+    advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
+    advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -954,6 +957,69 @@ class SyntheticMessageGenerator:
 
 
 # =============================================================================
+# Trace Advancement Helpers
+# =============================================================================
+
+def calculate_start_index(requests: list, rng: random.Random,
+                          min_pct: float, max_pct: float,
+                          max_context: int = 0) -> int:
+    """Calculate starting request index based on advancement range.
+
+    Args:
+        requests: List of trace requests
+        rng: Random number generator for deterministic selection
+        min_pct: Minimum position as fraction (0.0-1.0)
+        max_pct: Maximum position as fraction (0.0-1.0)
+        max_context: If >0, clamp to last index where input_tokens <= max_context
+
+    Returns:
+        Index into requests list where user should start
+    """
+    if max_pct <= 0 or len(requests) <= 1:
+        return 0
+
+    min_idx = int(len(requests) * min_pct)
+    max_idx = min(int(len(requests) * max_pct), len(requests) - 1)
+
+    # Clamp max_idx so we don't start beyond max_context
+    if max_context > 0:
+        while max_idx > min_idx and requests[max_idx].get('input_tokens', 0) > max_context:
+            max_idx -= 1
+        # If even min_idx exceeds context, return 0 (start from beginning)
+        if requests[min_idx].get('input_tokens', 0) > max_context:
+            return 0
+
+    if min_idx >= max_idx:
+        return min_idx
+
+    return rng.randint(min_idx, max_idx)
+
+
+def adjust_for_request_pairs(requests: list, start_idx: int) -> int:
+    """Adjust index to avoid starting at second part of a request pair.
+
+    Request pairs (streaming + non-streaming) have identical hash_ids.
+    If we land on the second request, back up to the first.
+    """
+    if start_idx <= 0:
+        return start_idx
+
+    current = set(requests[start_idx].get('hash_ids', []))
+    prev = set(requests[start_idx - 1].get('hash_ids', []))
+
+    if current == prev and len(current) > 0:
+        return start_idx - 1
+    return start_idx
+
+
+def skip_subagent_markers(requests: list, start_idx: int) -> int:
+    """Skip past any subagent markers at start position."""
+    while start_idx < len(requests) and requests[start_idx].get('type') == 'subagent':
+        start_idx += 1
+    return start_idx
+
+
+# =============================================================================
 # User Session
 # =============================================================================
 
@@ -1079,6 +1145,35 @@ class UserSession:
             self.all_hash_ids.update(global_hash_ids)
             self.current_idx += 1
             self.last_request_time = time.time()
+
+    def reconstruct_state_at_index(self, start_idx: int, generator_seed: int):
+        """Reconstruct session state to start at given index.
+
+        Sets up state as if requests 0..start_idx-1 had been processed.
+        This enables trace advancement without replaying all previous requests.
+        """
+        if start_idx <= 0:
+            return
+
+        prev_request = self.requests[start_idx - 1]
+
+        # Set hash_id state from previous request for cache tracking
+        self.prev_hash_ids = set(prev_request.get('hash_ids', []))
+        self.prev_request_hash_ids = set(prev_request.get('hash_ids', []))
+        self.prev_input_tokens = prev_request.get('input_tokens', 0)
+
+        # Reset response tracking (no accumulated tokens from skipped requests)
+        self.stored_response_tokens = 0
+        self.token_shortfall = 0
+
+        # Set position
+        self.current_idx = start_idx
+
+        # Build synthetic conversation matching the starting request's input_tokens
+        current_request = self.requests[start_idx]
+        target_tokens = current_request.get('input_tokens', 0)
+        content = self.generator.generate_user_text(target_tokens, generator_seed)
+        self.conversation = [{"role": "user", "content": content}]
 
     def calculate_cache_hits(self, request: dict) -> Tuple[int, int]:
         """Calculate cache hits and misses for this request based on hash_ids."""
@@ -1559,12 +1654,38 @@ class TestOrchestrator:
         user = UserSession(user_id, trace, self.generator, self.config.max_context)
         user.start_time = time.time()
 
-        self.users[user_id] = user
-        initial_tokens = trace['requests'][0]['input_tokens']
-        self.log_lifecycle_event(user_id, "started", trace['metadata']['conversation_id'],
-                                 f"{len(trace['requests'])} requests, {initial_tokens:,} initial tokens")
+        # Apply trace advancement if configured
+        advancement_pct = 0.0
+        if self.config.advance_max > 0:
+            start_idx = calculate_start_index(
+                trace['requests'], self.trace_manager.rng,
+                self.config.advance_min, self.config.advance_max,
+                self.config.max_context)
+            start_idx = adjust_for_request_pairs(trace['requests'], start_idx)
+            start_idx = skip_subagent_markers(trace['requests'], start_idx)
 
-        logger.info(f"{Colors.USER}  👤 {user_id} started{Colors.ENDC} (trace: {user.trace_id[:10]}, {len(trace['requests'])} requests, {initial_tokens:,} initial tokens)")
+            if start_idx > 0 and start_idx < len(trace['requests']):
+                seed = hash(f"{user_id}_advanced_{start_idx}") % (2**32)
+                user.reconstruct_state_at_index(start_idx, seed)
+                advancement_pct = (start_idx / len(trace['requests'])) * 100
+
+        self.users[user_id] = user
+
+        if advancement_pct > 0:
+            remaining_reqs = len(trace['requests']) - user.current_idx
+            current_req = user.requests[user.current_idx] if user.current_idx < len(user.requests) else None
+            current_tokens = current_req['input_tokens'] if current_req else 0
+            self.log_lifecycle_event(user_id, "started", trace['metadata']['conversation_id'],
+                                     f"{remaining_reqs} requests remaining (advanced {advancement_pct:.0f}%), "
+                                     f"{current_tokens:,} tokens at start")
+            logger.info(f"{Colors.USER}  👤 {user_id} started{Colors.ENDC} (trace: {user.trace_id[:10]}, "
+                       f"📍 advanced to req {user.current_idx} ({advancement_pct:.0f}%), "
+                       f"{remaining_reqs} remaining, {current_tokens:,} tokens)")
+        else:
+            initial_tokens = trace['requests'][0]['input_tokens']
+            self.log_lifecycle_event(user_id, "started", trace['metadata']['conversation_id'],
+                                     f"{len(trace['requests'])} requests, {initial_tokens:,} initial tokens")
+            logger.info(f"{Colors.USER}  👤 {user_id} started{Colors.ENDC} (trace: {user.trace_id[:10]}, {len(trace['requests'])} requests, {initial_tokens:,} initial tokens)")
 
         return user
 
@@ -2680,6 +2801,12 @@ def parse_arguments():
                              "content, enabling cache hits after user 1. Default: 0.5 (50%%). "
                              "Set to 0 to disable.")
 
+    # Trace advancement
+    parser.add_argument("--advance-min", type=float, default=0.0,
+                        help="Minimum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
+    parser.add_argument("--advance-max", type=float, default=0.0,
+                        help="Maximum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
+
     return parser.parse_args()
 
 
@@ -2728,7 +2855,9 @@ async def main():
         repetition_penalty=args.repetition_penalty,
         enable_request_rate_limiting=args.enable_request_rate_limiting,
         max_concurrent_requests=args.max_concurrent_requests,
-        warm_prefix_pct=args.warm_prefix_pct
+        warm_prefix_pct=args.warm_prefix_pct,
+        advance_min=args.advance_min,
+        advance_max=args.advance_max
     )
 
     # Print header
@@ -2776,6 +2905,8 @@ async def main():
         logger.info(f"  Warm Prefix: {config.warm_prefix_pct:.0%} of tool+system ({warm_tokens:,} tokens)")
     else:
         logger.info(f"  Warm Prefix: disabled")
+    if config.advance_max > 0:
+        logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%}")
     logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
 
     # Initialize components
