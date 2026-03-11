@@ -24,7 +24,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Literal, Set
-from collections import defaultdict
+from collections import defaultdict, deque
 import numpy as np
 import pandas as pd
 
@@ -1019,6 +1019,18 @@ def skip_subagent_markers(requests: list, start_idx: int) -> int:
     return start_idx
 
 
+def get_first_real_request(requests: list) -> Optional[dict]:
+    """Get the first non-subagent request from a list of requests.
+
+    Subagent markers have type='subagent' and 0 input_tokens.
+    This helper skips them to find the first actual request.
+    """
+    for req in requests:
+        if req.get('type') != 'subagent':
+            return req
+    return None
+
+
 # =============================================================================
 # User Session
 # =============================================================================
@@ -1054,8 +1066,6 @@ class UserSession:
 
         # Track previous hash_ids for cache hit calculation
         self.prev_hash_ids: Set[int] = set()
-        # Track all hash_ids seen for working set calculation
-        self.all_hash_ids: Set[int] = set()
 
         # Conversation history: list of {"role": "user"|"assistant", "content": str}
         self.conversation: List[dict] = []
@@ -1139,10 +1149,6 @@ class UserSession:
             request = self.requests[self.current_idx]
             current_hash_ids = set(request.get('hash_ids', []))
             self.prev_hash_ids = current_hash_ids
-            # Accumulate globally-unique hash_ids for working set tracking
-            # Prefix with user_id to make hash_ids unique across users
-            global_hash_ids = {f"{self.user_id}_{h}" for h in current_hash_ids}
-            self.all_hash_ids.update(global_hash_ids)
             self.current_idx += 1
             self.last_request_time = time.time()
 
@@ -1581,6 +1587,12 @@ class TestOrchestrator:
         self.peak_working_set_tokens: int = 0  # Track peak working set
         self.peak_users: int = 0  # Track peak concurrent users
 
+        # Block-level working set tracking with timestamps for time-based aging
+        # Keys are (trace_id, hash_id) tuples to make hash_ids unique per conversation
+        self.block_last_access: Dict[Tuple[str, int], float] = {}
+        # Time-ordered list of (timestamp, block_key) for efficient pruning
+        self.block_access_order: deque = deque()
+
         # Admission control
         self.in_flight_requests: int = 0  # Current count of requests in flight
         self.in_flight_decoding: int = 0  # Requests that have received first token (in decode phase)
@@ -1829,12 +1841,52 @@ class TestOrchestrator:
         backoff = min(1.0 * overage_ratio, 10.0)
         return True, backoff
 
+    def prune_old_blocks(self, max_age: float = 900):
+        """Remove blocks older than max_age seconds. O(k) where k = expired blocks.
+
+        Args:
+            max_age: Maximum age in seconds (default 900 = 15 minutes)
+        """
+        cutoff = time.time() - max_age
+        while self.block_access_order and self.block_access_order[0][0] < cutoff:
+            ts, key = self.block_access_order.popleft()
+            # Only delete if this is still the latest access for this block
+            if key in self.block_last_access and self.block_last_access[key] == ts:
+                del self.block_last_access[key]
+
     def get_current_working_set_tokens(self) -> int:
-        """Calculate current working set size in tokens from all users."""
-        working_set = set()
-        for user in self.users.values():
-            working_set.update(user.all_hash_ids)
-        return len(working_set) * self.config.chunk_size
+        """Calculate working set size in tokens (blocks accessed within 15m window).
+
+        Returns the number of unique blocks in block_last_access * chunk_size.
+        This is O(1) since we just return the dict size.
+        """
+        return len(self.block_last_access) * self.config.chunk_size
+
+    def compute_windowed_working_set(self) -> Dict[str, int]:
+        """Compute working set for 1m, 5m, 15m time windows.
+
+        Returns a dict mapping window label to token count.
+        Single pass through block_last_access dict, counting by age buckets.
+        O(n) where n = active blocks (bounded by pruning to 15m max).
+        """
+        now = time.time()
+        cutoff_1m = now - 60
+        cutoff_5m = now - 300
+        # cutoff_15m not needed - all blocks in dict are within 15m after pruning
+
+        count_1m = count_5m = count_15m = 0
+        for ts in self.block_last_access.values():
+            count_15m += 1  # All blocks in dict are within 15m after pruning
+            if ts >= cutoff_5m:
+                count_5m += 1
+                if ts >= cutoff_1m:
+                    count_1m += 1
+
+        return {
+            '1m': count_1m * self.config.chunk_size,
+            '5m': count_5m * self.config.chunk_size,
+            '15m': count_15m * self.config.chunk_size
+        }
 
     def can_add_user_for_working_set(self, trace: dict) -> Tuple[bool, int]:
         """
@@ -1846,8 +1898,10 @@ class TestOrchestrator:
         if self.config.max_working_set_tokens == 0:
             return True, 0  # Unlimited
 
-        # Estimate new tokens from first request's hash_ids
-        first_req = trace['requests'][0]
+        # Estimate new tokens from first real request's hash_ids (skip subagent markers)
+        first_req = get_first_real_request(trace['requests'])
+        if first_req is None:
+            return True, 0  # No real requests
         estimated_new_blocks = len(first_req.get('hash_ids', []))
         estimated_new_tokens = estimated_new_blocks * self.config.chunk_size
 
@@ -1947,13 +2001,11 @@ class TestOrchestrator:
         cache_hits = sum(m.cache_hit_blocks for m in period_prefill_metrics)
         cache_total = cache_hits + sum(m.cache_miss_blocks for m in period_prefill_metrics)
 
-        # Count working set blocks (all unique blocks seen across all users)
-        working_set = set()
-        for user in self.users.values():
-            working_set.update(user.all_hash_ids)
+        # Count working set blocks (15m window - unique blocks accessed recently)
+        working_set_blocks = len(self.block_last_access)
 
         # Update peak working set
-        working_set_tokens = len(working_set) * self.config.chunk_size
+        working_set_tokens = working_set_blocks * self.config.chunk_size
         if working_set_tokens > self.peak_working_set_tokens:
             self.peak_working_set_tokens = working_set_tokens
 
@@ -2014,7 +2066,7 @@ class TestOrchestrator:
             ttft_p95=np.percentile(ttfts, 95) if ttfts else 0,
             ttft_p99=np.percentile(ttfts, 99) if ttfts else 0,
             avg_cache_hit_rate=cache_hits / cache_total if cache_total > 0 else 0,
-            working_set_blocks=len(working_set),
+            working_set_blocks=working_set_blocks,
             users_added=self.period_users_added,
             users_completed=0,  # Could track this if needed
             total_request_time=total_request_time,
@@ -2075,6 +2127,10 @@ class TestOrchestrator:
         else:
             logger.info(f"  Working Set: {working_set_tokens:,} tokens ({metrics.working_set_blocks} blocks)")
 
+        # Show time-windowed working set (1m, 5m, 15m)
+        windowed = self.compute_windowed_working_set()
+        logger.info(f"  Working Set by Age: 1m: {windowed['1m']:,} | 5m: {windowed['5m']:,} | 15m: {windowed['15m']:,} tokens")
+
         logger.info(f"  Idle Time: {metrics.idle_time_pct:.1f}% (processing: {metrics.total_request_time:.1f}s)")
 
         # Show admission control metrics if enabled
@@ -2098,6 +2154,15 @@ class TestOrchestrator:
 
         user.state = "active"
         logger.debug(f"  📤 {user.user_id} req {user.current_idx + 1}: firing ({request['input_tokens']:,} input tokens)")
+
+        # Track hash_ids for working set when request fires (not when it completes)
+        # Prefix with trace_id to make hash_ids unique per conversation
+        # (raw hash_ids are sequential integers that overlap across traces)
+        current_time = time.time()
+        for h in request.get('hash_ids', []):
+            key = (user.trace_id, h)
+            self.block_last_access[key] = current_time
+            self.block_access_order.append((current_time, key))
 
         # Build messages (only user messages are generated, assistant messages come from history)
         # Pass canonical prefix for cross-conversation cache sharing on first request
@@ -2362,6 +2427,9 @@ class TestOrchestrator:
                 if time.time() - self.current_period_start >= self.config.assessment_period:
                     period_number += 1
                     period_end_time = self.current_period_start + self.config.assessment_period
+
+                    # Prune old blocks from working set tracking (keeps 15m window)
+                    self.prune_old_blocks()
 
                     # Calculate metrics based on timestamps (which requests' TTFT fell in this period)
                     pending_start_times = [start_time for _, start_time in pending_tasks.values()]
