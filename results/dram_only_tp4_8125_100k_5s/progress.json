@@ -1,0 +1,66 @@
+{
+  "test_id": "1e47e6512c2634a8",
+  "parameters": {
+    "api_endpoints": [
+      "http://localhost:8125"
+    ],
+    "context_sizes": [
+      100000
+    ],
+    "working_set_sizes": [
+      400000,
+      642105,
+      884210,
+      1126315,
+      1368421,
+      1610526,
+      1852631,
+      2094736,
+      2336842,
+      2578947,
+      2821052,
+      3063157,
+      3305263,
+      3547368,
+      3789473,
+      4031578,
+      4273684,
+      4515789,
+      4757894,
+      5000000
+    ],
+    "cache_hit_rates": [
+      96
+    ],
+    "output_tokens": 1,
+    "max_ttft": 5.0,
+    "ttft_metric": "avg",
+    "output_dir": "results/dram_only_tp4_8125_100k_5s",
+    "tokenizer_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+    "test_duration": 1800,
+    "ramp_duration": 60,
+    "reinit_strategy": "per_working_set",
+    "random_selection": true,
+    "num_retries": 0,
+    "start_concurrency": 1,
+    "concurrency_increment": 2,
+    "max_concurrency": 1000,
+    "init_concurrency": 16,
+    "skip_graphs": false,
+    "force_restart": false,
+    "verbose": false,
+    "chunk_size": 256,
+    "seed": null,
+    "kv_cache_bytes": 2,
+    "strict_time_window": false,
+    "mode": "sustained",
+    "assessment_period": 30,
+    "min_tokens_per_req": null,
+    "init_strategy": "max",
+    "fixed_concurrency": null
+  },
+  "completed_tests": [
+    "100000_5000000_96"
+  ],
+  "last_update": "2026-03-11T05:40:11.228278+00:00"
+}

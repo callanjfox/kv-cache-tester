@@ -578,7 +578,7 @@ class SyntheticMessageGenerator:
     - Tool results: File contents, bash output, paths, errors
     """
 
-    def __init__(self, tokenizer_id: str, chunk_size: int = 256):
+    def __init__(self, tokenizer_id: str, chunk_size: int = 64):
         self.tokenizer = None
         self.tokenizer_id = tokenizer_id
         self.chunk_size = chunk_size
@@ -1599,6 +1599,12 @@ class TestOrchestrator:
         self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
 
+        # Cooldown tracking for ramp controller
+        self.consecutive_exceeded_periods: int = 0   # How many consecutive periods exceeded TTFT
+        self.consecutive_good_periods: int = 0       # How many consecutive periods under TTFT
+        self.cooldown_required: int = 0              # Good periods required before next ramp
+        self.post_cooldown_ramps: int = 0            # Ramps since last cooldown (for throttling)
+
         # Error tracking
         self.consecutive_connection_errors: int = 0
         self.total_connection_errors: int = 0
@@ -1779,13 +1785,13 @@ class TestOrchestrator:
 
     def calculate_users_to_add(self) -> int:
         """
-        Calculate how many users to add based on TTFT headroom only.
+        Calculate how many users to add based on TTFT headroom with cooldown gating.
 
-        Budget enforcement (per-period and working set) happens in create_user()
-        on a per-trace basis, allowing more accurate decisions based on actual
-        trace sizes rather than rough estimates.
+        Uses consecutive good/bad period tracking to prevent ramping after brief
+        recovery from sustained overload. Budget enforcement (per-period and working
+        set) happens in create_user() on a per-trace basis.
 
-        Returns number of users to add (0 if TTFT threshold exceeded or no data).
+        Returns number of users to add (0 if gated by any condition).
         """
         ttft_value = self.get_ttft_value()
 
@@ -1793,24 +1799,40 @@ class TestOrchestrator:
         if ttft_value is None:
             return 0
 
-        # Check if we're over TTFT threshold
+        # Over TTFT threshold = don't add
         if ttft_value >= self.config.max_ttft:
             return 0
 
-        # Don't add users if admission control is at capacity
-        # Adding users when dispatches are blocked just increases dispatch delay
+        # Gate: in-flight > 75% of max concurrent
         if (self.config.max_concurrent_requests and
-            self.in_flight_requests >= self.config.max_concurrent_requests):
-            logger.info(f"{Colors.WARNING}  ⏸️ Skipping user addition: admission control at capacity "
-                       f"({self.in_flight_requests}/{self.config.max_concurrent_requests} in-flight){Colors.ENDC}")
+            self.in_flight_requests > self.config.max_concurrent_requests * 0.75):
+            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Skipping user addition: in-flight at {self.in_flight_requests}/{self.config.max_concurrent_requests} (>75%){Colors.ENDC}")
             return 0
 
-        # Calculate headroom percentage (how far below threshold)
-        headroom_pct = (self.config.max_ttft - ttft_value) / self.config.max_ttft * 100
+        # Gate: cooldown not yet satisfied
+        if self.cooldown_required > 0 and self.consecutive_good_periods < self.cooldown_required:
+            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Cooldown: {self.consecutive_good_periods}/{self.cooldown_required} good periods required before ramp{Colors.ENDC}")
+            return 0
 
-        # Scale users by headroom - budget enforcement happens per-user in create_user()
-        # Formula: 2 base + 1 per 10% headroom (e.g., 80% headroom = 2 + 8 = 10 users)
-        return max(2, 2 + int(headroom_pct / 10))
+        # Cooldown satisfied — reset it
+        if self.cooldown_required > 0:
+            logger.info(f"  \u2713 Cooldown satisfied ({self.consecutive_good_periods} consecutive good periods)")
+            self.cooldown_required = 0
+
+        # Gate: minimum headroom of 20%
+        headroom_pct = (self.config.max_ttft - ttft_value) / self.config.max_ttft * 100
+        if headroom_pct < 20:
+            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Headroom too low ({headroom_pct:.0f}% < 20% minimum){Colors.ENDC}")
+            return 0
+
+        # Throttle after cooldown: first 2 ramps = +1 only
+        self.post_cooldown_ramps += 1
+        if self.post_cooldown_ramps <= 2:
+            return 1
+
+        # Normal ramp: scale by headroom (less aggressive than before)
+        # 1 base + 1 per 15% headroom (e.g., 75% headroom = 1 + 5 = 6 users)
+        return max(1, 1 + int(headroom_pct / 15))
 
     def check_thresholds(self) -> bool:
         """Check if performance thresholds are met. Returns True if we can add users."""
@@ -2437,6 +2459,23 @@ class TestOrchestrator:
                     self.assessment_periods.append(assessment)
                     self.print_assessment(assessment)
 
+                    # Update cooldown tracking based on TTFT
+                    ttft_val = self.get_ttft_value()
+                    if ttft_val is not None and ttft_val < self.config.max_ttft:
+                        self.consecutive_good_periods += 1
+                        self.consecutive_exceeded_periods = 0
+                    else:
+                        self.consecutive_exceeded_periods += 1
+                        self.consecutive_good_periods = 0
+                        # Set cooldown based on severity of distress
+                        if self.consecutive_exceeded_periods >= 10:
+                            self.cooldown_required = 5
+                        elif self.consecutive_exceeded_periods >= 3:
+                            self.cooldown_required = 3
+                        else:
+                            self.cooldown_required = 2
+                        self.post_cooldown_ramps = 0  # Reset throttle counter
+
                     # Calculate how many users to add based on headroom and budget
                     users_to_add = self.calculate_users_to_add()
                     max_to_add = min(users_to_add, self.config.max_users - len(self.users))
@@ -2450,7 +2489,8 @@ class TestOrchestrator:
                         old_users = assessment.active_users + assessment.idle_users - users_added
                         new_users = old_users + users_added
                         headroom = assessment.ttft_headroom_pct
-                        logger.info(f"{Colors.SUCCESS}  → Users {old_users} → {new_users} (+{users_added}) (headroom: {headroom:.0f}%, budget remaining: {self.config.max_new_tokens_per_period - self.period_new_tokens:,} tokens){Colors.ENDC}")
+                        cooldown_info = f", cooldown: {self.cooldown_required}" if self.cooldown_required > 0 else ""
+                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}, budget remaining: {self.config.max_new_tokens_per_period - self.period_new_tokens:,} tokens){Colors.ENDC}")
 
                     # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
@@ -2828,8 +2868,8 @@ def parse_arguments():
                         help="Maximum input tokens per request (default: 128000)")
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-Coder-32B-Instruct",
                         help="Tokenizer to use for synthetic data generation")
-    parser.add_argument("--chunk-size", type=int, default=256,
-                        help="Cache block size in tokens (default: 256)")
+    parser.add_argument("--chunk-size", type=int, default=64,
+                        help="Cache block size in tokens (default: 64)")
 
     # Output control
     parser.add_argument("--no-color", action="store_true",
