@@ -13,7 +13,7 @@
 | **Fire-and-forget async** | Non-blocking request dispatch; users fire immediately when ready |
 | **Proportional output attribution** | Output tokens attributed to period when generated (not when request completes) |
 | **Timestamp-based metrics** | Input tokens at TTFT, output tokens by chunk timestamp |
-| **Adaptive user scaling** | Adds users based on TTFT headroom below threshold |
+| **Cooldown-gated user scaling** | Adds users based on TTFT headroom with cooldown after threshold breaches |
 | **Cache pressure budgeting** | `--max-new-tokens-per-period` limits cache churn |
 | **Working set limits** | `--max-working-set-tokens` caps total unique tokens across all users |
 | **Trace recycling** | `--recycle` replaces completed users with fresh traces |
@@ -125,7 +125,7 @@ The warm prefix feature simulates how Claude Code's tool definitions and system 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--tokenizer` | Qwen/Qwen2.5-Coder-32B-Instruct | Tokenizer for synthetic data |
-| `--chunk-size` | 256 | Cache block size in tokens |
+| `--chunk-size` | 64 | Cache block size in tokens |
 | `--seed` | - | Random seed for reproducible trace selection |
 | `--verbose` | false | Enable verbose logging |
 | `--skip-graphs` | false | Skip graph generation |
@@ -336,3 +336,39 @@ python trace_replay_tester.py \
 ```
 
 **Note:** The `RATE_LIMITED` state only occurs when `--enable-request-rate-limiting` is enabled and TTFT exceeds the threshold. Users in this state wait with exponential backoff before retrying.
+
+## Ramp Controller
+
+The ramp controller decides how many users to add each assessment period. It uses cooldown-based gating to prevent death spirals where a single good period after sustained overload triggers premature user additions.
+
+### Gating Conditions (all must pass to add users)
+
+| Gate | Condition | Purpose |
+|------|-----------|---------|
+| **TTFT threshold** | `ttft_avg < max_ttft` | Basic overload check |
+| **In-flight capacity** | `in_flight < 75% of max_concurrent` | Prevents adding users when dispatch queue is deep |
+| **Cooldown** | N consecutive good periods after overload | Prevents ramp after brief recovery from sustained distress |
+| **Headroom floor** | `headroom > 20%` | Prevents ramp at dangerously low margins |
+
+### Cooldown Severity
+
+| Consecutive exceeded periods | Required good periods before ramp |
+|------------------------------|-----------------------------------|
+| 1-2 | 2 |
+| 3-9 | 3 |
+| 10+ | 5 |
+
+### Ramp Rate
+
+After all gates pass:
+- First 2 ramps after cooldown: **+1 user** (throttled)
+- Normal ramp: **1 + headroom/15** users (e.g., 75% headroom = +6 users)
+
+### Trace Advancement
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--advance-min` | 0.0 | Minimum trace advancement (0.0-1.0) |
+| `--advance-max` | 0.0 | Maximum trace advancement (0.0-1.0) |
+
+When set, new users start partway through their traces (e.g., `--advance-min 0.3 --advance-max 0.6` starts users 30-60% through). This simulates users joining with existing conversation history and tests cache performance under realistic working set growth.

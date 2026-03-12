@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Cooldown-based ramp gating** for `trace_replay_tester.py`: Prevents death spirals where a single good period after sustained overload triggers premature user additions
+  - Requires 2-5 consecutive good periods before ramping (scaled by distress severity)
+  - In-flight gate at >75% of max concurrent requests blocks ramp
+  - Minimum 20% headroom floor prevents ramp at dangerously low margins
+  - Post-cooldown throttle limits first 2 ramps to +1 user
+  - Normal ramp formula less aggressive: `1 + headroom/15` (was `2 + headroom/10`)
+- **Trace advancement** (`--advance-min`, `--advance-max`): Start users partway through traces to simulate joining with existing conversation history
+- **Time-windowed working set tracking**: Working set display shows 1m, 5m, 15m windows
+
+### Changed
+- **`--chunk-size` default changed from 256 to 64** to match trace `block_size` (fixes 4x inflated working set token reports)
 - **`--no-color` option for all tools**: Disable colored output for light terminal backgrounds
   - Works with single_prompt_tester, cache_rate_tester, and working_set_tester
   - Useful when terminal colors are hard to read on light backgrounds
