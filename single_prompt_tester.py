@@ -301,10 +301,14 @@ class APIClient:
                     continue
 
                 delta = chunk.choices[0].delta
-                if delta.content is not None:
-                    if first_token_time is None and delta.content != "":
+                # Check both content and reasoning_content (for reasoning models like Kimi-K2.5)
+                token_text = delta.content
+                if token_text is None:
+                    token_text = getattr(delta, 'reasoning_content', None)
+                if token_text is not None:
+                    if first_token_time is None and token_text != "":
                         first_token_time = time.time()
-                    response_text += delta.content
+                    response_text += token_text
 
             prompt_tokens = chunk.usage.prompt_tokens if hasattr(chunk, 'usage') else 0
             completion_tokens = chunk.usage.completion_tokens if hasattr(chunk, 'usage') else 0
