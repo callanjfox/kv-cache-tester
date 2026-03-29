@@ -2447,6 +2447,9 @@ class TestOrchestrator:
                             user.state = "idle"  # Transition back for retry
                             logger.debug(f"  ↻ {user.user_id} exiting rate-limit (attempt #{user.rate_limit_count})")
                     elif user.state == "idle":
+                        # Parent waiting for sub-agents to complete — don't dispatch
+                        if user.pending_subagents:
+                            continue
                         # Calculate when this user became ready
                         delay = user.get_delay_until_next()
                         capped_delay = min(delay, self.config.max_delay) * self.config.time_scale
