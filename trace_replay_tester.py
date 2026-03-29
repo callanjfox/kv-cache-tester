@@ -375,27 +375,36 @@ def normalize_trace(trace: dict) -> dict:
     """Convert new trace format to internal normalized format.
 
     New format has compact field names (t, in, out) and subagent support.
-    This normalizes to the internal format expected by the rest of the code.
+    Sub-agent entries (type='subagent') are preserved as markers in the
+    request list rather than flattened. The orchestrator spawns separate
+    UserSessions for sub-agents when encountered during replay.
     """
-    requests = flatten_requests(trace.get('requests', []), base_time=0.0)
+    raw_requests = trace.get('requests', [])
+    requests = []
+    for req in raw_requests:
+        if req.get('type') == 'subagent':
+            # Preserve sub-agent entry as a marker (not flattened)
+            requests.append(req)
+        else:
+            requests.append(normalize_request(req, base_time=0.0))
 
-    # Compute stats from flattened requests
-    total_input_tokens = sum(r['input_tokens'] for r in requests)
+    # Compute stats from parent requests only (exclude sub-agent markers)
+    parent_requests = [r for r in requests if r.get('type') != 'subagent']
+    total_input_tokens = sum(r['input_tokens'] for r in parent_requests)
 
-    # Compute cache hit rate from hash_ids if available
+    # Compute cache hit rate from hash_ids (parent requests only)
     cache_hits = 0
     total_blocks = 0
-    for i, req in enumerate(requests):
+    for i, req in enumerate(parent_requests):
         hash_ids = req.get('hash_ids', [])
         if i > 0 and hash_ids:
-            prev_hash_ids = set(requests[i-1].get('hash_ids', []))
-            # Count how many blocks at the start match previous request
+            prev_hash_ids = set(parent_requests[i-1].get('hash_ids', []))
             for h in hash_ids:
                 total_blocks += 1
                 if h in prev_hash_ids:
                     cache_hits += 1
                 else:
-                    break  # Prefix-only cache: stop at first miss
+                    break
         elif hash_ids:
             total_blocks += len(hash_ids)
 
@@ -406,9 +415,10 @@ def normalize_trace(trace: dict) -> dict:
             'conversation_id': trace.get('id', 'unknown'),
             'models': trace.get('models', []),
             'block_size': trace.get('block_size', 64),
+            'hash_id_scope': trace.get('hash_id_scope', 'per_context'),
             'tool_tokens': trace.get('tool_tokens', 0),
             'system_tokens': trace.get('system_tokens', 0),
-            'request_count': len(requests),
+            'request_count': len(parent_requests),
             'total_input_tokens': total_input_tokens,
             'cache_hit_rate': cache_hit_rate,
         },
@@ -1086,6 +1096,12 @@ class UserSession:
         self.rate_limit_count: int = 0  # Times rate-limited for current request attempt
         self.total_rate_limit_count: int = 0  # Total times rate-limited across all requests
 
+        # Sub-agent tracking
+        self.pending_subagents: List[str] = []      # user_ids of active sub-agent sessions
+        self.parent_user_id: Optional[str] = None   # set if this is a sub-agent
+        self.is_subagent: bool = False
+        self._subagent_counter: int = 0
+
     def get_total_requests(self) -> int:
         return len(self.requests)
 
@@ -1093,12 +1109,21 @@ class UserSession:
         return self.current_idx
 
     def get_next_request(self) -> Optional[dict]:
-        """Get next request to process, or None if done/truncated"""
+        """Get next request to process, or None if done/truncated.
+
+        Returns sub-agent entries as-is (type='subagent') — the orchestrator
+        checks the type field and spawns a separate UserSession instead of
+        sending an API request.
+        """
         if self.current_idx >= len(self.requests):
             self.state = "completed"
             return None
 
         request = self.requests[self.current_idx]
+
+        # Sub-agent markers don't have input_tokens — return as-is for orchestrator
+        if request.get('type') == 'subagent':
+            return request
 
         # Check context limit
         if request['input_tokens'] > self.max_context:
@@ -1115,10 +1140,14 @@ class UserSession:
         if self.current_idx >= len(self.requests):
             return 0.0
 
-        prev_timestamp = self.requests[self.current_idx - 1]['timestamp']
-        curr_timestamp = self.requests[self.current_idx]['timestamp']
+        curr = self.requests[self.current_idx]
+        prev = self.requests[self.current_idx - 1]
 
-        return max(0.0, curr_timestamp - prev_timestamp)
+        # Sub-agent markers use 't' field, normalized requests use 'timestamp'
+        curr_ts = curr.get('timestamp', curr.get('t', 0.0))
+        prev_ts = prev.get('timestamp', prev.get('t', 0.0))
+
+        return max(0.0, curr_ts - prev_ts)
 
     def store_assistant_response(self, response_text: str, response_tokens: int, request: dict):
         """Store the actual assistant response.
@@ -1750,6 +1779,41 @@ class TestOrchestrator:
 
         del self.users[user_id]
 
+    def spawn_subagent(self, parent: UserSession, subagent_entry: dict):
+        """Spawn a sub-agent as an independent UserSession.
+
+        Called when the parent's get_next_request() returns a type='subagent' entry.
+        The sub-agent runs concurrently with the parent as a separate user.
+        """
+        if not subagent_entry.get('requests'):
+            return  # Skip empty/failed sub-agents
+
+        parent._subagent_counter += 1
+        sa_id = f"{parent.user_id}-SA{parent._subagent_counter}"
+
+        # Build a mini-trace for the sub-agent
+        sa_trace = normalize_trace({
+            'id': f"{parent.trace_id}:{subagent_entry.get('agent_id', 'unknown')}",
+            'models': subagent_entry.get('models', []),
+            'block_size': parent.trace['metadata'].get('block_size', 64),
+            'hash_id_scope': parent.trace['metadata'].get('hash_id_scope', 'per_context'),
+            'tool_tokens': subagent_entry.get('tool_tokens', 0),
+            'system_tokens': subagent_entry.get('system_tokens', 0),
+            'requests': subagent_entry['requests'],
+        })
+
+        sa_user = UserSession(sa_id, sa_trace, parent.generator, parent.max_context)
+        sa_user.is_subagent = True
+        sa_user.parent_user_id = parent.user_id
+        sa_user.start_time = time.time()
+
+        self.users[sa_id] = sa_user
+        parent.pending_subagents.append(sa_id)
+
+        sa_reqs = len([r for r in sa_trace['requests'] if r.get('type') != 'subagent'])
+        logger.info(f"{Colors.HEADER}  🔀 {sa_id} spawned from {parent.user_id} "
+                     f"({sa_reqs} requests, {subagent_entry.get('subagent_type', 'unknown')}){Colors.ENDC}")
+
     def log_lifecycle_event(self, user_id: str, event_type: str, trace_id: str, details: str = ""):
         """Log a user lifecycle event"""
         event = UserLifecycleEvent(
@@ -2354,6 +2418,22 @@ class TestOrchestrator:
                 now = time.time()
                 users_to_remove = []
 
+                # Phase 0: Process sub-agent markers before collecting ready users
+                # When a user's next request is type='subagent', spawn it and advance
+                for user_id, user in list(self.users.items()):
+                    if user.state != "idle":
+                        continue
+                    # Process consecutive sub-agent markers (e.g., 4 agents spawned at once)
+                    while user.current_idx < len(user.requests):
+                        req = user.requests[user.current_idx]
+                        if req.get('type') != 'subagent':
+                            break
+                        self.spawn_subagent(user, req)
+                        user.current_idx += 1
+                    # Check if we exhausted all requests (only had sub-agents left)
+                    if user.current_idx >= len(user.requests):
+                        user.state = "completed"
+
                 # Phase 1: Collect ready users with their ready_at times
                 ready_users = []
                 for user_id, user in list(self.users.items()):
@@ -2416,6 +2496,15 @@ class TestOrchestrator:
 
                 # Remove completed/truncated users
                 for user_id, reason in users_to_remove:
+                    user = self.users.get(user_id)
+                    if user and user.is_subagent:
+                        # Clean up sub-agent reference from parent
+                        parent_id = user.parent_user_id
+                        if parent_id in self.users:
+                            parent = self.users[parent_id]
+                            if user_id in parent.pending_subagents:
+                                parent.pending_subagents.remove(user_id)
+                        logger.info(f"{Colors.SUCCESS}  ✅ {user_id} subagent completed{Colors.ENDC}")
                     self.remove_user(user_id, reason)
                     # Add replacement if recycling
                     if self.config.recycle and len(self.users) < self.config.max_users:
