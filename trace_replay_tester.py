@@ -217,6 +217,8 @@ class TestConfig:
     max_users: int
     max_delay: float
     time_scale: float
+    timing_strategy: str  # "original", "think-only", "api-scaled"
+    api_time_scale: float  # multiplier for api_time with api-scaled strategy
     assessment_period: int
     test_duration: Optional[int]
     recycle: bool
@@ -335,7 +337,7 @@ class AssessmentPeriodMetrics:
 
 def normalize_request(req: dict, base_time: float) -> dict:
     """Normalize a single request from new trace format to internal format."""
-    return {
+    result = {
         'timestamp': base_time + req.get('t', 0.0),
         'type': 'streaming',  # Always streaming (ignore s/n distinction)
         'input_tokens': req.get('in', 0),
@@ -346,6 +348,12 @@ def normalize_request(req: dict, base_time: float) -> dict:
         'stop_reason': req.get('stop', ''),
         'model': req.get('model', ''),
     }
+    # Timing breakdown (optional, from newer traces)
+    if 'api_time' in req:
+        result['api_time'] = req['api_time']
+    if 'think_time' in req:
+        result['think_time'] = req['think_time']
+    return result
 
 
 def flatten_requests(requests: list, base_time: float) -> list:
@@ -1779,6 +1787,38 @@ class TestOrchestrator:
 
         del self.users[user_id]
 
+    def _compute_delay(self, user: UserSession) -> float:
+        """Compute the delay before the user's next request fires.
+
+        Supports timing strategies:
+        - original: use trace timestamp differences (default, backward compatible)
+        - think-only: use only client think_time (simulates instant server)
+        - api-scaled: use prev api_time * scale + think_time (simulates faster/slower server)
+        """
+        strategy = self.config.timing_strategy
+        idx = user.current_idx
+
+        if strategy != "original" and idx > 0 and idx < len(user.requests):
+            curr = user.requests[idx]
+            prev = user.requests[idx - 1]
+
+            think_time = curr.get('think_time')
+            prev_api_time = prev.get('api_time')
+
+            if think_time is not None:
+                if strategy == "think-only":
+                    delay = think_time
+                elif strategy == "api-scaled" and prev_api_time is not None:
+                    delay = prev_api_time * self.config.api_time_scale + think_time
+                else:
+                    # Fallback for api-scaled without api_time data
+                    delay = user.get_delay_until_next()
+                return min(delay, self.config.max_delay) * self.config.time_scale
+
+        # Default: original behavior
+        delay = user.get_delay_until_next()
+        return min(delay, self.config.max_delay) * self.config.time_scale
+
     def spawn_subagent(self, parent: UserSession, subagent_entry: dict):
         """Spawn a sub-agent as an independent UserSession.
 
@@ -2451,8 +2491,7 @@ class TestOrchestrator:
                         if user.pending_subagents:
                             continue
                         # Calculate when this user became ready
-                        delay = user.get_delay_until_next()
-                        capped_delay = min(delay, self.config.max_delay) * self.config.time_scale
+                        capped_delay = self._compute_delay(user)
                         last_time = user.last_request_time or user.start_time
                         ready_at = last_time + capped_delay
 
@@ -2950,6 +2989,13 @@ def parse_arguments():
                         help="Maximum delay between requests in seconds (default: 60)")
     parser.add_argument("--time-scale", type=float, default=1.0,
                         help="Time scaling factor (1.0 = real-time, 0.5 = 2x faster)")
+    parser.add_argument("--timing-strategy", type=str, default="original",
+                        choices=["original", "think-only", "api-scaled"],
+                        help="Timing strategy: original (use t differences), "
+                             "think-only (client think time only, ignore API time), "
+                             "api-scaled (api_time * api-time-scale + think_time)")
+    parser.add_argument("--api-time-scale", type=float, default=1.0,
+                        help="Multiplier for API processing time with api-scaled strategy (default: 1.0)")
     parser.add_argument("--test-duration", type=int, default=None,
                         help="Maximum test duration in seconds (default: unlimited)")
     parser.add_argument("--assessment-period", type=int, default=30,
@@ -3039,6 +3085,8 @@ async def main():
         max_users=args.max_users,
         max_delay=args.max_delay,
         time_scale=args.time_scale,
+        timing_strategy=args.timing_strategy,
+        api_time_scale=args.api_time_scale,
         assessment_period=args.assessment_period,
         test_duration=args.test_duration,
         recycle=args.recycle,
@@ -3088,6 +3136,9 @@ async def main():
     logger.info(f"  Max TTFT: {config.max_ttft}s ({config.ttft_metric})")
     logger.info(f"  Max Context: {config.max_context:,} tokens")
     logger.info(f"  Max Delay: {config.max_delay}s")
+    if config.timing_strategy != "original":
+        logger.info(f"  Timing Strategy: {config.timing_strategy}" +
+                     (f" (api_time_scale={config.api_time_scale})" if config.timing_strategy == "api-scaled" else ""))
     logger.info(f"  Start Users: {config.start_users}")
     logger.info(f"  Max Users: {config.max_users}")
     logger.info(f"  Recycle: {config.recycle}")
