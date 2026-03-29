@@ -21,6 +21,8 @@
 | **Request pairs** | Handles streaming + non-streaming pairs with same hash_ids |
 | **Admission control** | `--max-concurrent-requests` limits in-flight requests |
 | **Warm prefix caching** | `--warm-prefix-pct` enables cross-conversation cache sharing |
+| **Sub-agent spawning** | Nested sub-agents replay as separate concurrent users |
+| **Timing strategies** | `--timing-strategy` controls how inter-request delays are computed |
 
 ## Included Traces
 
@@ -87,6 +89,8 @@ python trace_replay_tester.py \
 |----------|---------|-------------|
 | `--max-delay` | 60.0 | Maximum delay between requests (seconds) |
 | `--time-scale` | 1.0 | Time scaling factor (0.5 = 2x faster) |
+| `--timing-strategy` | original | Timing strategy: `original`, `think-only`, or `api-scaled` |
+| `--api-time-scale` | 1.0 | API time multiplier (used with `api-scaled` strategy) |
 | `--test-duration` | - | Maximum test duration (seconds) |
 | `--assessment-period` | 30 | Assessment period duration (seconds) |
 
@@ -110,6 +114,40 @@ The warm prefix feature simulates how Claude Code's tool definitions and system 
 - User 1's first request: all cache misses on shared prefix
 - User 2+'s first request: cache hits on the warm prefix portion
 - Set to `0` to disable
+
+### Timing Strategies
+
+Traces can include `api_time` (server processing duration) and `think_time` (client delay) fields, enabling flexible replay timing:
+
+| Strategy | Delay Formula | Use Case |
+|----------|--------------|----------|
+| `original` | `t[N] - t[N-1]` | Default. Replays at recorded pace. |
+| `think-only` | `think_time` only | Simulates instant server response. Measures client-driven pacing. |
+| `api-scaled` | `prev_api_time * scale + think_time` | Simulates faster/slower server. E.g., `--api-time-scale 0.2` = 5x faster. |
+
+All strategies fall back to `original` when timing fields are absent (old traces).
+
+```bash
+# Simulate a server 5x faster than the original recording
+python trace_replay_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --trace-directory ./traces \
+    --output-dir ./results \
+    --timing-strategy api-scaled \
+    --api-time-scale 0.2
+```
+
+### Sub-Agent Handling
+
+Traces with nested sub-agent entries (`type: "subagent"`) are replayed as separate concurrent users:
+
+- When the parent encounters a sub-agent marker, it spawns an independent `UserSession`
+- Multiple sub-agents are spawned simultaneously (e.g., 4 agents at once)
+- The parent pauses until all sub-agents complete, then resumes
+- Sub-agent user IDs follow the pattern `User-001-SA1`, `User-001-SA2`, etc.
+- Each sub-agent has its own conversation history and cache tracking
+
+With `hash_id_scope: "global"` traces, sub-agents sharing the same tool definitions get matching hash IDs, enabling correct cross-sub-agent cache simulation.
 
 ### Generation Parameters
 

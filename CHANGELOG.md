@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Sub-agent spawning**: Sub-agent traces are now replayed as separate concurrent users instead of being flattened into the parent timeline. The parent pauses while sub-agents run, matching real Claude Code behavior. Eliminates cache thrashing from context switching (20% → 95% server-side cache hit rate).
+- **Timing strategies** (`--timing-strategy`): Separate API processing time from client think time for flexible replay:
+  - `original` (default): Use trace timestamp differences (backward compatible)
+  - `think-only`: Client think time only — simulates instant server response
+  - `api-scaled`: `prev_api_time * scale + think_time` — simulates faster/slower server
+  - Use with `--api-time-scale FLOAT` (e.g., `--api-time-scale 0.2` for 5x faster server)
+  - Requires traces built with timing data (`api_time`, `think_time` fields)
+- **Global hash_ids support**: Traces with `hash_id_scope: "global"` have consistent hash IDs across parent and sub-agents, enabling correct cross-context cache simulation
 - **Cooldown-based ramp gating** for `trace_replay_tester.py`: Prevents death spirals where a single good period after sustained overload triggers premature user additions
   - Requires 2-5 consecutive good periods before ramping (scaled by distress severity)
   - In-flight gate at >75% of max concurrent requests blocks ramp
