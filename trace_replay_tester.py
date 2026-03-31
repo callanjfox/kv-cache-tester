@@ -2590,8 +2590,11 @@ class TestOrchestrator:
                     self.print_assessment(assessment)
 
                     # Update cooldown tracking based on TTFT
+                    # Skip tracking when no data (e.g., parent waiting for sub-agents)
                     ttft_val = self.get_ttft_value()
-                    if ttft_val is not None and ttft_val < self.config.max_ttft:
+                    if ttft_val is None:
+                        pass  # No requests completed this period, don't affect cooldown state
+                    elif ttft_val < self.config.max_ttft:
                         self.consecutive_good_periods += 1
                         self.consecutive_exceeded_periods = 0
                     else:
