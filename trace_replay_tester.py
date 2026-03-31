@@ -1312,17 +1312,28 @@ class UserSession:
                        len(removed_hash_ids) > len(self.prev_request_hash_ids) * 0.1)
 
         if is_pullback:
-            # Pull-back case: reset to kept boundary and regenerate
-            # Get block_size from trace metadata (default 64 for backwards compat)
+            # Pull-back case: truncate conversation to kept boundary, then grow normally
+            # This preserves prefix content for cache hits on the kept portion
             block_size = self.trace['metadata'].get('block_size', 64)
             kept_tokens = len(kept_hash_ids) * block_size
-            # Generate: input_tokens - kept_tokens (plus any shortfall)
-            tokens_to_generate = max(0, current_input_tokens - kept_tokens + self.token_shortfall)
+
+            # Find the message boundary closest to kept_tokens
+            cumulative = 0
+            truncate_at = 0
+            for i, msg in enumerate(self.conversation):
+                msg_tokens = len(self.generator.tokenizer.encode(msg['content']))
+                if cumulative + msg_tokens > kept_tokens:
+                    break
+                cumulative += msg_tokens
+                truncate_at = i + 1
+
+            self.conversation = self.conversation[:truncate_at]
+            self.prev_input_tokens = kept_tokens
             self.token_shortfall = 0
             self.stored_response_tokens = 0
 
-            # Reset conversation and regenerate
-            self.conversation = []
+            # Now treat the new blocks like normal growth
+            tokens_to_generate = max(0, current_input_tokens - kept_tokens)
             if tokens_to_generate > 0:
                 seed = hash(f"{self.user_id}_{self.current_idx}_pullback_{tokens_to_generate}") % (2**32)
                 msg_type = self._get_user_message_type(request)
