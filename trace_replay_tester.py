@@ -1519,7 +1519,8 @@ class APIClient:
         return params
 
     async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
-                           on_first_token: Optional[callable] = None) -> dict:
+                           on_first_token: Optional[callable] = None,
+                           on_chunk: Optional[callable] = None) -> dict:
         """
         Send request and return metrics.
 
@@ -1559,6 +1560,9 @@ class APIClient:
                         # Track timestamp and token count for this chunk
                         token_timestamps.append(chunk_time)
                         tokens_per_chunk.append(1)
+                        # Live callback for real-time output tracking
+                        if on_chunk:
+                            on_chunk(chunk_time, 1)
 
                 complete_time = time.time()
 
@@ -1632,6 +1636,10 @@ class TestOrchestrator:
         self.lifecycle_events: List[UserLifecycleEvent] = []
         self.all_metrics: List[RequestMetrics] = []
         self.assessment_periods: List[AssessmentPeriodMetrics] = []
+
+        # Live output token stream — captures chunks as they arrive from streaming API,
+        # before request completion. Used for accurate per-period output tok/s.
+        self.output_token_log: deque = deque()
 
         self.test_start_time: Optional[float] = None
         self.current_period_start: Optional[float] = None
@@ -2133,14 +2141,11 @@ class TestOrchestrator:
         # Input tokens: attributed when prefill completes (at TTFT)
         input_tokens = sum(m.input_tokens for m in period_prefill_metrics)
 
-        # Output tokens: proportionally attributed based on when tokens were GENERATED
-        # This handles requests that span multiple periods correctly
+        # Output tokens: from live token stream (captures in-flight decode chunks)
         output_tokens = 0
-        for req in self.all_metrics:
-            if req.success and req.token_timestamps and req.tokens_per_chunk:
-                for chunk_time, chunk_tokens in zip(req.token_timestamps, req.tokens_per_chunk):
-                    if start_time < chunk_time <= end_time:
-                        output_tokens += chunk_tokens
+        for chunk_time, chunk_tokens in self.output_token_log:
+            if start_time < chunk_time <= end_time:
+                output_tokens += chunk_tokens
 
         # Cache stats from prefill completions
         cache_hits = sum(m.cache_hit_blocks for m in period_prefill_metrics)
@@ -2331,11 +2336,15 @@ class TestOrchestrator:
             first_token_received = True
             self.in_flight_decoding += 1
 
+        def on_chunk(chunk_time, chunk_tokens):
+            self.output_token_log.append((chunk_time, chunk_tokens))
+
         result = await self.api_client.send_request(
             messages,
             max_tokens,
             stream=stream,
-            on_first_token=on_first_token
+            on_first_token=on_first_token,
+            on_chunk=on_chunk
         )
 
         # Decrement decode counter if first token was received
@@ -2601,6 +2610,11 @@ class TestOrchestrator:
 
                     # Prune old blocks from working set tracking (keeps 15m window)
                     self.prune_old_blocks()
+
+                    # Prune old output token log entries (keep 15 minutes)
+                    cutoff = time.time() - 900
+                    while self.output_token_log and self.output_token_log[0][0] < cutoff:
+                        self.output_token_log.popleft()
 
                     # Calculate metrics based on timestamps (which requests' TTFT fell in this period)
                     pending_start_times = [start_time for _, start_time in pending_tasks.values()]
