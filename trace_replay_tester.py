@@ -1812,7 +1812,7 @@ class TestOrchestrator:
         if reason == "completed":
             logger.info(f"{Colors.SUCCESS}  ✓ {user_id} completed{Colors.ENDC} ({summary['requests_completed']}/{summary['requests_total']} requests, {summary['avg_cache_hit_rate']:.1%} cache hit)")
         else:
-            logger.warning(f"  ⚠️ {user_id} truncated at request {summary['requests_completed']}/{summary['requests_total']} (context exceeded {self.config.max_context})")
+            logger.warning(f"  ⚠️ {user_id} stopped at request {summary['requests_completed']}/{summary['requests_total']} (next request exceeds --max-context {self.config.max_context:,} tokens)")
 
         # Recycle trace if enabled
         if self.config.recycle:
