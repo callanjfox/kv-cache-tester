@@ -2257,7 +2257,6 @@ class TestOrchestrator:
         windowed = self.compute_windowed_working_set()
         logger.info(f"  Working Set by Age: 1m: {windowed['1m']:,} | 5m: {windowed['5m']:,} | 15m: {windowed['15m']:,} tokens")
 
-        logger.info(f"  Idle Time: {metrics.idle_time_pct:.1f}% (processing: {metrics.total_request_time:.1f}s)")
 
         # Show admission control metrics if enabled
         if self.config.max_concurrent_requests:
