@@ -1501,6 +1501,8 @@ class APIClient:
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        if stream:
+            params["stream_options"] = {"include_usage": True}
 
         # Add generation parameters (vLLM supports all of these directly)
         extra_body = {}
@@ -1520,7 +1522,8 @@ class APIClient:
 
     async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
                            on_first_token: Optional[callable] = None,
-                           on_chunk: Optional[callable] = None) -> dict:
+                           on_chunk: Optional[callable] = None,
+                           tokenizer=None) -> dict:
         """
         Send request and return metrics.
 
@@ -1550,19 +1553,22 @@ class APIClient:
                 async for chunk in response:
                     if chunk.choices and chunk.choices[0].delta.content:
                         chunk_time = time.time()
+                        chunk_text = chunk.choices[0].delta.content
                         if first_token_time is None:
                             first_token_time = chunk_time
                             # Signal that prefill is complete (first token received)
                             if on_first_token:
                                 on_first_token()
-                        response_text += chunk.choices[0].delta.content
-                        token_count += 1  # Approximate: 1 token per chunk
+                        response_text += chunk_text
+                        # Count actual tokens in this chunk
+                        chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
+                        token_count += chunk_token_count
                         # Track timestamp and token count for this chunk
                         token_timestamps.append(chunk_time)
-                        tokens_per_chunk.append(1)
+                        tokens_per_chunk.append(chunk_token_count)
                         # Live callback for real-time output tracking
                         if on_chunk:
-                            on_chunk(chunk_time, 1)
+                            on_chunk(chunk_time, chunk_token_count)
 
                 complete_time = time.time()
 
@@ -2344,7 +2350,8 @@ class TestOrchestrator:
             max_tokens,
             stream=stream,
             on_first_token=on_first_token,
-            on_chunk=on_chunk
+            on_chunk=on_chunk,
+            tokenizer=self.generator.tokenizer
         )
 
         # Decrement decode counter if first token was received
