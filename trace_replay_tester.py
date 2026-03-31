@@ -243,6 +243,7 @@ class TestConfig:
     # Trace advancement: start users partway through their traces
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
+    advance_all_users: bool = False  # If True, advance all users; if False, only initial users
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1653,7 +1654,7 @@ class TestOrchestrator:
 
         self.running = True
 
-    def create_user(self, enforce_budgets: bool = True) -> Optional[UserSession]:
+    def create_user(self, enforce_budgets: bool = True, advance: bool = True) -> Optional[UserSession]:
         """Create a new user from available traces.
 
         Args:
@@ -1709,9 +1710,9 @@ class TestOrchestrator:
         user = UserSession(user_id, trace, self.generator, self.config.max_context)
         user.start_time = time.time()
 
-        # Apply trace advancement if configured
+        # Apply trace advancement if configured and allowed for this user
         advancement_pct = 0.0
-        if self.config.advance_max > 0:
+        if self.config.advance_max > 0 and advance:
             start_idx = calculate_start_index(
                 trace['requests'], self.trace_manager.rng,
                 self.config.advance_min, self.config.advance_max,
@@ -1745,17 +1746,18 @@ class TestOrchestrator:
         return user
 
     async def create_users_batch(self, count: int, delay_ms: int = 50,
-                                  enforce_budgets: bool = True) -> List[UserSession]:
+                                  enforce_budgets: bool = True, advance: bool = True) -> List[UserSession]:
         """Create multiple users with a small delay between each to avoid overwhelming the server.
 
         Args:
             count: Number of users to create
             delay_ms: Delay between user creation in milliseconds
             enforce_budgets: If True, check per-period and working set budgets
+            advance: If True, apply trace advancement to these users
         """
         users = []
         for i in range(count):
-            user = self.create_user(enforce_budgets=enforce_budgets)
+            user = self.create_user(enforce_budgets=enforce_budgets, advance=advance)
             if user:
                 users.append(user)
                 # Add delay between users (not after the last one)
@@ -2410,7 +2412,7 @@ class TestOrchestrator:
 
         # Create initial users (with delay between each to avoid overwhelming server)
         # Don't enforce budgets for initial users - just warn if exceeded
-        await self.create_users_batch(self.config.start_users, enforce_budgets=False)
+        await self.create_users_batch(self.config.start_users, enforce_budgets=False, advance=True)
 
         # Warn if initial users exceed budgets
         initial_new_tokens = sum(
@@ -2452,7 +2454,7 @@ class TestOrchestrator:
                         logger.info("All traces completed and recycling disabled")
                         break
                     else:
-                        self.create_user()
+                        self.create_user(advance=self.config.advance_all_users)
 
                 now = time.time()
                 users_to_remove = []
@@ -2549,7 +2551,7 @@ class TestOrchestrator:
                     self.remove_user(user_id, reason)
                     # Add replacement if recycling
                     if self.config.recycle and len(self.users) < self.config.max_users:
-                        self.create_user()
+                        self.create_user(advance=self.config.advance_all_users)
 
                 # Check for completed tasks (non-blocking with short timeout)
                 if pending_tasks:
@@ -2613,7 +2615,7 @@ class TestOrchestrator:
                     users_to_add = self.calculate_users_to_add()
                     max_to_add = min(users_to_add, self.config.max_users - len(self.users))
                     if max_to_add > 0:
-                        new_users_list = await self.create_users_batch(max_to_add)
+                        new_users_list = await self.create_users_batch(max_to_add, advance=self.config.advance_all_users)
                         users_added = len(new_users_list)
                     else:
                         users_added = 0
@@ -3054,6 +3056,8 @@ def parse_arguments():
                         help="Minimum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
     parser.add_argument("--advance-max", type=float, default=0.0,
                         help="Maximum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
+    parser.add_argument("--advance-all-users", action="store_true", default=False,
+                        help="Advance all users (including ramp-up). Default: only initial users are advanced")
 
     return parser.parse_args()
 
@@ -3107,7 +3111,8 @@ async def main():
         max_concurrent_requests=args.max_concurrent_requests,
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
-        advance_max=args.advance_max
+        advance_max=args.advance_max,
+        advance_all_users=args.advance_all_users
     )
 
     # Print header
@@ -3159,7 +3164,8 @@ async def main():
     else:
         logger.info(f"  Warm Prefix: disabled")
     if config.advance_max > 0:
-        logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%}")
+        scope = "all users" if config.advance_all_users else "initial users only"
+        logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%} ({scope})")
     logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
 
     # Initialize components
