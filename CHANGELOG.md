@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Requires traces built with timing data (`api_time`, `think_time` fields)
 - **Accurate output token counting**: Uses tokenizer to count actual tokens per streaming chunk instead of assuming 1 token per chunk. Live output token log captures in-flight decode tokens for accurate per-period output tok/s reporting.
 - **Pull-back conversation truncation**: When context resets occur (>10% of hash_ids removed), the conversation is truncated to the kept prefix boundary instead of wiped entirely. Preserves prefix content for cache hits on the surviving portion.
+- **Advance scope control** (`--advance-all-users`): By default only initial users are advanced into traces; ramp-up/recycled users start from the beginning. Use `--advance-all-users` to advance everyone.
 - **Global hash_ids support**: Traces with `hash_id_scope: "global"` have consistent hash IDs across parent and sub-agents, enabling correct cross-context cache simulation
 - **Cooldown-based ramp gating** for `trace_replay_tester.py`: Prevents death spirals where a single good period after sustained overload triggers premature user additions
   - Requires 2-5 consecutive good periods before ramping (scaled by distress severity)

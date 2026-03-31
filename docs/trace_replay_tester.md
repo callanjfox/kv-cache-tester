@@ -408,5 +408,8 @@ After all gates pass:
 |----------|---------|-------------|
 | `--advance-min` | 0.0 | Minimum trace advancement (0.0-1.0) |
 | `--advance-max` | 0.0 | Maximum trace advancement (0.0-1.0) |
+| `--advance-all-users` | false | Advance all users including ramp-up (default: only initial users) |
 
 When set, new users start partway through their traces (e.g., `--advance-min 0.3 --advance-max 0.6` starts users 30-60% through). This simulates users joining with existing conversation history and tests cache performance under realistic working set growth.
+
+By default, only the initial users (`--start-users`) are advanced. Users added later via ramp-up or recycling start from the beginning, simulating fresh conversations. Use `--advance-all-users` to advance everyone.
