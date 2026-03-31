@@ -2274,7 +2274,7 @@ class TestOrchestrator:
         else:
             logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
         logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
-        logger.info(f"  Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
+        logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
 
         # Show working set with budget status if limit is configured
         if self.config.max_working_set_tokens > 0:
@@ -2718,7 +2718,7 @@ class TestOrchestrator:
         if ttfts:
             logger.info(f"  TTFT avg/p50/p95/max: {np.mean(ttfts):.2f}s / {np.percentile(ttfts, 50):.2f}s / {np.percentile(ttfts, 95):.2f}s / {max(ttfts):.2f}s")
         logger.info(f"  Throughput: {total_input/elapsed:,.0f} input tok/s | {total_output/elapsed:,.0f} output tok/s")
-        logger.info(f"  Avg Cache Hit Rate: {cache_hits/cache_total:.1%}" if cache_total > 0 else "  Cache hits: N/A")
+        logger.info(f"  Avg Workload Cache Hit Rate: {cache_hits/cache_total:.1%}" if cache_total > 0 else "  Cache hits: N/A")
         logger.info(f"  Peak Working Set: {self.peak_working_set_tokens:,} tokens")
         if self.canonical_prefix_tokens > 0:
             logger.info(f"  Warm Prefix: {self.canonical_prefix_tokens:,} tokens ({self.config.warm_prefix_pct:.0%} of max tool+system)")
@@ -3228,7 +3228,7 @@ async def main():
             orchestrator.canonical_prefix_content = generator.generate_canonical_prefix(warm_tokens)
             orchestrator.canonical_prefix_tokens = warm_tokens
             logger.info(f"{Colors.OKCYAN}Warm prefix enabled: {warm_tokens:,} tokens "
-                       f"({config.warm_prefix_pct:.0%} of {max_shared:,} max tool+system){Colors.ENDC}")
+                       f"(--warm-prefix-pct {config.warm_prefix_pct:.0%} of {max_shared:,} largest tool+system prefix across loaded traces){Colors.ENDC}")
         else:
             logger.info(f"{Colors.WARNING}Warm prefix disabled: no tool_tokens/system_tokens in traces{Colors.ENDC}")
 
