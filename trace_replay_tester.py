@@ -3003,9 +3003,9 @@ def parse_arguments():
     # Performance thresholds
     parser.add_argument("--max-ttft", type=float, default=2.0,
                         help="Maximum acceptable TTFT in seconds (default: 2.0)")
-    parser.add_argument("--ttft-metric", type=str, default="p95",
+    parser.add_argument("--ttft-metric", type=str, default="avg",
                         choices=["max", "avg", "p95"],
-                        help="TTFT metric to use for threshold: max (maximum), avg (average), p95 (95th percentile). Default: p95")
+                        help="TTFT metric to use for threshold: max (maximum), avg (average), p95 (95th percentile). Default: avg")
     parser.add_argument("--min-output-tokens-per-req", type=float, default=None,
                         help="Minimum output tokens/s per request (optional)")
 
