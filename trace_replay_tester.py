@@ -2659,8 +2659,8 @@ class TestOrchestrator:
                         users_added = 0
 
                     if users_added > 0:
-                        old_users = assessment.active_users + assessment.idle_users - users_added
-                        new_users = old_users + users_added
+                        new_users = len(self.users)
+                        old_users = new_users - users_added
                         headroom = assessment.ttft_headroom_pct
                         cooldown_info = f", cooldown: {self.cooldown_required}" if self.cooldown_required > 0 else ""
                         logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}, budget remaining: {self.config.max_new_tokens_per_period - self.period_new_tokens:,} tokens){Colors.ENDC}")
