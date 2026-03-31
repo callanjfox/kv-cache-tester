@@ -3031,10 +3031,10 @@ def parse_arguments():
                         help="Maximum delay between requests in seconds (default: 60)")
     parser.add_argument("--time-scale", type=float, default=1.0,
                         help="Time scaling factor (1.0 = real-time, 0.5 = 2x faster)")
-    parser.add_argument("--timing-strategy", type=str, default="original",
+    parser.add_argument("--timing-strategy", type=str, default="think-only",
                         choices=["original", "think-only", "api-scaled"],
-                        help="Timing strategy: original (use t differences), "
-                             "think-only (client think time only, ignore API time), "
+                        help="Timing strategy: think-only (default, client think time only), "
+                             "original (use t differences from trace), "
                              "api-scaled (api_time * api-time-scale + think_time)")
     parser.add_argument("--api-time-scale", type=float, default=1.0,
                         help="Multiplier for API processing time with api-scaled strategy (default: 1.0)")
