@@ -9,11 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - **Sub-agent spawning**: Sub-agent traces are now replayed as separate concurrent users instead of being flattened into the parent timeline. The parent pauses while sub-agents run, matching real Claude Code behavior. Eliminates cache thrashing from context switching (20% → 95% server-side cache hit rate).
 - **Timing strategies** (`--timing-strategy`): Separate API processing time from client think time for flexible replay:
-  - `original` (default): Use trace timestamp differences (backward compatible)
-  - `think-only`: Client think time only — simulates instant server response
+  - `think-only` (**default**): Client think time only — requests fire as fast as the server can process them, with real client delays (tool execution, user reading) preserved
+  - `original`: Use trace timestamp differences (backward compatible, includes original API processing time)
   - `api-scaled`: `prev_api_time * scale + think_time` — simulates faster/slower server
   - Use with `--api-time-scale FLOAT` (e.g., `--api-time-scale 0.2` for 5x faster server)
   - Requires traces built with timing data (`api_time`, `think_time` fields)
+- **Accurate output token counting**: Uses tokenizer to count actual tokens per streaming chunk instead of assuming 1 token per chunk. Live output token log captures in-flight decode tokens for accurate per-period output tok/s reporting.
+- **Pull-back conversation truncation**: When context resets occur (>10% of hash_ids removed), the conversation is truncated to the kept prefix boundary instead of wiped entirely. Preserves prefix content for cache hits on the surviving portion.
 - **Global hash_ids support**: Traces with `hash_id_scope: "global"` have consistent hash IDs across parent and sub-agents, enabling correct cross-context cache simulation
 - **Cooldown-based ramp gating** for `trace_replay_tester.py`: Prevents death spirals where a single good period after sustained overload triggers premature user additions
   - Requires 2-5 consecutive good periods before ramping (scaled by distress severity)

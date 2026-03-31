@@ -89,7 +89,7 @@ python trace_replay_tester.py \
 |----------|---------|-------------|
 | `--max-delay` | 60.0 | Maximum delay between requests (seconds) |
 | `--time-scale` | 1.0 | Time scaling factor (0.5 = 2x faster) |
-| `--timing-strategy` | original | Timing strategy: `original`, `think-only`, or `api-scaled` |
+| `--timing-strategy` | think-only | Timing strategy: `think-only`, `original`, or `api-scaled` |
 | `--api-time-scale` | 1.0 | API time multiplier (used with `api-scaled` strategy) |
 | `--test-duration` | - | Maximum test duration (seconds) |
 | `--assessment-period` | 30 | Assessment period duration (seconds) |
@@ -121,8 +121,8 @@ Traces can include `api_time` (server processing duration) and `think_time` (cli
 
 | Strategy | Delay Formula | Use Case |
 |----------|--------------|----------|
-| `original` | `t[N] - t[N-1]` | Default. Replays at recorded pace. |
-| `think-only` | `think_time` only | Simulates instant server response. Measures client-driven pacing. |
+| `think-only` | `think_time` only | **Default.** Requests fire as fast as the server can handle, with real client delays preserved. |
+| `original` | `t[N] - t[N-1]` | Replays at the original recorded pace (includes original API processing time). |
 | `api-scaled` | `prev_api_time * scale + think_time` | Simulates faster/slower server. E.g., `--api-time-scale 0.2` = 5x faster. |
 
 All strategies fall back to `original` when timing fields are absent (old traces).
