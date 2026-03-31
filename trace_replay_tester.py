@@ -1316,6 +1316,7 @@ class UserSession:
             # This preserves prefix content for cache hits on the kept portion
             block_size = self.trace['metadata'].get('block_size', 64)
             kept_tokens = len(kept_hash_ids) * block_size
+            old_msg_count = len(self.conversation)
 
             # Find the message boundary closest to kept_tokens
             cumulative = 0
@@ -1339,6 +1340,11 @@ class UserSession:
                 msg_type = self._get_user_message_type(request)
                 new_user_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
                 self.conversation.append(new_user_msg)
+
+            logger.debug(f"  ↩️ {self.user_id} pull-back: {len(self.prev_request_hash_ids)} → {len(current_hash_ids)} blocks "
+                        f"(kept {len(kept_hash_ids)}, removed {len(removed_hash_ids)}, new {len(new_hash_ids)}), "
+                        f"msgs {old_msg_count} → {len(self.conversation)}, "
+                        f"kept ~{kept_tokens:,} tokens, generating {tokens_to_generate:,} new")
 
         elif len(new_hash_ids) > 0 or len(removed_hash_ids) > 0:
             # Normal growth: few blocks removed (boundary replacement), new blocks added
