@@ -541,86 +541,63 @@ class TokenizerManager:
 
     def generate_dummy_tokens(self, num_tokens: int, seed: Optional[int] = None, prompt_number: Optional[int] = None) -> List[int]:
         """
-        Generate diverse dummy tokens to activate different experts in MoE models
-        Uses a mix of natural language, code, and formatting tokens
+        Generate diverse dummy tokens to activate different experts in MoE models.
+        Uses topic-based templates from 20 coding disciplines for broad vocabulary coverage.
         """
         if seed is not None:
             np.random.seed(seed)
 
-        # Diverse vocabulary to activate different MoE experts
-        # Mix of: natural language, code syntax, formatting, technical terms
-        word_pools = {
-            'natural': [
-                'the', 'and', 'with', 'for', 'this', 'that', 'from', 'have', 'been', 'which',
-                'their', 'said', 'each', 'about', 'many', 'some', 'these', 'would', 'other', 'into'
-            ],
-            'code_keywords': [
-                'function', 'class', 'return', 'import', 'async', 'await', 'const', 'let', 'var',
-                'def', 'if', 'else', 'while', 'for', 'try', 'catch', 'finally', 'throw', 'new'
-            ],
-            'code_symbols': [
-                '{', '}', '(', ')', '[', ']', ';', ':', ',', '.', '=', '==', '!=', '&&', '||',
-                '+', '-', '*', '/', '%', '<', '>', '<=', '>=', '=>', '->', '::', '//'
-            ],
-            'technical': [
-                'data', 'model', 'input', 'output', 'token', 'layer', 'cache', 'memory', 'compute',
-                'inference', 'batch', 'tensor', 'matrix', 'vector', 'array', 'buffer', 'queue'
-            ],
-            'formatting': [
-                '\n', '\t', '    ', '  ', '"""', "'''", '#', '//', '/*', '*/', '<!--', '-->'
-            ]
-        }
+        from vocabulary import TOPICS, CONNECTORS, ACTION_VERBS, ADJECTIVES, GENERIC_TEMPLATES
 
-        # Flatten all word pools with weights to create diverse distribution
-        all_words = []
-        weights = []
+        # Build weighted topic selection
+        topic_names = list(TOPICS.keys())
+        topic_weights = np.array([TOPICS[t]["weight"] for t in topic_names])
+        topic_weights = topic_weights / topic_weights.sum()
 
-        # Natural language (30%)
-        all_words.extend(word_pools['natural'])
-        weights.extend([0.3 / len(word_pools['natural'])] * len(word_pools['natural']))
+        # Code symbols for code-style chunks
+        code_symbols = [
+            '{', '}', '(', ')', '[', ']', ';', ':', ',', '.', '=', '==', '!=', '&&', '||',
+            '+', '-', '*', '/', '%', '<', '>', '<=', '>=', '=>', '->', '::', '//'
+        ]
 
-        # Code keywords (25%)
-        all_words.extend(word_pools['code_keywords'])
-        weights.extend([0.25 / len(word_pools['code_keywords'])] * len(word_pools['code_keywords']))
-
-        # Code symbols (20%)
-        all_words.extend(word_pools['code_symbols'])
-        weights.extend([0.20 / len(word_pools['code_symbols'])] * len(word_pools['code_symbols']))
-
-        # Technical terms (15%)
-        all_words.extend(word_pools['technical'])
-        weights.extend([0.15 / len(word_pools['technical'])] * len(word_pools['technical']))
-
-        # Formatting (10%)
-        all_words.extend(word_pools['formatting'])
-        weights.extend([0.10 / len(word_pools['formatting'])] * len(word_pools['formatting']))
-
-        # Normalize weights
-        weights = np.array(weights)
-        weights = weights / weights.sum()
-
-        # Generate diverse text that will activate different experts
-        # Create chunks of different "contexts" to further diversify
         chunks = []
-        chunk_size = 100  # Create variety in chunks
+        for _ in range((num_tokens * 3) // 100):
+            chunk_type = np.random.choice(['template', 'code', 'mixed'], p=[0.4, 0.3, 0.3])
+            topic_name = np.random.choice(topic_names, p=topic_weights)
+            topic = TOPICS[topic_name]
+            topic_nouns = topic["nouns"]
+            topic_verbs = topic.get("verbs", ACTION_VERBS)
 
-        for _ in range((num_tokens * 3) // chunk_size):  # Oversample for tokenization
-            # Randomly select chunk type
-            chunk_type = np.random.choice(['natural', 'code', 'mixed'], p=[0.3, 0.4, 0.3])
+            if chunk_type == 'template':
+                template = np.random.choice(GENERIC_TEMPLATES)
+                lines = []
+                for _ in range(5):
+                    line = template
+                    while "[noun]" in line:
+                        line = line.replace("[noun]", np.random.choice(topic_nouns), 1)
+                    while "[verb]" in line:
+                        line = line.replace("[verb]", np.random.choice(topic_verbs + ACTION_VERBS), 1)
+                    while "[adj]" in line:
+                        line = line.replace("[adj]", np.random.choice(ADJECTIVES), 1)
+                    while "[conn]" in line:
+                        line = line.replace("[conn]", np.random.choice(CONNECTORS), 1)
+                    lines.append(line)
+                chunks.append(". ".join(lines))
 
-            if chunk_type == 'natural':
-                # Natural language sentence
-                chunk_words = np.random.choice(word_pools['natural'], size=chunk_size // 2)
-                chunks.append(' '.join(chunk_words) + '.')
             elif chunk_type == 'code':
-                # Code-like structure
-                func_name = np.random.choice(['process', 'calculate', 'transform', 'execute'])
-                chunk_words = np.random.choice(word_pools['code_keywords'] + word_pools['technical'], size=chunk_size // 3)
-                chunks.append(f"def {func_name}({', '.join(chunk_words[:3])}): return {' '.join(chunk_words[3:])}")
-            else:
-                # Mixed content
-                chunk_words = np.random.choice(all_words, size=chunk_size // 2, p=weights)
-                chunks.append(' '.join(chunk_words))
+                func_name = np.random.choice(topic_verbs + ACTION_VERBS)
+                args = np.random.choice(topic_nouns, size=3)
+                body_words = list(np.random.choice(topic_nouns, size=10)) + list(np.random.choice(code_symbols, size=5))
+                np.random.shuffle(body_words)
+                chunks.append(f"def {func_name}({', '.join(args)}): return {' '.join(body_words)}")
+
+            else:  # mixed
+                words = (list(np.random.choice(topic_nouns, size=20)) +
+                         list(np.random.choice(CONNECTORS, size=15)) +
+                         list(np.random.choice(ACTION_VERBS, size=10)) +
+                         list(np.random.choice(ADJECTIVES, size=5)))
+                np.random.shuffle(words)
+                chunks.append(' '.join(words))
 
         text = '\n'.join(chunks)
 
@@ -628,7 +605,6 @@ class TokenizerManager:
         if prompt_number is not None:
             text = f"# PROMPT_{prompt_number}\n" + text
 
-        # Encode and trim to exact length
         tokens = self.encode(text)
         return tokens[:num_tokens]
 

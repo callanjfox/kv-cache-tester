@@ -757,12 +757,19 @@ class SyntheticMessageGenerator:
                 self.tokenizer.model_max_length = 1_000_000
 
     def _ensure_user_text_pool(self):
-        """Pre-generate content pool for user text messages."""
+        """Pre-generate content pool for user text messages using diverse vocabulary."""
         if self._user_text_pool_tokens is not None:
             return
 
         self.load_tokenizer()
         logger.info(f"Pre-generating user text pool ({self._pool_size:,} tokens)...")
+
+        from vocabulary import TOPICS, CONNECTORS, ACTION_VERBS, ADJECTIVES, GENERIC_TEMPLATES
+
+        # Build weighted topic selection
+        topic_names = list(TOPICS.keys())
+        topic_weights = np.array([TOPICS[t]["weight"] for t in topic_names])
+        topic_weights = topic_weights / topic_weights.sum()  # normalize
 
         np.random.seed(42)
         chunks = []
@@ -770,40 +777,28 @@ class SyntheticMessageGenerator:
         target_tokens = self._pool_size + 100_000
 
         while estimated_tokens < target_tokens:
-            # Generate natural language prompts
-            content_type = np.random.choice(['prompt', 'question', 'mixed'], p=[0.4, 0.3, 0.3])
+            # Pick a random topic
+            topic_name = np.random.choice(topic_names, p=topic_weights)
+            topic = TOPICS[topic_name]
+            topic_nouns = topic["nouns"]
+            topic_verbs = topic.get("verbs", ACTION_VERBS)
 
-            if content_type == 'prompt':
-                # "Can you help me implement a function that handles the authentication..."
-                lines = []
-                for _ in range(10):
-                    starter = np.random.choice(self.user_prompt_starters)
-                    verb = np.random.choice(self.user_action_verbs)
-                    nouns = np.random.choice(self.user_tech_nouns, size=3)
-                    connectors = np.random.choice(self.user_connectors, size=4)
-                    line = f"{starter} {verb} {connectors[0]} {nouns[0]} {connectors[1]} {nouns[1]} {connectors[2]} {connectors[3]} {nouns[2]}"
-                    lines.append(line)
-                chunk = ". ".join(lines)
-
-            elif content_type == 'question':
-                # Generate question-style content
-                lines = []
-                for _ in range(10):
-                    starter = np.random.choice(["How do I", "What is the", "Where can I find", "Why does", "Can you explain"])
-                    nouns = np.random.choice(self.user_tech_nouns, size=2)
-                    connectors = np.random.choice(self.user_connectors, size=2)
-                    ending = np.random.choice(self.user_question_endings)
-                    line = f"{starter} {nouns[0]} {connectors[0]} {connectors[1]} {nouns[1]} {ending}"
-                    lines.append(line)
-                chunk = " ".join(lines)
-
-            else:  # mixed
-                # Mix of technical description and natural language
-                words = list(np.random.choice(self.user_tech_nouns, size=20)) + \
-                        list(np.random.choice(self.user_connectors, size=30)) + \
-                        list(np.random.choice(self.user_action_verbs, size=10))
-                np.random.shuffle(words)
-                chunk = " ".join(words)
+            # Pick a random template and fill it
+            template = np.random.choice(GENERIC_TEMPLATES)
+            lines = []
+            for _ in range(10):
+                line = template
+                # Fill slots with vocabulary from this topic
+                while "[noun]" in line:
+                    line = line.replace("[noun]", np.random.choice(topic_nouns), 1)
+                while "[verb]" in line:
+                    line = line.replace("[verb]", np.random.choice(topic_verbs + ACTION_VERBS), 1)
+                while "[adj]" in line:
+                    line = line.replace("[adj]", np.random.choice(ADJECTIVES), 1)
+                while "[conn]" in line:
+                    line = line.replace("[conn]", np.random.choice(CONNECTORS), 1)
+                lines.append(line)
+            chunk = ". ".join(lines)
 
             chunks.append(chunk)
             estimated_tokens += len(chunk.split()) * 1.3
@@ -820,6 +815,11 @@ class SyntheticMessageGenerator:
         self.load_tokenizer()
         logger.info(f"Pre-generating tool result pool ({self._pool_size:,} tokens)...")
 
+        from vocabulary import TOPICS, CONNECTORS, ACTION_VERBS
+        all_topic_nouns = []
+        for t in TOPICS.values():
+            all_topic_nouns.extend(t["nouns"])
+
         np.random.seed(43)  # Different seed for different content
         chunks = []
         estimated_tokens = 0
@@ -831,10 +831,12 @@ class SyntheticMessageGenerator:
 
             if content_type == 'file':
                 # File contents with line numbers (like Read tool output)
+                # Mix code keywords with topic-specific vocabulary
+                extended_keywords = self.tool_code_keywords + list(np.random.choice(all_topic_nouns, size=20))
                 lines = []
                 for i in range(1, np.random.randint(50, 150)):
                     indent = "    " * np.random.randint(0, 4)
-                    keywords = np.random.choice(self.tool_code_keywords, size=np.random.randint(2, 6))
+                    keywords = np.random.choice(extended_keywords, size=np.random.randint(2, 6))
                     symbols = np.random.choice(self.tool_code_symbols, size=np.random.randint(1, 4))
                     content = indent + " ".join(list(keywords) + list(symbols))
                     lines.append(f"     {i}→{content}")
