@@ -56,16 +56,21 @@ uv run python trace_replay_tester.py \
 
 ### Included Traces
 
-The `traces/` directory contains real-world agentic coding traces for use with `trace_replay_tester.py`. This is a curated subset of a larger dataset: **642 coding conversations with embedded subagent usage**, totaling **112,176 requests** and **13,675,350,647 tokens**. The traces include subagent spawns just as a real user session would — the tool replays these as part of the conversation, capturing the realistic concurrency and cache pressure patterns they create.
+The `traces/` directory contains **522 anonymized agentic coding traces** with **100,186 requests**, including 23 traces with nested sub-agent conversations (80 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
 
-For privacy, conversation IDs have been anonymized and cache block hashes do not align across conversations. The trace replay tool accounts for this by generating a configurable shared prefix (`--warm-prefix-pct`) that simulates cross-conversation cache overlap from common tool definitions and system prompts — the default is calibrated to match patterns observed in real production data. We may release additional traces depending on community interest.
+Traces include:
+- **Global hash_ids** (`hash_id_scope: "global"`) — consistent across all conversations and sub-agents for cross-context cache simulation
+- **Timing breakdown** — `api_time` (server processing) and `think_time` (client delay) per request, enabling flexible replay timing strategies
+- **Sub-agent nesting** — sub-agents embedded in parent traces with their own tool/system tokens and request arrays
+
+All traces are fully anonymized — no conversation IDs, timestamps, or real agent IDs.
 
 | Metric | Min | P25 | Median | P75 | Max | Mean |
 |---|---|---|---|---|---|---|
-| Starting input tokens | 8,832 | 16,512 | 20,160 | 71,168 | 639,552 | 61,529 |
-| Ending input tokens | 10,304 | 65,600 | 115,008 | 149,632 | 785,280 | 133,471 |
-| Cache hit rate (per conv) | 38.3% | 91.1% | 96.9% | 98.5% | 99.6% | 93.6% |
-| Conversation duration (min) | 0.2 | 11.9 | 60.2 | 163.0 | 11,105.6 | 283.9 |
+| Starting input tokens | 6,697 | 17,360 | 19,588 | 56,364 | 509,308 | 42,174 |
+| Ending input tokens | 6,344 | 76,041 | 122,625 | 148,552 | 636,522 | 130,392 |
+| Cache hit rate (per conv) | 25% | 94% | 98% | 99% | 100% | 92% |
+| Conversation duration (min) | 0 | 33 | 71 | 161 | 44,073 | 658 |
 
 ## Utility Scripts
 

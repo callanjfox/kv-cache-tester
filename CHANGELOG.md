@@ -28,6 +28,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Time-windowed working set tracking**: Working set display shows 1m, 5m, 15m windows
 
 ### Changed
+- **Diverse vocabulary for synthetic text generation**: Replaced ~92-word vocabulary with ~2,000 unique terms across 20 topic domains (web frontend, backend/API, database, DevOps, cloud, Python, JavaScript, data science, testing, security, networking, git, Linux/shell, monitoring, performance, documentation, build systems, storage, message queues, mobile). Uses topic-based templates to generate realistic prompts. Affects all three testers: `trace_replay_tester.py`, `single_prompt_tester.py`, and `cache_rate_tester.py`. New shared `vocabulary.py` module.
+- **Default timing strategy changed to `think-only`**: Requests fire as fast as the server can handle, with only real client delays preserved.
+- **Default `--ttft-metric` changed from `p95` to `avg`**: Average TTFT is more practical for ramp decisions.
 - **`--chunk-size` default changed from 256 to 64** to match trace `block_size` (fixes 4x inflated working set token reports)
 - **`--no-color` option for all tools**: Disable colored output for light terminal backgrounds
   - Works with single_prompt_tester, cache_rate_tester, and working_set_tester
