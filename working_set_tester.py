@@ -780,12 +780,16 @@ class APIClient:
                     continue
 
                 delta = chunk.choices[0].delta
-                if delta.content is not None:
-                    if first_token_time is None and delta.content != "":
+                # Check both content and reasoning_content (for reasoning models like DeepSeek-R1)
+                token_text = delta.content
+                if token_text is None:
+                    token_text = getattr(delta, 'reasoning_content', None)
+                if token_text is not None:
+                    if first_token_time is None and token_text != "":
                         first_token_time = time.time()
-                    if delta.content != "":
+                    if token_text != "":
                         last_token_time = time.time()  # Track last token time
-                    response_text += delta.content
+                    response_text += token_text
 
             # Get usage from the last chunk
             prompt_tokens = chunk.usage.prompt_tokens if hasattr(chunk, 'usage') else 0

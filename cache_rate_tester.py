@@ -861,21 +861,25 @@ class APIClient:
                     continue
 
                 delta = chunk.choices[0].delta
-                if delta.content is not None and delta.content != "":
+                # Check both content and reasoning_content (for reasoning models like DeepSeek-R1)
+                token_text = delta.content
+                if token_text is None:
+                    token_text = getattr(delta, 'reasoning_content', None)
+                if token_text is not None and token_text != "":
                     chunk_time = time.time()
 
                     if first_token_time is None:
                         first_token_time = chunk_time
 
                     last_token_time = chunk_time
-                    response_text += delta.content
+                    response_text += token_text
 
                     # Tokenize this chunk to get exact token count
                     if tokenizer is not None:
-                        chunk_tokens = len(tokenizer.encode(delta.content))
+                        chunk_tokens = len(tokenizer.encode(token_text))
                     else:
                         # Fallback: estimate 1 token per 4 characters
-                        chunk_tokens = max(1, len(delta.content) // 4)
+                        chunk_tokens = max(1, len(token_text) // 4)
 
                     # Track this chunk
                     chunk_timestamps.append(chunk_time)
