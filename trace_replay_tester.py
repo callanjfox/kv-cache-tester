@@ -1551,16 +1551,23 @@ class APIClient:
                 response = await self.client.chat.completions.create(**params)
 
                 async for chunk in response:
-                    if chunk.choices and chunk.choices[0].delta.content:
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        content_text = delta.content or ""
+                        reasoning_text = getattr(delta, 'reasoning_content', None) or ""
+                        chunk_text = content_text or reasoning_text
+                        if not chunk_text:
+                            continue
                         chunk_time = time.time()
-                        chunk_text = chunk.choices[0].delta.content
                         if first_token_time is None:
                             first_token_time = chunk_time
                             # Signal that prefill is complete (first token received)
                             if on_first_token:
                                 on_first_token()
-                        response_text += chunk_text
-                        # Count actual tokens in this chunk
+                        # Only add content (not reasoning) to response text for conversation history
+                        if content_text:
+                            response_text += content_text
+                        # Count all generated tokens (content + reasoning) for metrics
                         chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
                         token_count += chunk_token_count
                         # Track timestamp and token count for this chunk
