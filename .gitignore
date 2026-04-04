@@ -18,6 +18,7 @@ ENV/
 *~
 
 # Test outputs
+results/
 output/
 output_*/
 single_prompt_output/
