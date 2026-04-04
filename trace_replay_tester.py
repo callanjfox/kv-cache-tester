@@ -203,6 +203,47 @@ class TraceStats:
     max_shared_prefix_tokens: int = 0  # Max(tool_tokens + system_tokens) across traces
 
 
+class TokenBucket:
+    """Token bucket rate limiter with continuous refill.
+
+    Used for OTPM (output tokens per minute) and ITPM (uncached input tokens per minute)
+    budgets. Capacity represents burst allowance (1 minute of budget). Refills continuously
+    at budget/60 tokens per second.
+    """
+
+    def __init__(self, capacity: float, refill_rate: float):
+        """
+        Args:
+            capacity: Maximum tokens in bucket (burst size).
+            refill_rate: Tokens added per second (= budget_per_minute / 60).
+        """
+        self.capacity = capacity
+        self.tokens = capacity  # Start full
+        self.refill_rate = refill_rate
+        self.last_refill = time.time()
+
+    def refill(self):
+        """Refill bucket based on elapsed time."""
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+
+    def try_consume(self, amount: float) -> bool:
+        """Try to consume tokens. Returns True if successful, False if insufficient."""
+        self.refill()
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+    @property
+    def fill_pct(self) -> float:
+        """Current fill level as percentage (0-100)."""
+        self.refill()
+        return (self.tokens / self.capacity * 100) if self.capacity > 0 else 100.0
+
+
 @dataclass
 class TestConfig:
     """Configuration for the trace replay test"""
@@ -234,11 +275,25 @@ class TestConfig:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
-    # Rate limiting
+    # Rate limiting (legacy — used when no new rate limiting flags are set)
     ttft_window: int = 3  # Rolling TTFT window (number of periods)
     rate_limit_backoff: float = 30.0  # Backoff duration when rate limited (seconds)
-    # Admission control
+    # Admission control (legacy)
     max_concurrent_requests: Optional[int] = None  # None = unlimited
+    # --- New three-layer rate limiting ---
+    # Layer 1: Inference admission (hardware guard rails)
+    max_prefill_concurrent: int = 0  # Max requests prefilling simultaneously (0=unlimited)
+    max_decode_concurrent: int = 0   # Max requests decoding simultaneously (0=unlimited)
+    # Layer 2: Token budgets (capacity envelope, tokens per minute, 0=unlimited)
+    otpm_budget: int = 0   # Output tokens per minute budget (token bucket)
+    itpm_budget: int = 0   # Uncached input tokens per minute budget (token bucket)
+    # SLO thresholds for goodput calculation
+    slo_ttft: float = 5.0          # Target TTFT in seconds
+    slo_decode_tps: float = 30.0   # Target per-request output tok/s
+    # Fairness
+    fairness_window: float = 60.0  # Rolling window for per-user consumption scoring (seconds)
+    # Cache aging
+    cache_max_age: float = 600.0   # Evict blocks not accessed in this many seconds (default 10min)
     # Warm prefix for cross-conversation cache sharing
     warm_prefix_pct: float = 0.5  # Default 50% of tool+system tokens warm
     # Trace advancement: start users partway through their traces
@@ -270,6 +325,9 @@ class RequestMetrics:
     delay_actual: float
     success: bool
     error_message: Optional[str] = None
+    # Queue and effective experience metrics
+    queue_time: float = 0.0  # Time spent waiting in rate_limited/queued state before dispatch
+    effective_ttft: float = 0.0  # queue_time + ttft (what user actually experiences)
     # Timestamps for period attribution
     request_start_time: float = 0.0  # When request was sent
     prefill_complete_time: float = 0.0  # When first token received (TTFT)
@@ -331,6 +389,21 @@ class AssessmentPeriodMetrics:
     dispatch_delay_max: float = 0.0  # Max seconds behind schedule
     in_flight_prefilling: int = 0  # Requests awaiting/in prefill at assessment time
     in_flight_decoding: int = 0  # Requests in decode phase at assessment time
+    # New three-layer rate limiting metrics
+    goodput_pct: float = 0.0           # % requests meeting BOTH SLOs (TTFT + decode tok/s)
+    goodput_ttft_pct: float = 0.0      # % requests meeting TTFT SLO only
+    goodput_decode_pct: float = 0.0    # % requests meeting decode tok/s SLO only
+    queue_depth: int = 0               # Users currently rate-limited (queued)
+    otpm_bucket_pct: float = 100.0     # OTPM token bucket fill level (0-100%)
+    itpm_bucket_pct: float = 100.0     # ITPM token bucket fill level (0-100%)
+    avg_decode_tps_per_user: float = 0.0  # Average output tok/s per decoding user
+    # Workload experience metrics (includes queue time)
+    effective_ttft_avg: float = 0.0     # avg(queue_time + ttft) — what user actually experiences
+    effective_ttft_p50: float = 0.0
+    effective_ttft_p95: float = 0.0
+    service_rate: float = 0.0           # % of total users that got ≥1 request completed this period
+    requests_per_user_per_min: float = 0.0  # requests completed / total users / period_minutes
+    goodput_effective_pct: float = 0.0  # % requests where effective_ttft ≤ SLO
 
 
 # =============================================================================
@@ -1108,6 +1181,10 @@ class UserSession:
         self.rate_limit_count: int = 0  # Times rate-limited for current request attempt
         self.total_rate_limit_count: int = 0  # Total times rate-limited across all requests
 
+        # Per-user consumption tracking for fairness scoring
+        self.output_consumption_log: deque = deque()   # (timestamp, output_tokens)
+        self.input_consumption_log: deque = deque()     # (timestamp, uncached_input_tokens)
+
         # Sub-agent tracking
         self.pending_subagents: List[str] = []      # user_ids of active sub-agent sessions
         self.parent_user_id: Optional[str] = None   # set if this is a sub-agent
@@ -1143,6 +1220,25 @@ class UserSession:
             return None
 
         return request
+
+    def record_consumption(self, output_tokens: int, uncached_input_tokens: int):
+        """Record token consumption for fairness scoring."""
+        now = time.time()
+        if output_tokens > 0:
+            self.output_consumption_log.append((now, output_tokens))
+        if uncached_input_tokens > 0:
+            self.input_consumption_log.append((now, uncached_input_tokens))
+
+    def get_recent_consumption(self, window: float) -> Tuple[int, int]:
+        """Return (output_tokens, input_tokens) consumed in the last `window` seconds."""
+        cutoff = time.time() - window
+        while self.output_consumption_log and self.output_consumption_log[0][0] < cutoff:
+            self.output_consumption_log.popleft()
+        while self.input_consumption_log and self.input_consumption_log[0][0] < cutoff:
+            self.input_consumption_log.popleft()
+        out = sum(t for _, t in self.output_consumption_log)
+        inp = sum(t for _, t in self.input_consumption_log)
+        return out, inp
 
     def get_delay_until_next(self) -> float:
         """Get delay in seconds until next request"""
@@ -1677,6 +1773,33 @@ class TestOrchestrator:
         # Rate limiting tracking
         self.period_rate_limit_ws: int = 0    # Users rate limited by working set this period
         self.period_rate_limit_ttft: int = 0  # Users rate limited by TTFT this period
+
+        # New three-layer rate limiting
+        self.otpm_bucket: Optional[TokenBucket] = None
+        self.itpm_bucket: Optional[TokenBucket] = None
+        self.use_new_rate_limiting: bool = (
+            config.max_prefill_concurrent > 0 or
+            config.max_decode_concurrent > 0 or
+            config.otpm_budget > 0 or
+            config.itpm_budget > 0
+        )
+        # Initialize token buckets
+        if config.otpm_budget > 0:
+            self.otpm_bucket = TokenBucket(
+                capacity=float(config.otpm_budget),  # 1 minute of burst
+                refill_rate=config.otpm_budget / 60.0
+            )
+        if config.itpm_budget > 0:
+            self.itpm_bucket = TokenBucket(
+                capacity=float(config.itpm_budget),
+                refill_rate=config.itpm_budget / 60.0
+            )
+
+        # Goodput tracking
+        self.period_slo_met: int = 0
+        self.period_slo_ttft_met: int = 0
+        self.period_slo_decode_met: int = 0
+        self.period_slo_total: int = 0
 
         # Error tracking
         self.consecutive_connection_errors: int = 0
@@ -2226,7 +2349,22 @@ class TestOrchestrator:
             dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
-            in_flight_decoding=self.in_flight_decoding
+            in_flight_decoding=self.in_flight_decoding,
+            # New three-layer metrics
+            goodput_pct=(self.period_slo_met / self.period_slo_total * 100) if self.period_slo_total > 0 else 0.0,
+            goodput_ttft_pct=(self.period_slo_ttft_met / self.period_slo_total * 100) if self.period_slo_total > 0 else 0.0,
+            goodput_decode_pct=(self.period_slo_decode_met / self.period_slo_total * 100) if self.period_slo_total > 0 else 0.0,
+            queue_depth=rate_limited_users,
+            otpm_bucket_pct=self.otpm_bucket.fill_pct if self.otpm_bucket else 100.0,
+            itpm_bucket_pct=self.itpm_bucket.fill_pct if self.itpm_bucket else 100.0,
+            avg_decode_tps_per_user=((output_tokens / duration) / self.in_flight_decoding) if self.in_flight_decoding > 0 and duration > 0 else 0.0,
+            # Workload experience metrics
+            effective_ttft_avg=np.mean([m.effective_ttft for m in period_prefill_metrics]) if period_prefill_metrics else 0.0,
+            effective_ttft_p50=np.percentile([m.effective_ttft for m in period_prefill_metrics], 50) if period_prefill_metrics else 0.0,
+            effective_ttft_p95=np.percentile([m.effective_ttft for m in period_prefill_metrics], 95) if period_prefill_metrics else 0.0,
+            service_rate=(users_with_requests / total_users * 100) if total_users > 0 else 0.0,
+            requests_per_user_per_min=(len(period_completed_metrics) / total_users / (duration / 60)) if total_users > 0 and duration > 0 else 0.0,
+            goodput_effective_pct=(sum(1 for m in period_prefill_metrics if m.effective_ttft <= self.config.slo_ttft) / len(period_prefill_metrics) * 100) if period_prefill_metrics else 0.0,
         )
 
     def print_assessment(self, metrics: AssessmentPeriodMetrics):
@@ -2285,19 +2423,31 @@ class TestOrchestrator:
 
 
         # Show admission control metrics if enabled
-        if self.config.max_concurrent_requests:
+        if self.config.max_concurrent_requests or self.use_new_rate_limiting:
             total_in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
-            logger.info(f"  Admission Control: {total_in_flight}/{self.config.max_concurrent_requests} in-flight "
+            logger.info(f"  Admission Control: {total_in_flight} in-flight "
                        f"({metrics.in_flight_prefilling} prefilling, {metrics.in_flight_decoding} decoding) | "
                        f"{metrics.admission_blocked_events} blocked | "
                        f"dispatch delay: {metrics.dispatch_delay_avg:.2f}s avg, {metrics.dispatch_delay_max:.2f}s max")
+
+        # Show new rate limiting metrics
+        if self.use_new_rate_limiting:
+            logger.info(f"  Goodput: {metrics.goodput_pct:.1f}% (TTFT: {metrics.goodput_ttft_pct:.1f}%, Decode: {metrics.goodput_decode_pct:.1f}%) | "
+                       f"Queue: {metrics.queue_depth} users | "
+                       f"Decode tok/s per user: {metrics.avg_decode_tps_per_user:.1f}")
+            logger.info(f"  User Experience: eff_TTFT avg={metrics.effective_ttft_avg:.1f}s p50={metrics.effective_ttft_p50:.1f}s p95={metrics.effective_ttft_p95:.1f}s | "
+                       f"Service rate: {metrics.service_rate:.0f}% | "
+                       f"Reqs/user/min: {metrics.requests_per_user_per_min:.1f} | "
+                       f"Eff goodput: {metrics.goodput_effective_pct:.1f}%")
+            if self.otpm_bucket or self.itpm_bucket:
+                logger.info(f"  Token Budgets: OTPM {metrics.otpm_bucket_pct:.0f}% | ITPM {metrics.itpm_bucket_pct:.0f}%")
 
             # Warn if the limit appears to be constraining throughput
             if metrics.admission_blocked_events > 100 or metrics.dispatch_delay_avg > 10.0:
                 logger.warning(f"{Colors.WARNING}  ⚠️ Max concurrent requests limit ({self.config.max_concurrent_requests}) "
                               f"may be constraining throughput. Consider increasing --max-concurrent-requests{Colors.ENDC}")
 
-    async def run_user_request(self, user: UserSession) -> Optional[RequestMetrics]:
+    async def run_user_request(self, user: UserSession, queue_time: float = 0.0) -> Optional[RequestMetrics]:
         """Execute a single request for a user"""
         request = user.get_next_request()
         if request is None:
@@ -2412,7 +2562,9 @@ class TestOrchestrator:
             ttlt=ttlt,
             itl=itl,
             delay_expected=user.get_delay_until_next(),
-            delay_actual=0,  # Will be set by orchestrator
+            delay_actual=queue_time,
+            queue_time=queue_time,
+            effective_ttft=queue_time + ttft,
             success=error_type is None,
             request_start_time=request_start_time,
             prefill_complete_time=prefill_complete_time,
@@ -2423,6 +2575,25 @@ class TestOrchestrator:
 
         user.metrics.append(metrics)
         user.advance()
+
+        # Record consumption for fairness scoring
+        if error_type is None:
+            user.record_consumption(actual_output, cache_misses * self.config.chunk_size)
+            user.rate_limit_count = 0  # Reset on successful dispatch
+
+            # Goodput tracking
+            decode_time = ttlt - ttft if ttlt > ttft else 0
+            decode_tps = (actual_output / decode_time) if decode_time > 0.1 and actual_output > 0 else 0
+            ttft_ok = ttft <= self.config.slo_ttft
+            decode_ok = decode_tps >= self.config.slo_decode_tps if decode_time > 0.1 else True
+
+            self.period_slo_total += 1
+            if ttft_ok:
+                self.period_slo_ttft_met += 1
+            if decode_ok:
+                self.period_slo_decode_met += 1
+            if ttft_ok and decode_ok:
+                self.period_slo_met += 1
 
         if user.current_idx >= len(user.requests):
             user.state = "completed"
@@ -2532,80 +2703,140 @@ class TestOrchestrator:
                 # Phase 2: Sort by ready_at (fair ordering - longest waiting first)
                 ready_users.sort(key=lambda x: x[2])
 
-                # Phase 2.5: Rate limiting — check triggers and limit most expensive users
-                rolling_ttft = self.get_rolling_ttft()
-                ws_over_cap = (self.config.max_working_set_tokens > 0 and
-                               self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
-                ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
+                if self.use_new_rate_limiting:
+                    # ============================================================
+                    # NEW TWO-LAYER RATE LIMITING
+                    # ============================================================
+                    # Working set cap only controls user ramp (in calculate_users_to_add).
+                    # Dispatch-level admission is handled by Layer 1 (concurrency)
+                    # and Layer 2 (token budgets).
 
-                if (ws_over_cap or ttft_over) and ready_users:
-                    # Score each ready user by predicted cache misses (most expensive first)
-                    scored = []
-                    for uid, user, rat in ready_users:
-                        misses = self.predict_user_cache_misses(user)
-                        scored.append((uid, user, rat, misses))
-
-                    # Sort by predicted misses descending (highest cost first)
-                    scored.sort(key=lambda x: -x[3])
-
-                    # Rate limit a FRACTION of users — not all at once.
-                    # For working set: limit enough to bring WS under cap
-                    # For TTFT: limit proportional to overage (e.g., 20% over = limit ~20% of users)
-                    if ws_over_cap:
-                        # Limit users until predicted WS drops below cap
-                        current_ws = self.get_current_working_set_tokens()
-                        excess = current_ws - self.config.max_working_set_tokens
-                        target_limit = max(1, len(scored) // 4)  # At most 25% of users per cycle
-                    elif ttft_over:
-                        # Limit proportional to overage
-                        overage_pct = (rolling_ttft - self.config.max_ttft) / self.config.max_ttft
-                        target_limit = max(1, int(len(scored) * min(overage_pct, 0.5)))  # Cap at 50%
-                    else:
-                        target_limit = 0
-
-                    remaining = []
-                    limited = 0
-                    base_backoff = self.config.rate_limit_backoff
-                    for uid, user, rat, misses in scored:
-                        if limited < target_limit and misses > 0:
-                            # Stagger: add randomness to prevent synchronized release
-                            import random
-                            jitter = random.uniform(0, base_backoff * 0.5)
-                            user_backoff = base_backoff + jitter
+                    for user_id, user, ready_at in ready_users:
+                        # --- Layer 1: Inference admission (hardware guard rails) ---
+                        in_flight_prefilling = self.in_flight_requests - self.in_flight_decoding
+                        if (self.config.max_prefill_concurrent > 0 and
+                                in_flight_prefilling >= self.config.max_prefill_concurrent):
                             user.state = "rate_limited"
-                            user.rate_limit_until = now + user_backoff
+                            user.rate_limit_until = now + 0.1
                             user.rate_limit_count += 1
                             user.total_rate_limit_count += 1
-                            trigger = "working-set" if ws_over_cap else "ttft"
-                            if ws_over_cap:
-                                self.period_rate_limit_ws += 1
-                            else:
-                                self.period_rate_limit_ttft += 1
-                            logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
-                                       f"({trigger}, {misses} predicted miss blocks, "
-                                       f"backoff: {user_backoff:.0f}s){Colors.ENDC}")
-                            limited += 1
+                            self.period_admission_blocked += 1
+                            continue
+
+                        if (self.config.max_decode_concurrent > 0 and
+                                self.in_flight_decoding >= self.config.max_decode_concurrent):
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + 0.1
+                            user.rate_limit_count += 1
+                            user.total_rate_limit_count += 1
+                            self.period_admission_blocked += 1
+                            continue
+
+                        # Legacy max_concurrent_requests still applies
+                        if (self.config.max_concurrent_requests and
+                                self.in_flight_requests >= self.config.max_concurrent_requests):
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + 0.1
+                            user.rate_limit_count += 1
+                            user.total_rate_limit_count += 1
+                            self.period_admission_blocked += 1
+                            continue
+
+                        # --- Layer 2: Token budget check ---
+                        # Check both budgets BEFORE consuming either (two-phase check)
+                        predicted_misses = self.predict_user_cache_misses(user)
+                        itpm_cost = max(0, predicted_misses * self.config.chunk_size)
+                        req = user.requests[user.current_idx] if user.current_idx < len(user.requests) else {}
+                        otpm_cost = max(0, req.get('out', req.get('output_tokens', 100)))
+
+                        budget_ok = True
+                        if self.itpm_bucket and itpm_cost > 0:
+                            self.itpm_bucket.refill()
+                            if self.itpm_bucket.tokens < itpm_cost:
+                                budget_ok = False
+                        if self.otpm_bucket and otpm_cost > 0:
+                            self.otpm_bucket.refill()
+                            if self.otpm_bucket.tokens < otpm_cost:
+                                budget_ok = False
+
+                        if budget_ok:
+                            # Both budgets have capacity — consume atomically
+                            if self.itpm_bucket and itpm_cost > 0:
+                                self.itpm_bucket.tokens -= itpm_cost
+                            if self.otpm_bucket and otpm_cost > 0:
+                                self.otpm_bucket.tokens -= otpm_cost
+
+                        if not budget_ok:
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + 0.1
+                            user.rate_limit_count += 1
+                            user.total_rate_limit_count += 1
+                            self.period_rate_limit_ttft += 1  # Reuse counter for budget events
+                            continue
+
+                        # --- All checks passed: DISPATCH ---
+                        dispatch_delay = now - ready_at
+                        self.period_dispatch_delays.append(dispatch_delay)
+                        self.in_flight_requests += 1
+                        task = asyncio.create_task(self.run_user_request(user, queue_time=dispatch_delay))
+                        pending_tasks[task] = (user_id, now)
+
+                else:
+                    # ============================================================
+                    # LEGACY RATE LIMITING (backward compatibility)
+                    # ============================================================
+                    rolling_ttft = self.get_rolling_ttft()
+                    ws_over_cap = (self.config.max_working_set_tokens > 0 and
+                                   self.get_current_working_set_tokens() > self.config.max_working_set_tokens)
+                    ttft_over = (rolling_ttft is not None and rolling_ttft >= self.config.max_ttft)
+
+                    if (ws_over_cap or ttft_over) and ready_users:
+                        scored = []
+                        for uid, user, rat in ready_users:
+                            misses = self.predict_user_cache_misses(user)
+                            scored.append((uid, user, rat, misses))
+                        scored.sort(key=lambda x: -x[3])
+
+                        if ws_over_cap:
+                            target_limit = max(1, len(scored) // 4)
+                        elif ttft_over:
+                            overage_pct = (rolling_ttft - self.config.max_ttft) / self.config.max_ttft
+                            target_limit = max(1, int(len(scored) * min(overage_pct, 0.5)))
                         else:
-                            remaining.append((uid, user, rat))
+                            target_limit = 0
 
-                    ready_users = remaining
+                        remaining = []
+                        limited = 0
+                        import random
+                        base_backoff = self.config.rate_limit_backoff
+                        for uid, user, rat, misses in scored:
+                            if limited < target_limit and misses > 0:
+                                jitter = random.uniform(0, base_backoff * 0.5)
+                                user_backoff = base_backoff + jitter
+                                user.state = "rate_limited"
+                                user.rate_limit_until = now + user_backoff
+                                user.rate_limit_count += 1
+                                user.total_rate_limit_count += 1
+                                if ws_over_cap:
+                                    self.period_rate_limit_ws += 1
+                                else:
+                                    self.period_rate_limit_ttft += 1
+                                limited += 1
+                            else:
+                                remaining.append((uid, user, rat))
+                        ready_users = remaining
 
-                # Phase 3: Dispatch in fair order, respecting admission limit
-                for user_id, user, ready_at in ready_users:
-                    # Admission control check
-                    if (self.config.max_concurrent_requests and
-                        self.in_flight_requests >= self.config.max_concurrent_requests):
-                        self.period_admission_blocked += 1
-                        continue  # At capacity, skip this user
-
-                    # Track dispatch delay (how far behind schedule)
-                    dispatch_delay = now - ready_at
-                    self.period_dispatch_delays.append(dispatch_delay)
-
-                    # Increment in-flight counter and dispatch
-                    self.in_flight_requests += 1
-                    task = asyncio.create_task(self.run_user_request(user))
-                    pending_tasks[task] = (user_id, now)
+                    # Phase 3: Dispatch (legacy)
+                    for user_id, user, ready_at in ready_users:
+                        if (self.config.max_concurrent_requests and
+                                self.in_flight_requests >= self.config.max_concurrent_requests):
+                            self.period_admission_blocked += 1
+                            continue
+                        dispatch_delay = now - ready_at
+                        self.period_dispatch_delays.append(dispatch_delay)
+                        self.in_flight_requests += 1
+                        task = asyncio.create_task(self.run_user_request(user, queue_time=dispatch_delay))
+                        pending_tasks[task] = (user_id, now)
 
                 # Remove completed/truncated users
                 for user_id, reason in users_to_remove:
@@ -2653,7 +2884,7 @@ class TestOrchestrator:
                     period_end_time = self.current_period_start + self.config.assessment_period
 
                     # Prune old blocks from working set tracking (keeps 15m window)
-                    self.prune_old_blocks()
+                    self.prune_old_blocks(self.config.cache_max_age)
 
                     # Prune old output token log entries (keep 15 minutes)
                     cutoff = time.time() - 900
@@ -2701,6 +2932,10 @@ class TestOrchestrator:
                     self.period_rate_limit_ttft = 0
                     self.period_admission_blocked = 0
                     self.period_dispatch_delays = []
+                    self.period_slo_met = 0
+                    self.period_slo_ttft_met = 0
+                    self.period_slo_decode_met = 0
+                    self.period_slo_total = 0
 
         except KeyboardInterrupt:
             logger.info(f"\n{Colors.WARNING}Test interrupted by user{Colors.ENDC}")
@@ -2966,6 +3201,89 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
         fig3.write_html(output_path / "trace_replay_user_timeline.html")
         logger.info("Generated: trace_replay_user_timeline.html")
 
+    # Graph 4: Rate Limiting Dashboard (only if new rate limiting is active)
+    if orchestrator.use_new_rate_limiting:
+        fig4 = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            subplot_titles=(
+                'Queue Depth & Service Rate',
+                'Token Budget Utilization',
+                'Effective TTFT & Goodput'
+            ),
+            vertical_spacing=0.08
+        )
+
+        period_nums = [p.period_number for p in periods]
+
+        # Row 1: Queue depth (bar) + service rate (line)
+        fig4.add_trace(go.Bar(
+            x=period_nums,
+            y=[p.queue_depth for p in periods],
+            name='Queue Depth (users)',
+            marker_color='rgba(255, 165, 0, 0.6)'
+        ), row=1, col=1)
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.service_rate for p in periods],
+            name='Service Rate %',
+            line=dict(color='green', width=2)
+        ), row=1, col=1)
+
+        # Row 2: Token bucket fill levels
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.otpm_bucket_pct for p in periods],
+            name='OTPM Budget %',
+            line=dict(color='blue', width=2)
+        ), row=2, col=1)
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.itpm_bucket_pct for p in periods],
+            name='ITPM Budget %',
+            line=dict(color='green', width=2)
+        ), row=2, col=1)
+
+        # Row 3: Effective TTFT + goodput (including queue time)
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.effective_ttft_avg for p in periods],
+            name='Eff TTFT avg',
+            line=dict(color='red', width=2)
+        ), row=3, col=1)
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.effective_ttft_p95 for p in periods],
+            name='Eff TTFT p95',
+            line=dict(color='red', width=1, dash='dash')
+        ), row=3, col=1)
+        fig4.add_trace(go.Scatter(
+            x=period_nums,
+            y=[p.goodput_effective_pct for p in periods],
+            name='Eff Goodput %',
+            line=dict(color='green', width=2),
+            fill='tozeroy',
+            fillcolor='rgba(0, 200, 0, 0.1)'
+        ), row=3, col=1)
+        # SLO threshold line
+        fig4.add_hline(y=config.slo_ttft, row=3, col=1,
+                       line=dict(color='gray', dash='dot'), annotation_text=f"SLO: {config.slo_ttft}s")
+
+        fig4.update_yaxes(title_text="Count / %", row=1, col=1)
+        fig4.update_yaxes(title_text="Fill %", range=[0, 105], row=2, col=1)
+        fig4.update_yaxes(title_text="Seconds / %", row=3, col=1)
+        fig4.update_xaxes(title_text="Assessment Period", row=3, col=1)
+
+        fig4.update_layout(
+            title=f"Rate Limiting Dashboard (SLO: TTFT ≤ {config.slo_ttft}s, Decode ≥ {config.slo_decode_tps} tok/s)",
+            height=900,
+            showlegend=True,
+            template='plotly_white'
+        )
+
+        fig4.write_html(output_path / "trace_replay_rate_limiting.html")
+        logger.info("Generated: trace_replay_rate_limiting.html")
+
 
 def save_results(orchestrator: TestOrchestrator, config: TestConfig):
     """Save all results to files"""
@@ -3056,8 +3374,8 @@ def parse_arguments():
                         help="Minimum requests per trace to include (default: 1)")
 
     # Timing
-    parser.add_argument("--max-delay", type=float, default=60.0,
-                        help="Maximum delay between requests in seconds (default: 60)")
+    parser.add_argument("--max-delay", type=float, default=600.0,
+                        help="Maximum delay between requests in seconds (default: 600)")
     parser.add_argument("--time-scale", type=float, default=1.0,
                         help="Time scaling factor (1.0 = real-time, 0.5 = 2x faster)")
     parser.add_argument("--timing-strategy", type=str, default="think-only",
@@ -3100,17 +3418,46 @@ def parse_arguments():
     parser.add_argument("--repetition-penalty", type=float, default=None,
                         help="Override repetition_penalty for generation (e.g., 1.05)")
 
-    # Rate limiting
+    # Rate limiting (legacy)
     parser.add_argument("--ttft-window", type=int, default=3,
                         help="Rolling TTFT window in periods for ramp and rate limit decisions (default: 3)")
     parser.add_argument("--rate-limit-backoff", type=float, default=30.0,
                         help="Backoff duration in seconds when a user is rate limited (default: 30)")
 
-    # Admission control
+    # Admission control (legacy)
     parser.add_argument("--max-concurrent-requests", type=int, default=50,
                         help="Max concurrent in-flight requests (admission control). "
                              "When reached, new dispatches are blocked until requests complete. "
                              "Default: 50. Set to 0 to disable.")
+
+    # --- New three-layer rate limiting ---
+    # Layer 1: Inference admission
+    parser.add_argument("--max-prefill-concurrent", type=int, default=0,
+                        help="Max requests prefilling simultaneously (0=unlimited). "
+                             "Controls TTFT by limiting GPU compute contention during prefill.")
+    parser.add_argument("--max-decode-concurrent", type=int, default=0,
+                        help="Max requests decoding simultaneously (0=unlimited). "
+                             "Controls per-user output tok/s by limiting decode batch size.")
+
+    # Layer 2: Token budgets
+    parser.add_argument("--otpm-budget", type=int, default=0,
+                        help="Output tokens per minute budget (0=unlimited). "
+                             "Token bucket: refills continuously, queues requests when empty.")
+    parser.add_argument("--itpm-budget", type=int, default=0,
+                        help="Uncached input tokens per minute budget (0=unlimited). "
+                             "Only counts predicted cache misses, not cached tokens.")
+
+    # SLO thresholds
+    parser.add_argument("--slo-ttft", type=float, default=5.0,
+                        help="Target TTFT for goodput calculation (default: 5.0s)")
+    parser.add_argument("--slo-decode-tps", type=float, default=30.0,
+                        help="Target per-request output tok/s for goodput (default: 30.0)")
+
+    # Fairness and cache aging
+    parser.add_argument("--fairness-window", type=float, default=60.0,
+                        help="Rolling window in seconds for per-user consumption fairness (default: 60)")
+    parser.add_argument("--cache-max-age", type=float, default=600.0,
+                        help="Evict cached blocks not accessed in this many seconds (default: 600 = 10min)")
 
     # Warm prefix for cross-conversation cache sharing
     parser.add_argument("--warm-prefix-pct", type=float, default=0.5,
@@ -3181,7 +3528,15 @@ async def main():
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
         advance_max=args.advance_max,
-        advance_all_users=args.advance_all_users
+        advance_all_users=args.advance_all_users,
+        max_prefill_concurrent=args.max_prefill_concurrent,
+        max_decode_concurrent=args.max_decode_concurrent,
+        otpm_budget=args.otpm_budget,
+        itpm_budget=args.itpm_budget,
+        slo_ttft=args.slo_ttft,
+        slo_decode_tps=args.slo_decode_tps,
+        fairness_window=args.fairness_window,
+        cache_max_age=args.cache_max_age,
     )
 
     # Print header
@@ -3227,6 +3582,13 @@ async def main():
         logger.info(f"  Test Duration: {config.test_duration}s")
     if config.max_concurrent_requests:
         logger.info(f"  Max Concurrent Requests: {config.max_concurrent_requests}")
+    # New rate limiting config
+    if config.max_prefill_concurrent > 0 or config.max_decode_concurrent > 0:
+        logger.info(f"  Layer 1 (Inference): max_prefill={config.max_prefill_concurrent or 'unlimited'}, max_decode={config.max_decode_concurrent or 'unlimited'}")
+    if config.otpm_budget > 0 or config.itpm_budget > 0:
+        logger.info(f"  Layer 2 (Budgets): OTPM={config.otpm_budget or 'unlimited'}/min, ITPM={config.itpm_budget or 'unlimited'}/min")
+    logger.info(f"  SLO: TTFT ≤ {config.slo_ttft}s, Decode ≥ {config.slo_decode_tps} tok/s")
+    logger.info(f"  Cache Max Age: {config.cache_max_age}s")
     if config.warm_prefix_pct > 0:
         warm_tokens = int(config.warm_prefix_pct * stats.max_shared_prefix_tokens) if stats.max_shared_prefix_tokens > 0 else 0
         logger.info(f"  Warm Prefix: {config.warm_prefix_pct:.0%} of tool+system ({warm_tokens:,} tokens)")
