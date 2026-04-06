@@ -2430,17 +2430,16 @@ class TestOrchestrator:
                        f"{metrics.admission_blocked_events} blocked | "
                        f"dispatch delay: {metrics.dispatch_delay_avg:.2f}s avg, {metrics.dispatch_delay_max:.2f}s max")
 
-        # Show new rate limiting metrics
-        if self.use_new_rate_limiting:
-            logger.info(f"  Goodput: {metrics.goodput_pct:.1f}% (TTFT: {metrics.goodput_ttft_pct:.1f}%, Decode: {metrics.goodput_decode_pct:.1f}%) | "
-                       f"Queue: {metrics.queue_depth} users | "
-                       f"Decode tok/s per user: {metrics.avg_decode_tps_per_user:.1f}")
-            logger.info(f"  User Experience: eff_TTFT avg={metrics.effective_ttft_avg:.1f}s p50={metrics.effective_ttft_p50:.1f}s p95={metrics.effective_ttft_p95:.1f}s | "
-                       f"Service rate: {metrics.service_rate:.0f}% | "
-                       f"Reqs/user/min: {metrics.requests_per_user_per_min:.1f} | "
-                       f"Eff goodput: {metrics.goodput_effective_pct:.1f}%")
-            if self.otpm_bucket or self.itpm_bucket:
-                logger.info(f"  Token Budgets: OTPM {metrics.otpm_bucket_pct:.0f}% | ITPM {metrics.itpm_bucket_pct:.0f}%")
+        # Show goodput and user experience metrics (always, not just with new rate limiting)
+        logger.info(f"  Goodput: {metrics.goodput_pct:.1f}% (TTFT: {metrics.goodput_ttft_pct:.1f}%, Decode: {metrics.goodput_decode_pct:.1f}%) | "
+                   f"Queue: {metrics.queue_depth} users | "
+                   f"Decode tok/s per user: {metrics.avg_decode_tps_per_user:.1f}")
+        logger.info(f"  User Experience: eff_TTFT avg={metrics.effective_ttft_avg:.1f}s p50={metrics.effective_ttft_p50:.1f}s p95={metrics.effective_ttft_p95:.1f}s | "
+                   f"Service rate: {metrics.service_rate:.0f}% | "
+                   f"Reqs/user/min: {metrics.requests_per_user_per_min:.1f} | "
+                   f"Eff goodput: {metrics.goodput_effective_pct:.1f}%")
+        if self.otpm_bucket or self.itpm_bucket:
+            logger.info(f"  Token Budgets: OTPM {metrics.otpm_bucket_pct:.0f}% | ITPM {metrics.itpm_bucket_pct:.0f}%")
 
             # Warn if the limit appears to be constraining throughput
             if metrics.admission_blocked_events > 100 or metrics.dispatch_delay_avg > 10.0:
@@ -3201,8 +3200,8 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
         fig3.write_html(output_path / "trace_replay_user_timeline.html")
         logger.info("Generated: trace_replay_user_timeline.html")
 
-    # Graph 4: Rate Limiting Dashboard (only if new rate limiting is active)
-    if orchestrator.use_new_rate_limiting:
+    # Graph 4: Rate Limiting & User Experience Dashboard
+    if True:  # Always generate — goodput metrics are tracked regardless of rate limiting mode
         fig4 = make_subplots(
             rows=3, cols=1,
             shared_xaxes=True,
