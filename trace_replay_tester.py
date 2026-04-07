@@ -2808,36 +2808,32 @@ class TestOrchestrator:
                             continue
 
                         # --- Layer 2: Token budget check ---
-                        # Check both budgets BEFORE consuming either (two-phase check)
+                        # Budget exhaustion is a system-wide condition, not per-user.
+                        # If budget is empty, STOP dispatching this cycle (break).
+                        # Users stay idle with their queue position preserved.
+                        # The bucket refills continuously; next cycle may have capacity.
                         predicted_misses = self.predict_user_cache_misses(user)
                         itpm_cost = max(0, predicted_misses * self.config.chunk_size)
                         req = user.requests[user.current_idx] if user.current_idx < len(user.requests) else {}
                         otpm_cost = max(0, req.get('out', req.get('output_tokens', 100)))
 
-                        budget_ok = True
                         if self.itpm_bucket and itpm_cost > 0:
                             self.itpm_bucket.refill()
                             if self.itpm_bucket.tokens < itpm_cost:
-                                budget_ok = False
+                                self.period_rate_limit_ttft += 1
+                                break  # Budget empty — stop dispatching, try next cycle
+
                         if self.otpm_bucket and otpm_cost > 0:
                             self.otpm_bucket.refill()
                             if self.otpm_bucket.tokens < otpm_cost:
-                                budget_ok = False
+                                self.period_rate_limit_ttft += 1
+                                break  # Budget empty — stop dispatching, try next cycle
 
-                        if budget_ok:
-                            # Both budgets have capacity — consume atomically
-                            if self.itpm_bucket and itpm_cost > 0:
-                                self.itpm_bucket.tokens -= itpm_cost
-                            if self.otpm_bucket and otpm_cost > 0:
-                                self.otpm_bucket.tokens -= otpm_cost
-
-                        if not budget_ok:
-                            user.state = "rate_limited"
-                            user.rate_limit_until = now + 0.1
-                            user.rate_limit_count += 1
-                            user.total_rate_limit_count += 1
-                            self.period_rate_limit_ttft += 1  # Reuse counter for budget events
-                            continue
+                        # Both budgets have capacity — consume atomically
+                        if self.itpm_bucket and itpm_cost > 0:
+                            self.itpm_bucket.tokens -= itpm_cost
+                        if self.otpm_bucket and otpm_cost > 0:
+                            self.otpm_bucket.tokens -= otpm_cost
 
                         # --- All checks passed: DISPATCH ---
                         dispatch_delay = now - ready_at
