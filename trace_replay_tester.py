@@ -2778,33 +2778,33 @@ class TestOrchestrator:
 
                     for user_id, user, ready_at in ready_users:
                         # --- Layer 1: Inference admission (hardware guard rails) ---
+                        # Uses exponential backoff with jitter on repeated blocks.
+                        # This pushes persistently-blocked users behind others in the
+                        # queue, spreading load fairly across users.
                         in_flight_prefilling = self.in_flight_requests - self.in_flight_decoding
+                        blocked = False
+
                         if (self.config.max_prefill_concurrent > 0 and
                                 in_flight_prefilling >= self.config.max_prefill_concurrent):
-                            user.state = "rate_limited"
-                            user.rate_limit_until = now + 0.1
-                            user.rate_limit_count += 1
-                            user.total_rate_limit_count += 1
-                            self.period_admission_blocked += 1
-                            continue
-
-                        if (self.config.max_decode_concurrent > 0 and
+                            blocked = True
+                        elif (self.config.max_decode_concurrent > 0 and
                                 self.in_flight_decoding >= self.config.max_decode_concurrent):
-                            user.state = "rate_limited"
-                            user.rate_limit_until = now + 0.1
-                            user.rate_limit_count += 1
-                            user.total_rate_limit_count += 1
-                            self.period_admission_blocked += 1
-                            continue
-
-                        # Legacy max_concurrent_requests still applies
-                        if (self.config.max_concurrent_requests and
+                            blocked = True
+                        elif (self.config.max_concurrent_requests and
                                 self.in_flight_requests >= self.config.max_concurrent_requests):
-                            user.state = "rate_limited"
-                            user.rate_limit_until = now + 0.1
+                            blocked = True
+
+                        if blocked:
                             user.rate_limit_count += 1
                             user.total_rate_limit_count += 1
                             self.period_admission_blocked += 1
+                            # Exponential backoff: 0.2s base, 2x growth, cap 30s, ±25% jitter
+                            import random
+                            base_backoff = min(30.0, 0.2 * (2 ** (user.rate_limit_count - 1)))
+                            jitter = random.uniform(0.75, 1.25)
+                            backoff = base_backoff * jitter
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + backoff
                             continue
 
                         # --- Layer 2: Token budget check ---
