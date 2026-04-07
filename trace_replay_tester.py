@@ -3581,12 +3581,29 @@ async def main():
         logger.info(f"  Test Duration: {config.test_duration}s")
     if config.max_concurrent_requests:
         logger.info(f"  Max Concurrent Requests: {config.max_concurrent_requests}")
-    # New rate limiting config
-    if config.max_prefill_concurrent > 0 or config.max_decode_concurrent > 0:
-        logger.info(f"  Layer 1 (Inference): max_prefill={config.max_prefill_concurrent or 'unlimited'}, max_decode={config.max_decode_concurrent or 'unlimited'}")
-    if config.otpm_budget > 0 or config.itpm_budget > 0:
-        logger.info(f"  Layer 2 (Budgets): OTPM={config.otpm_budget or 'unlimited'}/min, ITPM={config.itpm_budget or 'unlimited'}/min")
-    logger.info(f"  SLO: TTFT ≤ {config.slo_ttft}s, Decode ≥ {config.slo_decode_tps} tok/s")
+    # Rate limiting summary
+    has_layer1 = config.max_prefill_concurrent > 0 or config.max_decode_concurrent > 0
+    has_layer2 = config.otpm_budget > 0 or config.itpm_budget > 0
+    has_any = has_layer1 or has_layer2 or bool(config.max_concurrent_requests)
+
+    if has_any:
+        logger.info(f"  Rate Limiting: ENABLED")
+        if has_layer1:
+            logger.info(f"    Layer 1 (Concurrency): max_prefill={config.max_prefill_concurrent or 'unlimited'}, "
+                       f"max_decode={config.max_decode_concurrent or 'unlimited'}")
+            logger.info(f"      → Limits how many requests prefill/decode simultaneously.")
+            logger.info(f"      → Blocked users get exponential backoff (0.2s → 30s cap).")
+        if has_layer2:
+            logger.info(f"    Layer 2 (Token Budgets): OTPM={config.otpm_budget or 'unlimited'}/min, "
+                       f"ITPM={config.itpm_budget or 'unlimited'}/min")
+            logger.info(f"      → Token bucket: refills continuously, pauses dispatch when empty.")
+            logger.info(f"      → ITPM counts only predicted cache-miss tokens (not cached input).")
+        if config.max_concurrent_requests:
+            logger.info(f"    Max Concurrent Requests: {config.max_concurrent_requests}")
+    else:
+        logger.info(f"  Rate Limiting: DISABLED (no concurrency or budget limits set)")
+        logger.info(f"    → All ready users dispatch immediately, no admission control.")
+    logger.info(f"  SLO Thresholds: TTFT ≤ {config.slo_ttft}s, Decode ≥ {config.slo_decode_tps} tok/s (for goodput calculation)")
     logger.info(f"  Cache Max Age: {config.cache_max_age}s")
     if config.warm_prefix_pct > 0:
         warm_tokens = int(config.warm_prefix_pct * stats.max_shared_prefix_tokens) if stats.max_shared_prefix_tokens > 0 else 0
