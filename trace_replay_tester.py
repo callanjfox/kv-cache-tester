@@ -2409,7 +2409,13 @@ class TestOrchestrator:
             effective_ttft_p95=np.percentile([m.effective_ttft for m in period_prefill_metrics], 95) if period_prefill_metrics else 0.0,
             service_rate=(users_with_requests / total_users * 100) if total_users > 0 else 0.0,
             requests_per_user_per_min=(len(period_completed_metrics) / total_users / (duration / 60)) if total_users > 0 and duration > 0 else 0.0,
-            goodput_effective_pct=(sum(1 for m in period_prefill_metrics if m.effective_ttft <= self.config.slo_ttft) / len(period_prefill_metrics) * 100) if period_prefill_metrics else 0.0,
+            goodput_effective_pct=(sum(
+                1 for m in period_prefill_metrics
+                if m.effective_ttft <= self.config.slo_ttft and (
+                    (m.ttlt - m.ttft) <= 0.1 or  # Very short decode — treat as meeting SLO
+                    m.output_tokens_actual / (m.ttlt - m.ttft) >= self.config.slo_decode_tps
+                )
+            ) / len(period_prefill_metrics) * 100) if period_prefill_metrics else 0.0,
         )
 
     def print_assessment(self, metrics: AssessmentPeriodMetrics):
