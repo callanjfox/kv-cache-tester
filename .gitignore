@@ -36,3 +36,5 @@ launcher/config.local.yaml
 # OS
 .DS_Store
 Thumbs.db
+traces_neon/trace_0045.json
+traces_neon/trace_0045.json
