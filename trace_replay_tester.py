@@ -1562,9 +1562,13 @@ class APIClient:
             if stream:
                 response = await self.client.chat.completions.create(**params)
 
+                _debug_logged = False
                 async for chunk in response:
                     if chunk.choices:
                         delta = chunk.choices[0].delta
+                        if not _debug_logged:
+                            logger.info(f"[DEBUG] First delta type={type(delta).__name__} attrs={vars(delta) if hasattr(delta, '__dict__') else dir(delta)}")
+                            _debug_logged = True
                         content_text = delta.content or ""
                         reasoning_text = getattr(delta, 'reasoning_content', None) or ""
                         chunk_text = content_text or reasoning_text
