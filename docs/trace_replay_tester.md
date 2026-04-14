@@ -18,7 +18,6 @@
 | **Working set limits** | `--max-working-set-tokens` caps total unique tokens across all users |
 | **Trace recycling** | `--recycle` replaces completed users with fresh traces |
 | **Deterministic seeds** | `--seed` for reproducible trace selection |
-| **Request pairs** | Handles streaming + non-streaming pairs with same hash_ids |
 | **Admission control** | `--max-concurrent-requests` limits in-flight requests |
 | **Warm prefix caching** | `--warm-prefix-pct` enables cross-conversation cache sharing |
 | **Sub-agent spawning** | Nested sub-agents replay as separate concurrent users |

@@ -415,7 +415,7 @@ def normalize_request(req: dict, base_time: float) -> dict:
     """Normalize a single request from new trace format to internal format."""
     result = {
         'timestamp': base_time + req.get('t', 0.0),
-        'type': 'streaming',  # Always streaming (ignore s/n distinction)
+        'type': {'s': 'streaming', 'n': 'non_streaming'}.get(req.get('type', ''), req.get('type', 'streaming')),
         'input_tokens': req.get('in', 0),
         'output_tokens': req.get('out', 0),
         'hash_ids': req.get('hash_ids', []),
@@ -560,8 +560,12 @@ class TraceManager:
         self.traces = []
         for trace in all_traces:
             if trace['requests']:
-                first_input = trace['requests'][0]['input_tokens']
-                num_requests = len(trace['requests'])
+                # Find the first non-subagent request for context size check
+                parent_requests = [r for r in trace['requests'] if r.get('type') != 'subagent']
+                if not parent_requests:
+                    continue
+                first_input = parent_requests[0]['input_tokens']
+                num_requests = len(parent_requests)
                 # Allow if first request fits and has enough requests
                 if first_input <= self.max_context and num_requests >= self.min_requests:
                     self.traces.append(trace)
@@ -1099,22 +1103,6 @@ def calculate_start_index(requests: list, rng: random.Random,
     return rng.randint(min_idx, max_idx)
 
 
-def adjust_for_request_pairs(requests: list, start_idx: int) -> int:
-    """Adjust index to avoid starting at second part of a request pair.
-
-    Request pairs (streaming + non-streaming) have identical hash_ids.
-    If we land on the second request, back up to the first.
-    """
-    if start_idx <= 0:
-        return start_idx
-
-    current = set(requests[start_idx].get('hash_ids', []))
-    prev = set(requests[start_idx - 1].get('hash_ids', []))
-
-    if current == prev and len(current) > 0:
-        return start_idx - 1
-    return start_idx
-
 
 def skip_subagent_markers(requests: list, start_idx: int) -> int:
     """Skip past any subagent markers at start position."""
@@ -1269,21 +1257,8 @@ class UserSession:
     def store_assistant_response(self, response_text: str, response_tokens: int, request: dict):
         """Store the actual assistant response.
 
-        For request pairs (streaming + non-streaming with same hash_ids),
-        only store after the non-streaming request to avoid double-counting.
-        Also tracks stored_response_tokens for accurate token generation in next request.
+        Tracks stored_response_tokens for accurate token generation in next request.
         """
-        current_hash_ids = set(request.get('hash_ids', []))
-
-        # Check if next request is a pair (same hash_ids)
-        next_idx = self.current_idx + 1
-        if next_idx < len(self.requests):
-            next_req = self.requests[next_idx]
-            next_hash_ids = set(next_req.get('hash_ids', []))
-            if current_hash_ids == next_hash_ids and next_req.get('type') == 'non_streaming':
-                # This is the streaming part of a pair - don't store yet
-                return
-
         # Store the actual response and track its token count
         # Skip empty responses — they poison the conversation and cause cascading failures
         if response_tokens > 0 and response_text:
@@ -1360,7 +1335,6 @@ class UserSession:
         """Build messages for this request.
 
         Uses hash_ids and input_tokens together:
-        - Same hash_ids as previous → re-send same content (request pair)
         - Many blocks removed (>10% pull-back) → reset to kept boundary, regenerate
         - Few blocks removed (normal boundary) → append new content
 
@@ -1408,11 +1382,6 @@ class UserSession:
             self.prev_request_hash_ids = current_hash_ids
             self.prev_input_tokens = current_input_tokens
 
-            return list(self.conversation), max_tokens
-
-        # Check if this is a request pair (identical hash_ids to previous)
-        if current_hash_ids == self.prev_request_hash_ids and len(current_hash_ids) > 0:
-            # Same content - re-send same conversation (cache hit test)
             return list(self.conversation), max_tokens
 
         # Analyze hash_id changes
@@ -1929,7 +1898,6 @@ class TestOrchestrator:
                 trace['requests'], self.trace_manager.rng,
                 self.config.advance_min, self.config.advance_max,
                 self.config.max_context)
-            start_idx = adjust_for_request_pairs(trace['requests'], start_idx)
             start_idx = skip_subagent_markers(trace['requests'], start_idx)
 
             if start_idx > 0 and start_idx < len(trace['requests']):
@@ -2608,7 +2576,6 @@ class TestOrchestrator:
             logger.debug(f"  📥 {user.user_id} req {user.current_idx + 1}: complete (TTFT: {ttft:.2f}s, {actual_output} output tokens, {ttlt:.2f}s total)")
 
         # Store actual assistant response for use in subsequent requests' history
-        # For request pairs, only store after the non-streaming request
         user.store_assistant_response(response_text, actual_output, request)
 
         # Track shortfall if output tokens significantly lower than expected (< 80%)
