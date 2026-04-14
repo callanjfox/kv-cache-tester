@@ -330,6 +330,16 @@ class AssessmentPeriodMetrics:
     dispatch_delay_max: float = 0.0  # Max seconds behind schedule
     in_flight_prefilling: int = 0  # Requests awaiting/in prefill at assessment time
     in_flight_decoding: int = 0  # Requests in decode phase at assessment time
+    # Cumulative (running) metrics across all periods
+    cumulative_ttft_avg: float = 0.0
+    cumulative_ttft_p50: float = 0.0
+    cumulative_ttft_p95: float = 0.0
+    cumulative_ttft_p99: float = 0.0
+    cumulative_requests_completed: int = 0
+    cumulative_requests_per_second: float = 0.0
+    cumulative_input_tokens_per_second: float = 0.0
+    cumulative_output_tokens_per_second: float = 0.0
+    cumulative_cache_hit_rate: float = 0.0
 
 
 # =============================================================================
@@ -2209,6 +2219,18 @@ class TestOrchestrator:
         # Count rate-limited users
         rate_limited_users = sum(1 for u in self.users.values() if u.state == "rate_limited")
 
+        # Compute cumulative (running) metrics across all completed requests
+        all_completed = [m for m in self.all_metrics if m.success]
+        total_elapsed = end_time - self.test_start_time if self.test_start_time else 1.0
+        total_elapsed = max(total_elapsed, 0.001)
+
+        all_ttfts = [m.ttft for m in all_completed if m.ttft > 0]
+        cum_total_input = sum(m.input_tokens for m in all_completed)
+        cum_total_output = sum(m.output_tokens_actual for m in all_completed)
+        cum_cache_hits = sum(m.cache_hit_blocks for m in all_completed)
+        cum_cache_misses = sum(m.cache_miss_blocks for m in all_completed)
+        cum_cache_total = cum_cache_hits + cum_cache_misses
+
         return AssessmentPeriodMetrics(
             period_number=period_number,
             start_time=start_time,
@@ -2244,7 +2266,16 @@ class TestOrchestrator:
             dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
-            in_flight_decoding=self.in_flight_decoding
+            in_flight_decoding=self.in_flight_decoding,
+            cumulative_ttft_avg=np.mean(all_ttfts) if all_ttfts else 0,
+            cumulative_ttft_p50=np.percentile(all_ttfts, 50) if all_ttfts else 0,
+            cumulative_ttft_p95=np.percentile(all_ttfts, 95) if all_ttfts else 0,
+            cumulative_ttft_p99=np.percentile(all_ttfts, 99) if all_ttfts else 0,
+            cumulative_requests_completed=len(all_completed),
+            cumulative_requests_per_second=len(all_completed) / total_elapsed,
+            cumulative_input_tokens_per_second=cum_total_input / total_elapsed,
+            cumulative_output_tokens_per_second=cum_total_output / total_elapsed,
+            cumulative_cache_hit_rate=cum_cache_hits / cum_cache_total if cum_cache_total > 0 else 0,
         )
 
     def print_assessment(self, metrics: AssessmentPeriodMetrics):
@@ -2282,8 +2313,11 @@ class TestOrchestrator:
             logger.info(f"  {metric_name}: {threshold_status} (threshold: {self.config.max_ttft}s)")
         else:
             logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
+        logger.info(f"  {metric_name} (cumulative): avg={metrics.cumulative_ttft_avg:.2f}s | p50={metrics.cumulative_ttft_p50:.2f}s | p95={metrics.cumulative_ttft_p95:.2f}s | p99={metrics.cumulative_ttft_p99:.2f}s ({metrics.cumulative_requests_completed} reqs)")
         logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
+        logger.info(f"  Throughput (cumulative): {metrics.cumulative_input_tokens_per_second:,.0f} input tok/s | {metrics.cumulative_output_tokens_per_second:,.0f} output tok/s | {metrics.cumulative_requests_per_second:.2f} req/s")
         logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
+        logger.info(f"  Cache Hit Rate (cumulative): {metrics.cumulative_cache_hit_rate:.1%}")
 
         # Show working set with budget status if limit is configured
         if self.config.max_working_set_tokens > 0:
