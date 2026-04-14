@@ -244,6 +244,7 @@ class TestConfig:
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
     advance_all_users: bool = False  # If True, advance all users; if False, only initial users
+    ignore_eos: bool = False  # If True, force generation of exact output_tokens (ignore EOS)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1427,9 +1428,11 @@ class APIClient:
                  temperature: Optional[float] = None,
                  top_p: Optional[float] = None,
                  top_k: Optional[int] = None,
-                 repetition_penalty: Optional[float] = None):
+                 repetition_penalty: Optional[float] = None,
+                 ignore_eos: bool = False):
         self.api_endpoint = api_endpoint
         self.model = model
+        self.ignore_eos = ignore_eos
 
         # Store user-specified overrides (None means use model defaults or auto-detect)
         self._user_temperature = temperature
@@ -1526,6 +1529,8 @@ class APIClient:
             extra_body["top_k"] = self.top_k
         if self.repetition_penalty is not None:
             extra_body["repetition_penalty"] = self.repetition_penalty
+        if self.ignore_eos:
+            extra_body["ignore_eos"] = True
 
         if extra_body:
             params["extra_body"] = extra_body
@@ -3144,6 +3149,11 @@ def parse_arguments():
     parser.add_argument("--advance-all-users", action="store_true", default=False,
                         help="Advance all users (including ramp-up). Default: only initial users are advanced")
 
+    # EOS control
+    parser.add_argument("--ignore-eos", action="store_true", default=False,
+                        help="Ignore EOS token and force generation of exact output_tokens from trace. "
+                             "Useful for consistent throughput benchmarking.")
+
     return parser.parse_args()
 
 
@@ -3197,7 +3207,8 @@ async def main():
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
         advance_max=args.advance_max,
-        advance_all_users=args.advance_all_users
+        advance_all_users=args.advance_all_users,
+        ignore_eos=args.ignore_eos
     )
 
     # Print header
@@ -3260,7 +3271,8 @@ async def main():
         temperature=config.temperature,
         top_p=config.top_p,
         top_k=config.top_k,
-        repetition_penalty=config.repetition_penalty
+        repetition_penalty=config.repetition_penalty,
+        ignore_eos=config.ignore_eos
     )
     await api_client.detect_model()
 
