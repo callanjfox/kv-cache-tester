@@ -271,9 +271,6 @@ class RequestMetrics:
     output_tokens_actual: int
     cache_hit_blocks: int
     cache_miss_blocks: int
-    # Hash_ids in this request that appeared anywhere earlier in the session
-    # (infinite-cache upper bound — independent of cache_hit_blocks).
-    theoretical_cache_hit_blocks: int = 0
     ttft: float
     ttlt: float
     itl: float
@@ -281,6 +278,9 @@ class RequestMetrics:
     delay_actual: float
     success: bool
     error_message: Optional[str] = None
+    # Hash_ids in this request that appeared anywhere earlier in the session
+    # (infinite-cache upper bound — independent of cache_hit_blocks).
+    theoretical_cache_hit_blocks: int = 0
     # Timestamps for period attribution
     request_start_time: float = 0.0  # When request was sent
     prefill_complete_time: float = 0.0  # When first token received (TTFT)
