@@ -201,6 +201,10 @@ class TraceStats:
     total_input_tokens: int
     traces_with_tool_use: int
     max_shared_prefix_tokens: int = 0  # Max(tool_tokens + system_tokens) across traces
+    # Theoretical cache-hit ceilings assuming an infinite cache. Purely a
+    # property of the trace data — independent of the replayer's replay mode.
+    theoretical_set_cache_hit_rate: float = 0.0     # any hash_id seen before → hit
+    theoretical_prefix_cache_hit_rate: float = 0.0  # longest hash_id prefix match per trace
 
 
 @dataclass
@@ -574,6 +578,50 @@ class TraceManager:
             system_tokens = trace['metadata'].get('system_tokens', 0)
             max_shared_prefix = max(max_shared_prefix, tool_tokens + system_tokens)
 
+        # Theoretical cache-hit ceilings — pure property of the trace data,
+        # independent of replay mode. "Infinite cache" assumption (every seen
+        # chunk stays cached forever). Useful as a North-Star the replayer can
+        # be compared against.
+        set_hit_blocks = 0
+        set_total_blocks = 0
+        prefix_hit_tokens = 0
+        prefix_total_tokens = 0
+        for trace in self.traces:
+            block_size = trace['metadata'].get('block_size', 64)
+            seen: Set[int] = set()
+            prior_seqs: List[tuple] = []
+            for req in trace['requests']:
+                if req.get('type') == 'subagent':
+                    continue
+                hash_ids = req.get('hash_ids', []) or []
+                # Set-cache: any hash_id seen before in this conversation → hit
+                for h in hash_ids:
+                    if h in seen:
+                        set_hit_blocks += 1
+                    set_total_blocks += 1
+                seen.update(hash_ids)
+
+                # Prefix-chain cache: longest prefix of this request's hash_ids
+                # that matches the prefix of any prior request in this trace.
+                hh = tuple(hash_ids)
+                best = 0
+                for p in prior_seqs:
+                    lim = min(len(hh), len(p))
+                    k = 0
+                    while k < lim and hh[k] == p[k]:
+                        k += 1
+                    if k > best:
+                        best = k
+                        if best == len(hh):
+                            break
+                in_tok = req.get('input_tokens', 0)
+                prefix_hit_tokens += min(best * block_size, in_tok)
+                prefix_total_tokens += in_tok
+                prior_seqs.append(hh)
+
+        set_ceiling = set_hit_blocks / set_total_blocks if set_total_blocks else 0.0
+        prefix_ceiling = prefix_hit_tokens / prefix_total_tokens if prefix_total_tokens else 0.0
+
         self.stats = TraceStats(
             total_traces=total_before_filter,
             filtered_traces=len(self.traces),
@@ -584,7 +632,9 @@ class TraceManager:
             max_input_tokens=max(input_tokens) if input_tokens else 0,
             total_input_tokens=sum(input_tokens),
             traces_with_tool_use=tool_use_count,
-            max_shared_prefix_tokens=max_shared_prefix
+            max_shared_prefix_tokens=max_shared_prefix,
+            theoretical_set_cache_hit_rate=set_ceiling,
+            theoretical_prefix_cache_hit_rate=prefix_ceiling,
         )
 
     def get_random_trace(self) -> Optional[dict]:
@@ -3355,6 +3405,9 @@ async def main():
     logger.info(f"  Avg cache hit rate: {stats.avg_cache_hit_rate:.1%}")
     logger.info(f"  Traces with tool_use: {stats.traces_with_tool_use}")
     logger.info(f"  Max shared prefix (tool+system): {stats.max_shared_prefix_tokens:,} tokens")
+    logger.info(f"  {Colors.BOLD}Theoretical cache-hit ceilings (infinite cache, within-trace):{Colors.ENDC}")
+    logger.info(f"    Set-based (any hash_id seen before):  {stats.theoretical_set_cache_hit_rate:.1%}")
+    logger.info(f"    Prefix-chain (hash-block mode ceiling): {stats.theoretical_prefix_cache_hit_rate:.1%}")
 
     logger.info(f"{'-' * 120}")
     logger.info(f"Configuration:")
