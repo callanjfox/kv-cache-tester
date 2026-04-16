@@ -19,6 +19,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -266,6 +267,8 @@ def main():
                         help="Tool definition token count for trace metadata (default: 0)")
     parser.add_argument("--system-tokens", type=int, default=0,
                         help="System prompt token count for trace metadata (default: 0)")
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="Parallel workers for DB fetch + trace build/write (default: 8)")
     args = parser.parse_args()
 
     # Connect to DB
@@ -291,25 +294,38 @@ def main():
         conn.close()
         return
 
-    # Fetch all requests for all sessions
-    print(f"Fetching requests...")
-    all_requests = []
-    for session_id, req_count in sessions:
-        requests = fetch_session_requests(conn, session_id)
-        all_requests.append(requests)
-        print(f"  Session {session_id[:12]}... : {len(requests)} requests")
-
     conn.close()
 
-    # Build global hash_id mapping
+    # Fetch all requests in parallel — each worker gets its own connection
+    print(f"Fetching requests with {args.num_workers} workers...")
+    all_requests = [None] * len(sessions)
+
+    def _fetch(idx_and_session):
+        idx, (session_id, _) = idx_and_session
+        worker_conn = connect_db(database_url)
+        try:
+            return idx, session_id, fetch_session_requests(worker_conn, session_id)
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+        futures = [pool.submit(_fetch, item) for item in enumerate(sessions)]
+        for done, fut in enumerate(as_completed(futures), 1):
+            idx, session_id, requests = fut.result()
+            all_requests[idx] = requests
+            print(f"  [{done}/{len(sessions)}] {session_id[:12]}... : {len(requests)} requests")
+
+    # Build global hash_id mapping — must be serial since it assigns sequential IDs
     print(f"Building global hash_id mapping...")
     hash_map = build_hash_id_map(all_requests)
     print(f"  {len(hash_map)} unique hash_ids across all sessions")
 
-    # Build and write traces
-    print(f"Building traces...")
+    # Build and write traces in parallel
+    print(f"Building traces with {args.num_workers} workers...")
     total_requests = 0
-    for i, ((session_id, _), requests) in enumerate(zip(sessions, all_requests)):
+
+    def _build_and_write(i_sess_reqs):
+        i, (session_id, _), requests = i_sess_reqs
         trace = build_trace(
             session_id=session_id,
             requests=requests,
@@ -320,11 +336,19 @@ def main():
             tool_tokens=args.tool_tokens,
             system_tokens=args.system_tokens,
         )
-        if trace:
-            filepath = write_trace(trace, output_dir)
-            n_reqs = len(trace["requests"])
+        if not trace:
+            return None
+        filepath = write_trace(trace, output_dir)
+        return trace["id"], len(trace["requests"]), filepath
+
+    with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+        items = [(i, sess, reqs) for i, (sess, reqs) in enumerate(zip(sessions, all_requests))]
+        for result in pool.map(_build_and_write, items):
+            if result is None:
+                continue
+            trace_id, n_reqs, filepath = result
             total_requests += n_reqs
-            print(f"  {trace['id']}: {n_reqs} requests → {filepath}")
+            print(f"  {trace_id}: {n_reqs} requests → {filepath}")
 
     # Summary
     print(f"\nDone!")

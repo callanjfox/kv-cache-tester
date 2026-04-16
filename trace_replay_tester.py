@@ -245,6 +245,10 @@ class TestConfig:
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
     advance_all_users: bool = False  # If True, advance all users; if False, only initial users
     ignore_eos: bool = False  # If True, force generation of exact output_tokens (ignore EOS)
+    # Hash-block mode: deterministic per-request content keyed by hash_ids,
+    # bypassing pullback/growth heuristics. Intended for traces with interleaved
+    # subagent requests (e.g. neon traces) where sequential hash_id diffs are noisy.
+    hash_block_mode: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -454,8 +458,11 @@ def normalize_trace(trace: dict) -> dict:
 class TraceManager:
     """Manages loading and sampling of conversation traces"""
 
-    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, seed: Optional[int] = None):
+    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, seed: Optional[int] = None,
+                 hf_dataset: Optional[str] = None, hf_split: str = "train"):
         self.trace_dir = trace_dir
+        self.hf_dataset = hf_dataset
+        self.hf_split = hf_split
         self.max_context = max_context
         self.min_requests = min_requests
         self.seed = seed
@@ -472,24 +479,41 @@ class TraceManager:
         self.rng = random.Random(seed) if seed is not None else random.Random()
 
     def load_traces(self) -> int:
-        """Load all traces from directory and filter by max_context"""
-        logger.info(f"Loading traces from {self.trace_dir}...")
-
+        """Load all traces from directory or HF dataset and filter by max_context"""
         all_traces = []
-        trace_files = list(self.trace_dir.glob("*.json"))
 
-        if not trace_files:
-            raise ValueError(f"No trace files found in {self.trace_dir}")
-
-        for filepath in trace_files:
+        if self.hf_dataset:
+            logger.info(f"Loading traces from Hugging Face dataset {self.hf_dataset} (split={self.hf_split})...")
             try:
-                with open(filepath) as f:
-                    trace = json.load(f)
-                    trace = normalize_trace(trace)  # Convert new format to internal format
-                    trace['_filepath'] = str(filepath)
+                from datasets import load_dataset
+            except ImportError:
+                raise ImportError("datasets package required for --hf-dataset. Install with: pip install datasets")
+
+            ds = load_dataset(self.hf_dataset, split=self.hf_split)
+            for i, row in enumerate(ds):
+                try:
+                    trace = dict(row)
+                    trace = normalize_trace(trace)
+                    trace['_filepath'] = f"{self.hf_dataset}[{self.hf_split}][{i}]"
                     all_traces.append(trace)
-            except Exception as e:
-                logger.warning(f"Failed to load {filepath}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to normalize row {i} from {self.hf_dataset}: {e}")
+        else:
+            logger.info(f"Loading traces from {self.trace_dir}...")
+            trace_files = list(self.trace_dir.glob("*.json"))
+
+            if not trace_files:
+                raise ValueError(f"No trace files found in {self.trace_dir}")
+
+            for filepath in trace_files:
+                try:
+                    with open(filepath) as f:
+                        trace = json.load(f)
+                        trace = normalize_trace(trace)  # Convert new format to internal format
+                        trace['_filepath'] = str(filepath)
+                        all_traces.append(trace)
+                except Exception as e:
+                    logger.warning(f"Failed to load {filepath}: {e}")
 
         # Filter by max context and min requests
         self.traces = []
@@ -921,6 +945,51 @@ class SyntheticMessageGenerator:
         self._ensure_user_text_pool()
         return self._get_from_pool(self._user_text_pool_tokens, num_tokens, seed)
 
+    def generate_hash_block_content(self, hash_ids: List[int], total_tokens: int,
+                                    block_size: int = 64) -> str:
+        """Build deterministic content from hash_ids, "fill the hash blocks" style.
+
+        Each hash_id maps to a fixed-size chunk of pool tokens seeded by the
+        hash_id itself. Chunks are concatenated IN ORDER starting at position 0;
+        any shortfall is padded with hash-id-set-seeded text.
+
+        Invariant: two requests whose hash_ids share a prefix produce text that
+        shares a prefix — so the inference engine's prefix cache hits naturally
+        on the overlap, with no PULLBACK/GROWTH detection required.
+        """
+        self._ensure_user_text_pool()
+        self.load_tokenizer()
+
+        pool = self._user_text_pool_tokens
+        if not pool:
+            return ""
+
+        max_offset = max(0, len(pool) - block_size - 1)
+
+        tokens: List[int] = []
+        for hid in hash_ids:
+            # Seed by hash_id only → same hash_id yields the same chunk everywhere
+            np.random.seed(int(hid) & 0x7FFFFFFF)
+            offset = np.random.randint(0, max_offset) if max_offset > 0 else 0
+            tokens.extend(pool[offset:offset + block_size])
+
+        # Exact-length fit to match the trace's input_tokens.
+        # Truncate: drops from the tail — the HEAD (hash-keyed prefix) stays intact,
+        # preserving the prefix-cache property.
+        if len(tokens) >= total_tokens:
+            tokens = tokens[:total_tokens]
+        else:
+            need = total_tokens - len(tokens)
+            # Padding seed is keyed by the full hash_id set, so two requests with
+            # the same hash_ids get the same padding → cache hit on whole request.
+            pad_seed = (sum(int(h) for h in hash_ids) + 0x9E3779B9) & 0x7FFFFFFF
+            np.random.seed(pad_seed)
+            pad_max = max(0, len(pool) - need - 1)
+            pad_off = np.random.randint(0, pad_max) if pad_max > 0 else 0
+            tokens.extend(pool[pad_off:pad_off + need])
+
+        return self.tokenizer.decode(tokens)
+
     def generate_tool_result(self, num_tokens: int, seed: int) -> str:
         """Generate tool execution output (file contents, bash output, etc.)."""
         self._ensure_tool_result_pool()
@@ -1081,11 +1150,13 @@ class UserSession:
     but we don't need to reconstruct individual messages - just hit the token targets.
     """
 
-    def __init__(self, user_id: str, trace: dict, generator: SyntheticMessageGenerator, max_context: int):
+    def __init__(self, user_id: str, trace: dict, generator: SyntheticMessageGenerator, max_context: int,
+                 hash_block_mode: bool = False):
         self.user_id = user_id
         self.trace = trace
         self.generator = generator
         self.max_context = max_context
+        self.hash_block_mode = hash_block_mode
 
         self.trace_id = trace['metadata']['conversation_id']
         self.requests = trace['requests']
@@ -1281,6 +1352,27 @@ class UserSession:
         max_tokens = max(1, request.get('output_tokens', 100))
         current_hash_ids = set(request.get('hash_ids', []))
         current_input_tokens = request.get('input_tokens', 0)
+
+        # Hash-block mode: deterministic content keyed purely by hash_ids.
+        # No conversation carry-over, no pullback/growth detection — prefix cache
+        # hits fall out automatically from prefix-overlapping hash_id lists.
+        if self.hash_block_mode:
+            ordered_hash_ids = request.get('hash_ids', []) or []
+            block_size = self.trace['metadata'].get('block_size', 64)
+            if ordered_hash_ids:
+                content = self.generator.generate_hash_block_content(
+                    ordered_hash_ids, current_input_tokens, block_size
+                )
+            else:
+                # No hash_ids (rare) — fall back to per-user-per-request synthetic text
+                seed = hash(f"{self.user_id}_{self.current_idx}_nohash") % (2**32)
+                content = self.generator.generate_user_text(max(1, current_input_tokens), seed)
+            self.conversation = [{"role": "user", "content": content}]
+            self.prev_request_hash_ids = current_hash_ids
+            self.prev_input_tokens = current_input_tokens
+            self.stored_response_tokens = 0
+            self.token_shortfall = 0
+            return list(self.conversation), max_tokens
 
         # For first request with warm prefix enabled - use canonical shared prefix
         if self.current_idx == 0 and canonical_prefix and canonical_prefix_tokens > 0:
@@ -1762,7 +1854,8 @@ class TestOrchestrator:
         self.user_counter += 1
         user_id = f"User-{self.user_counter:03d}"
 
-        user = UserSession(user_id, trace, self.generator, self.config.max_context)
+        user = UserSession(user_id, trace, self.generator, self.config.max_context,
+                           hash_block_mode=self.config.hash_block_mode)
         user.start_time = time.time()
 
         # Apply trace advancement if configured and allowed for this user
@@ -1899,7 +1992,8 @@ class TestOrchestrator:
             'requests': subagent_entry['requests'],
         })
 
-        sa_user = UserSession(sa_id, sa_trace, parent.generator, parent.max_context)
+        sa_user = UserSession(sa_id, sa_trace, parent.generator, parent.max_context,
+                              hash_block_mode=parent.hash_block_mode)
         sa_user.is_subagent = True
         sa_user.parent_user_id = parent.user_id
         sa_user.start_time = time.time()
@@ -3043,8 +3137,13 @@ def parse_arguments():
     # Required arguments
     parser.add_argument("--api-endpoint", type=str, required=True,
                         help="API server endpoint (e.g., http://localhost:8000)")
-    parser.add_argument("--trace-directory", type=str, required=True,
-                        help="Directory containing trace JSON files")
+    parser.add_argument("--trace-directory", type=str, default=None,
+                        help="Directory containing trace JSON files (required unless --hf-dataset is set)")
+    parser.add_argument("--hf-dataset", type=str, default=None,
+                        help="Hugging Face dataset repo ID to load traces from (e.g. semianalysisai/cc-traces-0). "
+                             "Mutually exclusive with --trace-directory.")
+    parser.add_argument("--hf-split", type=str, default="train",
+                        help="Split to use when loading from --hf-dataset (default: train)")
     parser.add_argument("--output-dir", type=str, required=True,
                         help="Output directory for results")
 
@@ -3150,6 +3249,14 @@ def parse_arguments():
                         help="Ignore EOS token and force generation of exact output_tokens from trace. "
                              "Useful for consistent throughput benchmarking.")
 
+    # Hash-block replay mode
+    parser.add_argument("--hash-block-mode", action="store_true", default=False,
+                        help="Build each request's prompt deterministically from hash_ids ("
+                             "\"fill the hash blocks\"). Bypasses pullback/growth heuristics — use "
+                             "for neon/interleaved-subagent traces where sequential hash_id diffs "
+                             "are noisy. Prefix-overlapping hash_ids produce prefix-identical text, "
+                             "so prefix-cache hits fall out naturally.")
+
     return parser.parse_args()
 
 
@@ -3159,6 +3266,12 @@ def parse_arguments():
 
 async def main():
     args = parse_arguments()
+
+    # Validate trace source
+    if args.hf_dataset and args.trace_directory:
+        raise ValueError("--trace-directory and --hf-dataset are mutually exclusive")
+    if not args.hf_dataset and not args.trace_directory:
+        raise ValueError("Either --trace-directory or --hf-dataset must be provided")
 
     # Disable colors if requested
     if args.no_color:
@@ -3204,16 +3317,29 @@ async def main():
         advance_min=args.advance_min,
         advance_max=args.advance_max,
         advance_all_users=args.advance_all_users,
-        ignore_eos=args.ignore_eos
+        ignore_eos=args.ignore_eos,
+        hash_block_mode=args.hash_block_mode,
     )
 
     # Print header
     logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
     logger.info(f"{Colors.PHASE}{Colors.BOLD}Trace Replay Performance Tester v{__version__}{Colors.ENDC}")
     logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+    if config.hash_block_mode:
+        logger.info(f"{Colors.BOLD}Replay mode: hash-block (deterministic per-request content from hash_ids){Colors.ENDC}")
+    else:
+        logger.info(f"Replay mode: conversational (pullback/growth heuristics)")
 
-    # Load traces
-    trace_manager = TraceManager(Path(config.trace_directory), config.max_context, config.min_requests, config.seed)
+    # Load traces (from local directory or HF dataset)
+    trace_dir_arg = Path(config.trace_directory) if config.trace_directory else None
+    trace_manager = TraceManager(
+        trace_dir_arg,
+        config.max_context,
+        config.min_requests,
+        config.seed,
+        hf_dataset=args.hf_dataset,
+        hf_split=args.hf_split,
+    )
     num_traces = trace_manager.load_traces()
 
     if num_traces == 0:
