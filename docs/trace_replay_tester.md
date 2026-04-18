@@ -194,6 +194,18 @@ With `hash_id_scope: "global"` traces, sub-agents sharing the same tool definiti
 | `*.html` | Plotly visualizations |
 | `index.html` | Dashboard (via generate_index.py) |
 
+## End-of-Test Summary
+
+The summary printed at the end of a test includes an SLO compliance breakdown based on `--slo-ttft` and `--slo-decode-tps`:
+
+- **TTFT met**: requests with TTFT ≤ threshold
+- **Decode met**: requests where decode throughput ≥ threshold (very short decodes auto-pass)
+- **Goodput (both)**: requests meeting both SLOs
+- **Effective TTFT met**: requests where (queue_time + TTFT) ≤ threshold — captures user-experienced latency including admission queue
+- **Effective goodput**: requests meeting both effective TTFT and decode SLOs
+
+A per-period log line `Users: N total (X active, Y idle, Z rate-limited, W ran requests)` shows the full user state breakdown summing to the total user count. When no requests complete prefill in a period, input tokens/s and cache hit rate display `⏳ No data` rather than `0` to distinguish "no signal" from "genuinely zero".
+
 ## Trace Format
 
 Traces should be JSON files with this structure:
@@ -418,3 +430,5 @@ After all gates pass:
 When set, new users start partway through their traces (e.g., `--advance-min 0.3 --advance-max 0.6` starts users 30-60% through). This simulates users joining with existing conversation history and tests cache performance under realistic working set growth.
 
 By default, only the initial users (`--start-users`) are advanced. Users added later via ramp-up or recycling start from the beginning, simulating fresh conversations. Use `--advance-all-users` to advance everyone.
+
+Advance positions are deterministic per-user given `--trace-seed` (or `--seed`). The same user_id will always land at the same trace position across runs, regardless of dispatch timing.
