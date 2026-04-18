@@ -2776,7 +2776,6 @@ class TestOrchestrator:
                             user.total_rate_limit_count += 1
                             self.period_admission_blocked += 1
                             # Exponential backoff: 0.2s base, 2x growth, cap 30s, ±25% jitter
-                            import random
                             base_backoff = min(30.0, 0.2 * (2 ** (user.rate_limit_count - 1)))
                             jitter = random.uniform(0.75, 1.25)
                             backoff = base_backoff * jitter
@@ -2785,26 +2784,37 @@ class TestOrchestrator:
                             continue
 
                         # --- Layer 2: Token budget check ---
-                        # Budget exhaustion is a system-wide condition, not per-user.
-                        # If budget is empty, STOP dispatching this cycle (break).
-                        # Users stay idle with their queue position preserved.
-                        # The bucket refills continuously; next cycle may have capacity.
+                        # Per-user rate limiting matching Layer 1 behavior. When budget
+                        # is insufficient for this user's predicted cost, mark this user
+                        # as rate_limited with exponential backoff and continue to the
+                        # next ready user. Smaller users may still dispatch when the
+                        # budget has remaining capacity but isn't enough for larger ones.
                         predicted_misses = self.predict_user_cache_misses(user)
                         itpm_cost = max(0, predicted_misses * self.config.chunk_size)
                         req = user.requests[user.current_idx] if user.current_idx < len(user.requests) else {}
                         otpm_cost = max(0, req.get('out', req.get('output_tokens', 100)))
 
+                        budget_blocked = False
                         if self.itpm_bucket and itpm_cost > 0:
                             self.itpm_bucket.refill()
                             if self.itpm_bucket.tokens < itpm_cost:
-                                self.period_rate_limit_ttft += 1
-                                break  # Budget empty — stop dispatching, try next cycle
+                                budget_blocked = True
 
-                        if self.otpm_bucket and otpm_cost > 0:
+                        if not budget_blocked and self.otpm_bucket and otpm_cost > 0:
                             self.otpm_bucket.refill()
                             if self.otpm_bucket.tokens < otpm_cost:
-                                self.period_rate_limit_ttft += 1
-                                break  # Budget empty — stop dispatching, try next cycle
+                                budget_blocked = True
+
+                        if budget_blocked:
+                            user.rate_limit_count += 1
+                            user.total_rate_limit_count += 1
+                            self.period_rate_limit_ttft += 1
+                            base_backoff = min(30.0, 0.2 * (2 ** (user.rate_limit_count - 1)))
+                            jitter = random.uniform(0.75, 1.25)
+                            backoff = base_backoff * jitter
+                            user.state = "rate_limited"
+                            user.rate_limit_until = now + backoff
+                            continue
 
                         # Both budgets have capacity — consume atomically
                         if self.itpm_bucket and itpm_cost > 0:

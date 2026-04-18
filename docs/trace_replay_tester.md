@@ -98,7 +98,13 @@ python trace_replay_tester.py \
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--max-concurrent-requests` | 50 | Max in-flight requests (0 = unlimited) |
+| `--max-prefill-concurrent` | 0 | Max requests in prefill phase (0 = unlimited) |
+| `--max-decode-concurrent` | 0 | Max requests in decode phase (0 = unlimited) |
+| `--itpm-budget` | 0 | Input tokens per minute budget (0 = unlimited) |
+| `--otpm-budget` | 0 | Output tokens per minute budget (0 = unlimited) |
 | `--enable-request-rate-limiting` | false | Rate-limit dispatch when TTFT exceeds threshold |
+
+When any concurrency limit (Layer 1) or token budget (Layer 2) blocks a user, that user is individually placed into the `rate_limited` state with exponential backoff (0.2s base, 2x growth, 30s cap, ±25% jitter) and the dispatch loop continues to the next ready user. This matches production rate-limiting behavior — each user backs off independently rather than the entire dispatch cycle stalling. Smaller users may still dispatch when the budget has remaining capacity but isn't enough for a larger request ahead of them.
 
 ### Cross-Conversation Cache Sharing
 
