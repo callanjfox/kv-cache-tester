@@ -2435,8 +2435,11 @@ class TestOrchestrator:
             logger.info(f"  {metric_name}: {threshold_status} (threshold: {self.config.max_ttft}s)")
         else:
             logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
-        logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
-        logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
+        has_prefill_data = len(self.period_metrics) > 0
+        input_tps_str = f"{metrics.input_tokens_per_second:,.0f} input tok/s" if has_prefill_data else "⏳ No data input tok/s"
+        logger.info(f"  Throughput: {input_tps_str} | {metrics.output_tokens_per_second:,.0f} output tok/s")
+        cache_str = f"{metrics.avg_cache_hit_rate:.1%}" if has_prefill_data else "⏳ No data"
+        logger.info(f"  Workload Cache Hit Rate: {cache_str} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
 
         # Show working set with budget status if limit is configured
         if self.config.max_working_set_tokens > 0:
