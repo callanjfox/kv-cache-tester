@@ -2424,12 +2424,14 @@ class TestOrchestrator:
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}Assessment Period {metrics.period_number}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        total_users = metrics.active_users + metrics.idle_users
-        rl_count = metrics.rate_limited_users
-        if rl_count > 0:
-            logger.info(f"  Users: {total_users + rl_count} total ({metrics.users_with_requests} active, {rl_count} rate-limited)")
-        else:
-            logger.info(f"  Users: {total_users} total ({metrics.users_with_requests} active this period)")
+        active = metrics.active_users
+        idle = metrics.idle_users
+        rl = metrics.rate_limited_users
+        total = active + idle + rl
+        parts = [f"{active} active", f"{idle} idle"]
+        if rl > 0:
+            parts.append(f"{rl} rate-limited")
+        logger.info(f"  Users: {total} total ({', '.join(parts)}, {metrics.users_with_requests} ran requests)")
         logger.info(f"  Requests: {metrics.requests_launched} launched | {metrics.requests_completed} completed ({metrics.requests_completed_new} new, {metrics.requests_completed_prior} prior) | {metrics.requests_in_progress} in-progress ({metrics.requests_in_progress_new} new, {metrics.requests_in_progress_prior} prior) ({metrics.requests_per_second:.2f} req/s)")
         if measured_ttft is None:
             logger.info(f"  {metric_name}: {threshold_status} (threshold: {self.config.max_ttft}s)")
