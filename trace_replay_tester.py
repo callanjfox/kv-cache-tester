@@ -1795,6 +1795,7 @@ class TestOrchestrator:
         self.in_flight_decoding: int = 0  # Requests that have received first token (in decode phase)
         self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
+        self.period_rate_limited_user_ids: set = set()  # Users rate-limited at any point this period
 
         # Rolling TTFT window for ramp and rate limiting decisions
         self.ttft_history: deque = deque(maxlen=self.config.ttft_window)
@@ -2433,14 +2434,24 @@ class TestOrchestrator:
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}Assessment Period {metrics.period_number}{Colors.ENDC}")
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        active = metrics.active_users
-        idle = metrics.idle_users
-        rl = metrics.rate_limited_users
-        total = active + idle + rl
-        parts = [f"{active} active", f"{idle} idle"]
-        if rl > 0:
-            parts.append(f"{rl} rate-limited")
-        logger.info(f"  Users: {total} total ({', '.join(parts)}, {metrics.users_with_requests} ran requests)")
+        # Categorize users with priority: rate-limited (any time this period)
+        # > active (had requests or in-flight) > idle (nothing this period).
+        did_work = set(m.user_id for m in self.period_metrics)
+        rl_any = self.period_rate_limited_user_ids | {
+            u.user_id for u in self.users.values() if u.state == "rate_limited"
+        }
+        active_count = 0
+        idle_count = 0
+        rl_count = 0
+        for user in self.users.values():
+            if user.user_id in rl_any:
+                rl_count += 1
+            elif user.state == "active" or user.user_id in did_work:
+                active_count += 1
+            else:
+                idle_count += 1
+        total = active_count + idle_count + rl_count
+        logger.info(f"  Users: {total} total ({active_count} active, {idle_count} idle, {rl_count} rate-limited)")
         logger.info(f"  Requests: {metrics.requests_launched} launched | {metrics.requests_completed} completed ({metrics.requests_completed_new} new, {metrics.requests_completed_prior} prior) | {metrics.requests_in_progress} in-progress ({metrics.requests_in_progress_new} new, {metrics.requests_in_progress_prior} prior) ({metrics.requests_per_second:.2f} req/s)")
         if measured_ttft is None:
             logger.info(f"  {metric_name}: {threshold_status} (threshold: {self.config.max_ttft}s)")
@@ -2798,6 +2809,7 @@ class TestOrchestrator:
                             backoff = base_backoff * jitter
                             user.state = "rate_limited"
                             user.rate_limit_until = now + backoff
+                            self.period_rate_limited_user_ids.add(user_id)
                             continue
 
                         # --- Layer 2: Token budget check ---
@@ -2831,6 +2843,7 @@ class TestOrchestrator:
                             backoff = base_backoff * jitter
                             user.state = "rate_limited"
                             user.rate_limit_until = now + backoff
+                            self.period_rate_limited_user_ids.add(user_id)
                             continue
 
                         # Both budgets have capacity — consume atomically
@@ -2944,6 +2957,7 @@ class TestOrchestrator:
                     self.period_slo_ttft_met = 0
                     self.period_slo_decode_met = 0
                     self.period_slo_total = 0
+                    self.period_rate_limited_user_ids = set()
 
         except KeyboardInterrupt:
             logger.info(f"\n{Colors.WARNING}Test interrupted by user{Colors.ENDC}")
