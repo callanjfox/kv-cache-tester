@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Per-user ITPM/OTPM rate limiting**: `--itpm-budget` and `--otpm-budget` now mark individual users as `rate_limited` (with exponential backoff + jitter) when their predicted cost exceeds the budget, instead of stalling the entire dispatch loop. Matches production behavior and Layer 1 concurrency limits. Smaller users can still dispatch when the bucket has remaining capacity but isn't enough for a larger user ahead of them.
+- **SLO compliance summary at end of test**: Test summary now reports `TTFT met`, `Decode met`, `Goodput (both)`, `Effective TTFT met` (includes queue time), and `Effective goodput` with counts and percentages. Driven by `--slo-ttft` and `--slo-decode-tps`.
+- **Reproducible trace advancement**: Per-user advance position is now derived from `--seed` via a stable SHA-256 hash of the user_id, making advance positions deterministic regardless of API timing or PYTHONHASHSEED.
 - **Sub-agent spawning**: Sub-agent traces are now replayed as separate concurrent users instead of being flattened into the parent timeline. The parent pauses while sub-agents run, matching real Claude Code behavior. Eliminates cache thrashing from context switching (20% → 95% server-side cache hit rate).
 - **Timing strategies** (`--timing-strategy`): Separate API processing time from client think time for flexible replay:
   - `think-only` (**default**): Client think time only — requests fire as fast as the server can process them, with real client delays (tool execution, user reading) preserved
@@ -28,6 +31,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Time-windowed working set tracking**: Working set display shows 1m, 5m, 15m windows
 
 ### Changed
+- **Period user state display**: Replaced snapshot-based display (`active, idle, rate-limited, N ran requests`) with period-wide mutually-exclusive categories summing to total: `active, idle, rate-limited`. Priority: rate-limited (any time this period) > active (had requests or in-flight) > idle. Rate-limited count is always shown (including `0`) so the presence of rate limiting is always visible.
+- **"No data" display for throughput metrics**: Input tok/s, output tok/s, and workload cache hit rate now display `⏳ No data` (matching existing TTFT pattern) when no prefill data or decode chunks are observed in a period, instead of displaying `0`.
+- **Curated v8 trace set**: Replaced 522 paired traces with 739 curated unpaired traces. Filters: removed single-request, >900K-token, <60% cache rate, and frequent-compaction (>5% pullbacks) conversations. Traces now use `one request per turn` format (proxy bug fixed upstream in seifghazi/claude-code-proxy#33).
 - **Diverse vocabulary for synthetic text generation**: Replaced ~92-word vocabulary with ~2,000 unique terms across 20 topic domains (web frontend, backend/API, database, DevOps, cloud, Python, JavaScript, data science, testing, security, networking, git, Linux/shell, monitoring, performance, documentation, build systems, storage, message queues, mobile). Uses topic-based templates to generate realistic prompts. Affects all three testers: `trace_replay_tester.py`, `single_prompt_tester.py`, and `cache_rate_tester.py`. New shared `vocabulary.py` module.
 - **Default timing strategy changed to `think-only`**: Requests fire as fast as the server can handle, with only real client delays preserved.
 - **Default `--ttft-metric` changed from `p95` to `avg`**: Average TTFT is more practical for ramp decisions.

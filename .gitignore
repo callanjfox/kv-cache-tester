@@ -24,6 +24,8 @@ output_*/
 single_prompt_output/
 cacherate_*/
 workingset_*/
+results/
+tmp/
 *.log
 
 # Local configuration (contains machine-specific paths)

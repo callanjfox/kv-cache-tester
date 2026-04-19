@@ -18,7 +18,6 @@
 | **Working set limits** | `--max-working-set-tokens` caps total unique tokens across all users |
 | **Trace recycling** | `--recycle` replaces completed users with fresh traces |
 | **Deterministic seeds** | `--seed` for reproducible trace selection |
-| **Request pairs** | Handles streaming + non-streaming pairs with same hash_ids |
 | **Admission control** | `--max-concurrent-requests` limits in-flight requests |
 | **Warm prefix caching** | `--warm-prefix-pct` enables cross-conversation cache sharing |
 | **Sub-agent spawning** | Nested sub-agents replay as separate concurrent users |
@@ -99,7 +98,13 @@ python trace_replay_tester.py \
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--max-concurrent-requests` | 50 | Max in-flight requests (0 = unlimited) |
+| `--max-prefill-concurrent` | 0 | Max requests in prefill phase (0 = unlimited) |
+| `--max-decode-concurrent` | 0 | Max requests in decode phase (0 = unlimited) |
+| `--itpm-budget` | 0 | Input tokens per minute budget (0 = unlimited) |
+| `--otpm-budget` | 0 | Output tokens per minute budget (0 = unlimited) |
 | `--enable-request-rate-limiting` | false | Rate-limit dispatch when TTFT exceeds threshold |
+
+When any concurrency limit (Layer 1) or token budget (Layer 2) blocks a user, that user is individually placed into the `rate_limited` state with exponential backoff (0.2s base, 2x growth, 30s cap, ±25% jitter) and the dispatch loop continues to the next ready user. This matches production rate-limiting behavior — each user backs off independently rather than the entire dispatch cycle stalling. Smaller users may still dispatch when the budget has remaining capacity but isn't enough for a larger request ahead of them.
 
 ### Cross-Conversation Cache Sharing
 
@@ -188,6 +193,23 @@ With `hash_id_scope: "global"` traces, sub-agents sharing the same tool definiti
 | `progress.json` | Resume state |
 | `*.html` | Plotly visualizations |
 | `index.html` | Dashboard (via generate_index.py) |
+
+## End-of-Test Summary
+
+The summary printed at the end of a test includes an SLO compliance breakdown based on `--slo-ttft` and `--slo-decode-tps`:
+
+- **TTFT met**: requests with TTFT ≤ threshold
+- **Decode met**: requests where decode throughput ≥ threshold (very short decodes auto-pass)
+- **Goodput (both)**: requests meeting both SLOs
+- **Effective TTFT met**: requests where (queue_time + TTFT) ≤ threshold — captures user-experienced latency including admission queue
+- **Effective goodput**: requests meeting both effective TTFT and decode SLOs
+
+A per-period log line `Users: N total (X active, Y idle, Z rate-limited)` shows the user state breakdown summing to the total. Categories are mutually exclusive with priority rate-limited > active > idle:
+- **Rate-limited**: user was rate-limited at any point during this period
+- **Active**: had a request complete or is currently in-flight this period
+- **Idle**: everything else
+
+When no requests complete prefill in a period, input tokens/s, output tokens/s, and cache hit rate display `⏳ No data` rather than `0` to distinguish "no signal" from "genuinely zero".
 
 ## Trace Format
 
@@ -413,3 +435,5 @@ After all gates pass:
 When set, new users start partway through their traces (e.g., `--advance-min 0.3 --advance-max 0.6` starts users 30-60% through). This simulates users joining with existing conversation history and tests cache performance under realistic working set growth.
 
 By default, only the initial users (`--start-users`) are advanced. Users added later via ramp-up or recycling start from the beginning, simulating fresh conversations. Use `--advance-all-users` to advance everyone.
+
+Advance positions are deterministic per-user given `--trace-seed` (or `--seed`). The same user_id will always land at the same trace position across runs, regardless of dispatch timing.

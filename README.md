@@ -56,21 +56,37 @@ uv run python trace_replay_tester.py \
 
 ### Included Traces
 
-The `traces/` directory contains **522 anonymized agentic coding traces** with **100,186 requests**, including 23 traces with nested sub-agent conversations (80 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
+The `traces/` directory contains **739 curated agentic coding traces** with **59,204 requests**, including 19 traces with nested sub-agent conversations (70 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
 
 Traces include:
-- **Global hash_ids** (`hash_id_scope: "global"`) — consistent across all conversations and sub-agents for cross-context cache simulation
+- **Local hash_ids** (`hash_id_scope: "local"`) — hash IDs are scoped per conversation, with sub-agents sharing the parent's namespace
 - **Timing breakdown** — `api_time` (server processing) and `think_time` (client delay) per request, enabling flexible replay timing strategies
 - **Sub-agent nesting** — sub-agents embedded in parent traces with their own tool/system tokens and request arrays
+- **One request per turn** — no streaming/non-streaming pairing (proxy bug fixed upstream)
 
-All traces are fully anonymized — no conversation IDs, timestamps, or real agent IDs.
+All traces are fully anonymized — no conversation IDs, timestamps, or real agent IDs. Traces are curated from a larger set of 1,888 conversations: single-request conversations, conversations exceeding 900K input tokens, conversations with <60% cache hit rate, and conversations with frequent context compaction (pullbacks >5% of requests) are excluded.
 
 | Metric | Min | P25 | Median | P75 | Max | Mean |
 |---|---|---|---|---|---|---|
-| Starting input tokens | 6,697 | 17,360 | 19,588 | 56,364 | 509,308 | 42,174 |
-| Ending input tokens | 6,344 | 76,041 | 122,625 | 148,552 | 636,522 | 130,392 |
-| Cache hit rate (per conv) | 25% | 94% | 98% | 99% | 100% | 92% |
-| Conversation duration (min) | 0 | 33 | 71 | 161 | 44,073 | 658 |
+| Requests per trace | 3 | 19 | 48 | 101 | 1,178 | 80 |
+| Starting input tokens | 6,343 | 18,726 | 24,775 | 105,061 | 851,858 | 92,473 |
+| Ending input tokens | 11,053 | 94,686 | 137,529 | 208,960 | 894,371 | 181,659 |
+| Input tokens per request (P10/P50/P90) | 43,475 | — | 109,903 | — | 300,118 | 139,924 |
+| Output tokens per request (P10/P50/P90) | 103 | — | 218 | — | 937 | 446 |
+| Conversation duration (min) | 0.1 | 23 | 62 | 141 | 4,952 | 240 |
+| Think time per request (s) | 0 | 6 | 10 | 30 | 78,638 | 199 |
+| API time per request (s) | 1.2 | 4.4 | 6.5 | 11.0 | 300.0 | 10.2 |
+
+#### Cache hit rates
+
+Cache rates are computed from hash_id overlap between consecutive requests within each conversation.
+
+| Scenario | Min | P25 | Median | P75 | Max | Mean |
+|---|---|---|---|---|---|---|
+| Conversation-only (no warm prefix) | 61% | 92% | 96% | 97% | 100% | 93% |
+| With 75% warm prefix | 67% | 93% | 96% | 97% | 100% | 94% |
+
+**System and tools prefix impact:** Each trace includes `tool_tokens` (median ~10,500) and `system_tokens` (median ~2,600) — a combined prefix of ~15,000 tokens (median), representing ~60% of the median first-request input. In a production deployment, this prefix is shared across all conversations and stays warm in the KV cache, so the first request of any conversation gets a significant cache hit that isn't captured by the conversation-only rate above. The "75% warm prefix" row models 75% of the tools+system prefix being cached on the first request — this primarily benefits short conversations where the first-request miss dominates. For longer conversations, the prefix is a small fraction of total tokens and the impact is minimal (~1pp).
 
 ## Utility Scripts
 
