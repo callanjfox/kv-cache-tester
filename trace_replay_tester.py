@@ -1210,12 +1210,13 @@ class UserSession:
     """
 
     def __init__(self, user_id: str, trace: dict, generator: SyntheticMessageGenerator, max_context: int,
-                 hash_block_mode: bool = False):
+                 hash_block_mode: bool = False, no_max_tokens: bool = False):
         self.user_id = user_id
         self.trace = trace
         self.generator = generator
         self.max_context = max_context
         self.hash_block_mode = hash_block_mode
+        self.no_max_tokens = no_max_tokens
 
         self.trace_id = trace['metadata']['conversation_id']
         self.requests = trace['requests']
@@ -1423,7 +1424,7 @@ class UserSession:
         Returns:
             Tuple of (messages list, max_tokens for this request)
         """
-        if self.config.no_max_tokens:
+        if self.no_max_tokens:
             max_tokens = None
         else:
             max_tokens = max(1, request.get('output_tokens', 100))
@@ -1987,7 +1988,8 @@ class TestOrchestrator:
         user_id = f"User-{self.user_counter:03d}"
 
         user = UserSession(user_id, trace, self.generator, self.config.max_context,
-                           hash_block_mode=self.config.hash_block_mode)
+                           hash_block_mode=self.config.hash_block_mode,
+                           no_max_tokens=self.config.no_max_tokens)
         user.start_time = time.time()
 
         # Apply trace advancement if configured and allowed for this user
@@ -2125,7 +2127,8 @@ class TestOrchestrator:
         })
 
         sa_user = UserSession(sa_id, sa_trace, parent.generator, parent.max_context,
-                              hash_block_mode=parent.hash_block_mode)
+                              hash_block_mode=parent.hash_block_mode,
+                              no_max_tokens=parent.no_max_tokens)
         sa_user.is_subagent = True
         sa_user.parent_user_id = parent.user_id
         sa_user.start_time = time.time()
