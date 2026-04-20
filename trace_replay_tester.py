@@ -254,6 +254,7 @@ class TestConfig:
     # subagent requests (e.g. neon traces) where sequential hash_id diffs are noisy.
     hash_block_mode: bool = False
     debug_trace: bool = False  # Store full request/response bodies to JSONL
+    no_max_tokens: bool = False  # Don't enforce max_tokens from trace; let model generate freely
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1422,7 +1423,10 @@ class UserSession:
         Returns:
             Tuple of (messages list, max_tokens for this request)
         """
-        max_tokens = max(1, request.get('output_tokens', 100))
+        if self.config.no_max_tokens:
+            max_tokens = None
+        else:
+            max_tokens = max(1, request.get('output_tokens', 100))
         current_hash_ids = set(request.get('hash_ids', []))
         current_input_tokens = request.get('input_tokens', 0)
 
@@ -1676,14 +1680,15 @@ class APIClient:
 
         return self.model
 
-    def _build_request_params(self, messages: List[dict], max_tokens: int, stream: bool) -> dict:
+    def _build_request_params(self, messages: List[dict], max_tokens: Optional[int], stream: bool) -> dict:
         """Build request parameters including model-specific settings."""
         params = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "stream": stream,
         }
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
         if stream:
             params["stream_options"] = {"include_usage": True}
 
@@ -1705,7 +1710,7 @@ class APIClient:
 
         return params
 
-    async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
+    async def send_request(self, messages: List[dict], max_tokens: Optional[int], stream: bool = True,
                            on_first_token: Optional[callable] = None,
                            on_chunk: Optional[callable] = None,
                            tokenizer=None) -> dict:
@@ -3390,6 +3395,12 @@ def parse_arguments():
                         help="Ignore EOS token and force generation of exact output_tokens from trace. "
                              "Useful for consistent throughput benchmarking.")
 
+    # Output token control
+    parser.add_argument("--no-max-tokens", action="store_true", default=False,
+                        help="Don't enforce max_tokens from trace. Let the model generate "
+                             "freely until EOS. Useful for reasoning models (e.g. DeepSeek R1) "
+                             "that need extra token budget for <think> blocks.")
+
     # Debug trace: store full request/response bodies
     parser.add_argument("--debug-trace", action="store_true", default=False,
                         help="Store full request/response text for every API call to "
@@ -3467,6 +3478,7 @@ async def main():
         ignore_eos=args.ignore_eos,
         hash_block_mode=args.hash_block_mode,
         debug_trace=args.debug_trace,
+        no_max_tokens=args.no_max_tokens,
     )
 
     # Print header
