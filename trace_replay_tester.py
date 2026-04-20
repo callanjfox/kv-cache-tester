@@ -253,6 +253,7 @@ class TestConfig:
     # bypassing pullback/growth heuristics. Intended for traces with interleaved
     # subagent requests (e.g. neon traces) where sequential hash_id diffs are noisy.
     hash_block_mode: bool = False
+    debug_trace: bool = False  # Store full request/response bodies to JSONL
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1593,10 +1594,13 @@ class APIClient:
                  top_p: Optional[float] = None,
                  top_k: Optional[int] = None,
                  repetition_penalty: Optional[float] = None,
-                 ignore_eos: bool = False):
+                 ignore_eos: bool = False,
+                 debug_trace: bool = False):
         self.api_endpoint = api_endpoint
         self.model = model
         self.ignore_eos = ignore_eos
+        self.debug_trace = debug_trace
+        self._debug_trace_records: List[dict] = []
 
         # Store user-specified overrides (None means use model defaults or auto-detect)
         self._user_temperature = temperature
@@ -1721,6 +1725,7 @@ class APIClient:
         start_time = time.time()
         first_token_time = None
         response_text = ""
+        reasoning_text_full = ""
         token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
@@ -1748,6 +1753,8 @@ class APIClient:
                         # Only add content (not reasoning) to response text for conversation history
                         if content_text:
                             response_text += content_text
+                        if reasoning_text:
+                            reasoning_text_full += reasoning_text
                         # Count all generated tokens (content + reasoning) for metrics
                         chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
                         token_count += chunk_token_count
@@ -1768,6 +1775,7 @@ class APIClient:
 
                 if response.choices:
                     response_text = response.choices[0].message.content or ""
+                    reasoning_text_full = getattr(response.choices[0].message, 'reasoning_content', None) or ""
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
                     # For non-streaming, all tokens are attributed to completion time
                     token_timestamps.append(complete_time)
@@ -1776,7 +1784,7 @@ class APIClient:
             ttft = (first_token_time - start_time) if first_token_time else 0
             ttlt = complete_time - start_time
 
-            return {
+            result = {
                 'response_text': response_text,
                 'ttft': ttft,
                 'ttlt': ttlt,
@@ -1789,6 +1797,27 @@ class APIClient:
                 'tokens_per_chunk': tokens_per_chunk
             }
 
+            if self.debug_trace:
+                self._debug_trace_records.append({
+                    'timestamp': start_time,
+                    'request': {
+                        'messages': messages,
+                        'max_tokens': max_tokens,
+                        'stream': stream,
+                        'params': {k: v for k, v in params.items() if k != 'messages'},
+                    },
+                    'response': {
+                        'content': response_text,
+                        'reasoning_content': reasoning_text_full or None,
+                        'output_tokens': token_count,
+                        'ttft': ttft,
+                        'ttlt': ttlt,
+                    },
+                    'error': None,
+                })
+
+            return result
+
         except Exception as e:
             error_str = str(e).lower()
             if "connection" in error_str or "connect" in error_str or "refused" in error_str:
@@ -1797,6 +1826,19 @@ class APIClient:
             else:
                 error_type = "other"
                 logger.error(f"Request failed: {e}")
+
+            if self.debug_trace:
+                self._debug_trace_records.append({
+                    'timestamp': start_time,
+                    'request': {
+                        'messages': messages,
+                        'max_tokens': max_tokens,
+                        'stream': stream,
+                    },
+                    'response': None,
+                    'error': str(e),
+                })
+
             return {
                 'response_text': "",
                 'ttft': 0,
@@ -3193,6 +3235,14 @@ def save_results(orchestrator: TestOrchestrator, config: TestConfig):
     with open(output_path / "test_metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
 
+    # Save debug trace (full request/response bodies)
+    if config.debug_trace and orchestrator.api_client._debug_trace_records:
+        trace_file = output_path / "debug_trace.jsonl"
+        with open(trace_file, 'w') as f:
+            for record in orchestrator.api_client._debug_trace_records:
+                f.write(json.dumps(record, default=str) + '\n')
+        logger.info(f"Saved debug trace: {len(orchestrator.api_client._debug_trace_records)} request/response pairs → {trace_file}")
+
     # Save progress for compatibility
     progress = {
         "parameters": config.to_dict(),
@@ -3327,6 +3377,12 @@ def parse_arguments():
                         help="Ignore EOS token and force generation of exact output_tokens from trace. "
                              "Useful for consistent throughput benchmarking.")
 
+    # Debug trace: store full request/response bodies
+    parser.add_argument("--debug-trace", action="store_true", default=False,
+                        help="Store full request/response text for every API call to "
+                             "debug_trace.jsonl in the output directory. Warning: can produce "
+                             "very large files.")
+
     # Hash-block replay mode
     parser.add_argument("--hash-block-mode", action="store_true", default=False,
                         help="Build each request's prompt deterministically from hash_ids ("
@@ -3397,6 +3453,7 @@ async def main():
         advance_all_users=args.advance_all_users,
         ignore_eos=args.ignore_eos,
         hash_block_mode=args.hash_block_mode,
+        debug_trace=args.debug_trace,
     )
 
     # Print header
@@ -3475,7 +3532,8 @@ async def main():
         top_p=config.top_p,
         top_k=config.top_k,
         repetition_penalty=config.repetition_penalty,
-        ignore_eos=config.ignore_eos
+        ignore_eos=config.ignore_eos,
+        debug_trace=config.debug_trace,
     )
     await api_client.detect_model()
 
