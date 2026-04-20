@@ -1732,11 +1732,23 @@ class APIClient:
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
+            debug_chunks = [] if self.debug_trace else None
 
             if stream:
                 response = await self.client.chat.completions.create(**params)
 
                 async for chunk in response:
+                    if debug_chunks is not None:
+                        debug_chunks.append({
+                            'choices': [{
+                                'delta': {
+                                    'content': getattr(chunk.choices[0].delta, 'content', None) if chunk.choices else None,
+                                    'reasoning_content': getattr(chunk.choices[0].delta, 'reasoning_content', None) if chunk.choices else None,
+                                },
+                                'finish_reason': chunk.choices[0].finish_reason if chunk.choices else None,
+                            }] if chunk.choices else [],
+                            'usage': chunk.usage.model_dump() if hasattr(chunk, 'usage') and chunk.usage else None,
+                        })
                     if chunk.choices:
                         delta = chunk.choices[0].delta
                         content_text = delta.content or ""
@@ -1813,6 +1825,7 @@ class APIClient:
                         'ttft': ttft,
                         'ttlt': ttlt,
                     },
+                    'raw_chunks': debug_chunks,
                     'error': None,
                 })
 
