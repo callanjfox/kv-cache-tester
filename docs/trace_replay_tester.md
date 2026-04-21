@@ -14,8 +14,6 @@
 | **Proportional output attribution** | Output tokens attributed to period when generated (not when request completes) |
 | **Timestamp-based metrics** | Input tokens at TTFT, output tokens by chunk timestamp |
 | **Cooldown-gated user scaling** | Adds users based on TTFT headroom with cooldown after threshold breaches |
-| **Cache pressure budgeting** | `--max-new-tokens-per-period` limits cache churn |
-| **Working set limits** | `--max-working-set-tokens` caps total unique tokens across all users |
 | **Trace recycling** | `--recycle` replaces completed users with fresh traces |
 | **Deterministic seeds** | `--seed` for reproducible trace selection |
 | **Request pairs** | Handles streaming + non-streaming pairs with same hash_ids |
@@ -73,8 +71,6 @@ python trace_replay_tester.py \
 | `--start-users` | 1 | Initial number of users |
 | `--max-users` | 50 | Maximum concurrent users |
 | `--recycle` | false | Replace completed users with new traces |
-| `--max-new-tokens-per-period` | 500000 | Max cache miss tokens per assessment period |
-| `--max-working-set-tokens` | 0 | Max total tokens across all users (0 = unlimited) |
 
 ### Trace Filtering
 
@@ -260,7 +256,6 @@ python trace_replay_tester.py \
     --max-users 100 \
     --max-ttft 2.0 \
     --ttft-metric p95 \
-    --max-new-tokens-per-period 1000000 \
     --test-duration 1800 \
     --recycle \
     --seed 42

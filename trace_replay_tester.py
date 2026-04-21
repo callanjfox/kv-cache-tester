@@ -230,8 +230,6 @@ class TestConfig:
     verbose: bool
     tokenizer_id: str
     min_requests: int = 1
-    max_new_tokens_per_period: int = 500000  # Cache pressure limit per period
-    max_working_set_tokens: int = 0  # 0 = unlimited, else cap total working set
     seed: Optional[int] = None  # Random seed for reproducibility
     # Generation parameters (None = use model defaults or auto-detect)
     temperature: Optional[float] = None
@@ -1899,7 +1897,6 @@ class TestOrchestrator:
         self.test_start_time: Optional[float] = None
         self.current_period_start: Optional[float] = None
         self.period_metrics: List[RequestMetrics] = []
-        self.period_new_tokens: int = 0  # Cache miss tokens this period
         self.period_users_added: int = 0  # Users added this period
         self.period_rate_limit_events: int = 0  # Rate-limit events this period
         self.peak_working_set_tokens: int = 0  # Track peak working set
@@ -1934,55 +1931,11 @@ class TestOrchestrator:
 
         self.running = True
 
-    def create_user(self, enforce_budgets: bool = True, advance: bool = True) -> Optional[UserSession]:
-        """Create a new user from available traces.
-
-        Args:
-            enforce_budgets: If True, check per-period and working set budgets.
-                            Set to False for initial users (warning only).
-        """
+    def create_user(self, advance: bool = True) -> Optional[UserSession]:
+        """Create a new user from available traces."""
         trace = self.trace_manager.get_random_trace()
         if trace is None:
             return None
-
-        if enforce_budgets:
-            # Try up to max_attempts traces to find one that fits budget
-            max_attempts = 5
-            for attempt in range(max_attempts):
-                # Check global working set budget
-                can_add_ws, ws_tokens = self.can_add_user_for_working_set(trace)
-                if not can_add_ws:
-                    current_ws = self.get_current_working_set_tokens()
-                    available = self.config.max_working_set_tokens - current_ws
-                    logger.info(f"  ⚠️ Working set limit: trace needs ~{ws_tokens:,} tokens, "
-                               f"only {available:,} available")
-                    self.trace_manager.return_trace(trace)
-                    trace = self.trace_manager.get_random_trace()
-                    if trace is None:
-                        return None
-                    continue
-
-                # Check per-period budget
-                can_add_period, period_tokens = self.can_add_user_for_period_budget(trace)
-                if not can_add_period:
-                    available = self.config.max_new_tokens_per_period - self.period_new_tokens
-                    logger.info(f"  ⚠️ Period budget: trace needs ~{period_tokens:,} tokens, "
-                               f"only {available:,} available")
-                    self.trace_manager.return_trace(trace)
-                    trace = self.trace_manager.get_random_trace()
-                    if trace is None:
-                        return None
-                    continue
-
-                # Found a suitable trace - update budget and break
-                self.period_new_tokens += period_tokens
-                break
-            else:
-                # Exhausted attempts
-                logger.warning(f"Could not find trace fitting budget after {max_attempts} attempts")
-                if trace:
-                    self.trace_manager.return_trace(trace)
-                return None
 
         self.user_counter += 1
         user_id = f"User-{self.user_counter:03d}"
@@ -2028,25 +1981,24 @@ class TestOrchestrator:
         return user
 
     async def create_users_batch(self, count: int, delay_ms: int = 50,
-                                  enforce_budgets: bool = True, advance: bool = True) -> List[UserSession]:
+                                  advance: bool = True) -> List[UserSession]:
         """Create multiple users with a small delay between each to avoid overwhelming the server.
 
         Args:
             count: Number of users to create
             delay_ms: Delay between user creation in milliseconds
-            enforce_budgets: If True, check per-period and working set budgets
             advance: If True, apply trace advancement to these users
         """
         users = []
         for i in range(count):
-            user = self.create_user(enforce_budgets=enforce_budgets, advance=advance)
+            user = self.create_user(advance=advance)
             if user:
                 users.append(user)
                 # Add delay between users (not after the last one)
                 if i < count - 1:
                     await asyncio.sleep(delay_ms / 1000.0)
             else:
-                break  # No more traces available or budget exhausted
+                break  # No more traces available
         return users
 
     def remove_user(self, user_id: str, reason: str):
@@ -2178,8 +2130,7 @@ class TestOrchestrator:
         Calculate how many users to add based on TTFT headroom with cooldown gating.
 
         Uses consecutive good/bad period tracking to prevent ramping after brief
-        recovery from sustained overload. Budget enforcement (per-period and working
-        set) happens in create_user() on a per-trace basis.
+        recovery from sustained overload.
 
         Returns number of users to add (0 if gated by any condition).
         """
@@ -2300,47 +2251,6 @@ class TestOrchestrator:
             '15m': count_15m * self.config.chunk_size
         }
 
-    def can_add_user_for_working_set(self, trace: dict) -> Tuple[bool, int]:
-        """
-        Check if adding a user would exceed global working set budget.
-
-        Returns:
-            Tuple of (can_add, estimated_new_tokens)
-        """
-        if self.config.max_working_set_tokens == 0:
-            return True, 0  # Unlimited
-
-        # Estimate new tokens from first real request's hash_ids (skip subagent markers)
-        first_req = get_first_real_request(trace['requests'])
-        if first_req is None:
-            return True, 0  # No real requests
-        estimated_new_blocks = len(first_req.get('hash_ids', []))
-        estimated_new_tokens = estimated_new_blocks * self.config.chunk_size
-
-        current_working_set = self.get_current_working_set_tokens()
-
-        can_add = (current_working_set + estimated_new_tokens) <= self.config.max_working_set_tokens
-        return can_add, estimated_new_tokens
-
-    def can_add_user_for_period_budget(self, trace: dict) -> Tuple[bool, int]:
-        """
-        Check if adding a user would exceed per-period new token budget.
-
-        Returns:
-            Tuple of (can_add, estimated_tokens)
-        """
-        if self.config.max_new_tokens_per_period == 0:
-            return True, 0
-
-        # First request is all cache misses - use input_tokens as estimate
-        first_req = trace['requests'][0]
-        estimated_tokens = first_req.get('input_tokens', 0)
-
-        remaining_budget = self.config.max_new_tokens_per_period - self.period_new_tokens
-
-        can_add = estimated_tokens <= remaining_budget
-        return can_add, estimated_tokens
-
     def compute_assessment_metrics(self, period_number: int, period_end_time: Optional[float] = None,
                                      pending_task_start_times: Optional[List[float]] = None) -> AssessmentPeriodMetrics:
         """
@@ -2432,11 +2342,6 @@ class TestOrchestrator:
         # This is the actual cache miss count for reporting purposes
         cache_miss_blocks = sum(m.cache_miss_blocks for m in period_prefill_metrics)
         new_tokens = cache_miss_blocks * self.config.chunk_size
-
-        # Note: period_new_tokens is now tracked incrementally in create_user() for
-        # budget enforcement. We don't overwrite it here - the estimate-based tracking
-        # in create_user() is used for admission control, while new_tokens_ingested
-        # in the metrics shows the actual cache misses for reporting.
 
         # Store period metrics for print_assessment (filtered by prefill time)
         self.period_metrics = period_prefill_metrics
@@ -2554,16 +2459,11 @@ class TestOrchestrator:
         logger.info(f"  {metric_name} (cumulative): avg={metrics.cumulative_ttft_avg:.2f}s | p50={metrics.cumulative_ttft_p50:.2f}s | p95={metrics.cumulative_ttft_p95:.2f}s | p99={metrics.cumulative_ttft_p99:.2f}s ({metrics.cumulative_requests_completed} reqs)")
         logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
         logger.info(f"  Throughput (cumulative): {metrics.cumulative_input_tokens_per_second:,.0f} input tok/s | {metrics.cumulative_output_tokens_per_second:,.0f} output tok/s | {metrics.cumulative_requests_per_second:.2f} req/s")
-        logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
+        logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,}")
         logger.info(f"  Cache Hit Rate (cumulative): {metrics.cumulative_cache_hit_rate:.1%} "
                     f"| Theoretical cumulative (infinite cache): {metrics.theoretical_cumulative_cache_hit_rate:.1%}")
 
-        # Show working set with budget status if limit is configured
-        if self.config.max_working_set_tokens > 0:
-            pct_used = working_set_tokens * 100 / self.config.max_working_set_tokens
-            logger.info(f"  Working Set: {working_set_tokens:,} / {self.config.max_working_set_tokens:,} tokens ({pct_used:.0f}% used)")
-        else:
-            logger.info(f"  Working Set: {working_set_tokens:,} tokens ({metrics.working_set_blocks} blocks)")
+        logger.info(f"  Working Set: {working_set_tokens:,} tokens ({metrics.working_set_blocks} blocks)")
 
         # Show time-windowed working set (1m, 5m, 15m)
         windowed = self.compute_windowed_working_set()
@@ -2727,30 +2627,7 @@ class TestOrchestrator:
         logger.info(f"\n{Colors.HEADER}Starting test with {self.config.start_users} user(s)...{Colors.ENDC}\n")
 
         # Create initial users (with delay between each to avoid overwhelming server)
-        # Don't enforce budgets for initial users - just warn if exceeded
-        await self.create_users_batch(self.config.start_users, enforce_budgets=False, advance=True)
-
-        # Warn if initial users exceed budgets
-        initial_new_tokens = sum(
-            user.trace['requests'][0]['input_tokens']
-            for user in self.users.values()
-        )
-        if initial_new_tokens > self.config.max_new_tokens_per_period:
-            logger.warning(
-                f"{Colors.WARNING}Initial users will ingest {initial_new_tokens:,} new input tokens, "
-                f"exceeding per-period budget of {self.config.max_new_tokens_per_period:,} tokens. "
-                f"No additional users will be added until budget allows.{Colors.ENDC}"
-            )
-
-        # Also check working set budget
-        if self.config.max_working_set_tokens > 0:
-            initial_working_set = self.get_current_working_set_tokens()
-            if initial_working_set > self.config.max_working_set_tokens:
-                logger.warning(
-                    f"{Colors.WARNING}Initial users have working set of {initial_working_set:,} tokens, "
-                    f"exceeding limit of {self.config.max_working_set_tokens:,} tokens. "
-                    f"No additional users will be added until working set decreases.{Colors.ENDC}"
-                )
+        await self.create_users_batch(self.config.start_users, advance=True)
 
         # Track in-flight tasks: maps task -> (user_id, start_time)
         pending_tasks: Dict[asyncio.Task, Tuple[str, float]] = {}
@@ -2932,7 +2809,7 @@ class TestOrchestrator:
                             self.cooldown_required = 2
                         self.post_cooldown_ramps = 0  # Reset throttle counter
 
-                    # Calculate how many users to add based on headroom and budget
+                    # Calculate how many users to add based on headroom
                     users_to_add = self.calculate_users_to_add()
                     max_to_add = min(users_to_add, self.config.max_users - len(self.users))
                     if max_to_add > 0:
@@ -2946,12 +2823,11 @@ class TestOrchestrator:
                         old_users = new_users - users_added
                         headroom = assessment.ttft_headroom_pct
                         cooldown_info = f", cooldown: {self.cooldown_required}" if self.cooldown_required > 0 else ""
-                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}, budget remaining: {self.config.max_new_tokens_per_period - self.period_new_tokens:,} tokens){Colors.ENDC}")
+                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}){Colors.ENDC}")
 
                     # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
                     self.period_users_added = users_added  # Store for next period's metrics
-                    self.period_new_tokens = 0  # Reset token budget for new period
                     self.period_rate_limit_events = 0  # Reset rate-limit counter
                     self.period_admission_blocked = 0  # Reset admission control counter
                     self.period_dispatch_delays = []  # Reset dispatch delay tracking
@@ -3312,11 +3188,6 @@ def parse_arguments():
                         help="Maximum concurrent users (default: 50)")
     parser.add_argument("--recycle", action="store_true",
                         help="Replace completed users with new traces")
-    parser.add_argument("--max-new-tokens-per-period", type=int, default=500000,
-                        help="Max new (cache miss) tokens allowed per assessment period for user scaling (default: 500000)")
-    parser.add_argument("--max-working-set-tokens", type=int, default=0,
-                        help="Maximum working set size in tokens (0 = unlimited). "
-                             "Limits total unique tokens across all active users.")
 
     # Trace filtering
     parser.add_argument("--min-requests", type=int, default=1,
@@ -3465,8 +3336,6 @@ async def main():
         verbose=args.verbose,
         tokenizer_id=args.tokenizer,
         min_requests=args.min_requests,
-        max_new_tokens_per_period=args.max_new_tokens_per_period,
-        max_working_set_tokens=args.max_working_set_tokens,
         seed=args.seed,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -3533,11 +3402,6 @@ async def main():
     logger.info(f"  Start Users: {config.start_users}")
     logger.info(f"  Max Users: {config.max_users}")
     logger.info(f"  Recycle: {config.recycle}")
-    logger.info(f"  New Token Budget: {config.max_new_tokens_per_period:,} tokens/period")
-    if config.max_working_set_tokens > 0:
-        logger.info(f"  Working Set Limit: {config.max_working_set_tokens:,} tokens")
-    else:
-        logger.info(f"  Working Set Limit: unlimited")
     if config.test_duration:
         logger.info(f"  Test Duration: {config.test_duration}s")
     if config.max_concurrent_requests:
