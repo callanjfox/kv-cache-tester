@@ -1897,11 +1897,6 @@ class TestOrchestrator:
         self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
 
-        # Cooldown tracking for ramp controller
-        self.consecutive_exceeded_periods: int = 0   # How many consecutive periods exceeded TTFT
-        self.consecutive_good_periods: int = 0       # How many consecutive periods under TTFT
-        self.cooldown_required: int = 0              # Good periods required before next ramp
-        self.post_cooldown_ramps: int = 0            # Ramps since last cooldown (for throttling)
 
         # Error tracking
         self.consecutive_connection_errors: int = 0
@@ -2107,60 +2102,6 @@ class TestOrchestrator:
             return np.mean(ttfts)
         else:  # p95
             return np.percentile(ttfts, 95)
-
-    def calculate_users_to_add(self) -> int:
-        """
-        Calculate how many users to add based on TTFT headroom with cooldown gating.
-
-        Uses consecutive good/bad period tracking to prevent ramping after brief
-        recovery from sustained overload.
-
-        Returns number of users to add (0 if gated by any condition).
-        """
-        ttft_value = self.get_ttft_value()
-
-        # No data = don't add users (system may be overloaded or starting up)
-        if ttft_value is None:
-            return 0
-
-        # Over TTFT threshold = don't add
-        if ttft_value >= self.config.max_ttft:
-            return 0
-
-        # Gate: in-flight > 75% of max concurrent
-        if (self.config.max_concurrent_requests and
-            self.in_flight_requests > self.config.max_concurrent_requests * 0.75):
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Skipping user addition: in-flight at {self.in_flight_requests}/{self.config.max_concurrent_requests} (>75%){Colors.ENDC}")
-            return 0
-
-        # Gate: cooldown not yet satisfied
-        if self.cooldown_required > 0 and self.consecutive_good_periods < self.cooldown_required:
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Cooldown: {self.consecutive_good_periods}/{self.cooldown_required} good periods required before ramp{Colors.ENDC}")
-            return 0
-
-        # Cooldown satisfied — reset it
-        if self.cooldown_required > 0:
-            logger.info(f"  \u2713 Cooldown satisfied ({self.consecutive_good_periods} consecutive good periods)")
-            self.cooldown_required = 0
-
-        # Gate: minimum headroom of 20%
-        headroom_pct = (self.config.max_ttft - ttft_value) / self.config.max_ttft * 100
-        if headroom_pct < 20:
-            logger.info(f"{Colors.WARNING}  \u23f8\ufe0f Headroom too low ({headroom_pct:.0f}% < 20% minimum){Colors.ENDC}")
-            return 0
-
-        # Throttle after cooldown: first 2 ramps = +1 only
-        self.post_cooldown_ramps += 1
-        if self.post_cooldown_ramps <= 2:
-            return 1
-
-        # Normal ramp: scale by headroom (less aggressive than before)
-        # 1 base + 1 per 15% headroom (e.g., 75% headroom = 1 + 5 = 6 users)
-        return max(1, 1 + int(headroom_pct / 15))
-
-    def check_thresholds(self) -> bool:
-        """Check if performance thresholds are met. Returns True if we can add users."""
-        return self.calculate_users_to_add() > 0
 
     def should_rate_limit_dispatch(self) -> Tuple[bool, float]:
         """Check if new request dispatch should be rate-limited.
@@ -2766,29 +2707,9 @@ class TestOrchestrator:
                     self.assessment_periods.append(assessment)
                     self.print_assessment(assessment)
 
-                    # Update cooldown tracking based on TTFT
-                    # Skip tracking when no data (e.g., parent waiting for sub-agents)
-                    ttft_val = self.get_ttft_value()
-                    if ttft_val is None:
-                        pass  # No requests completed this period, don't affect cooldown state
-                    elif ttft_val < self.config.max_ttft:
-                        self.consecutive_good_periods += 1
-                        self.consecutive_exceeded_periods = 0
-                    else:
-                        self.consecutive_exceeded_periods += 1
-                        self.consecutive_good_periods = 0
-                        # Set cooldown based on severity of distress
-                        if self.consecutive_exceeded_periods >= 10:
-                            self.cooldown_required = 5
-                        elif self.consecutive_exceeded_periods >= 3:
-                            self.cooldown_required = 3
-                        else:
-                            self.cooldown_required = 2
-                        self.post_cooldown_ramps = 0  # Reset throttle counter
-
-                    # Calculate how many users to add based on headroom
-                    users_to_add = self.calculate_users_to_add()
-                    max_to_add = min(users_to_add, self.config.max_users - len(self.users))
+                    # Refill users up to max_users (replaces ones that completed
+                    # when --recycle is set). No ramp/cooldown gating.
+                    max_to_add = self.config.max_users - len(self.users)
                     if max_to_add > 0:
                         new_users_list = await self.create_users_batch(max_to_add, advance=self.config.advance_all_users)
                         users_added = len(new_users_list)
@@ -2798,9 +2719,7 @@ class TestOrchestrator:
                     if users_added > 0:
                         new_users = len(self.users)
                         old_users = new_users - users_added
-                        headroom = assessment.ttft_headroom_pct
-                        cooldown_info = f", cooldown: {self.cooldown_required}" if self.cooldown_required > 0 else ""
-                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}) (headroom: {headroom:.0f}%{cooldown_info}){Colors.ENDC}")
+                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}){Colors.ENDC}")
 
                     # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
