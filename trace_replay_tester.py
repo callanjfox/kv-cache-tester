@@ -269,6 +269,8 @@ class RequestMetrics:
     input_tokens: int
     output_tokens_expected: int
     output_tokens_actual: int
+    # Blocks whose hash_id this user's session has seen before (infinite-cache
+    # hit), and blocks that are new. hit_rate = hits / (hits + misses).
     cache_hit_blocks: int
     cache_miss_blocks: int
     ttft: float
@@ -278,9 +280,6 @@ class RequestMetrics:
     delay_actual: float
     success: bool
     error_message: Optional[str] = None
-    # Hash_ids in this request that appeared anywhere earlier in the session
-    # (infinite-cache upper bound — independent of cache_hit_blocks).
-    theoretical_cache_hit_blocks: int = 0
     # Timestamps for period attribution
     request_start_time: float = 0.0  # When request was sent
     prefill_complete_time: float = 0.0  # When first token received (TTFT)
@@ -351,11 +350,8 @@ class AssessmentPeriodMetrics:
     cumulative_requests_per_second: float = 0.0
     cumulative_input_tokens_per_second: float = 0.0
     cumulative_output_tokens_per_second: float = 0.0
+    # Infinite-cache hit rate over all completed requests so far.
     cumulative_cache_hit_rate: float = 0.0
-    # Infinite-cache upper bound computed over every hash_id seen in every
-    # completed request so far. A direct North-Star to compare against
-    # cumulative_cache_hit_rate (which is only a size-1-prior estimate).
-    theoretical_cumulative_cache_hit_rate: float = 0.0
 
 
 # =============================================================================
@@ -1226,10 +1222,8 @@ class UserSession:
         self.metrics: List[RequestMetrics] = []
 
         # Track previous hash_ids for cache hit calculation
-        self.prev_hash_ids: Set[int] = set()
-
-        # All hash_ids ever seen in this session — powers the
-        # "infinite cache" theoretical ceiling computation.
+        # All hash_ids ever seen in this session. A block is a cache hit iff
+        # its hash_id is already in this set — the infinite-cache hit model.
         self.seen_hash_ids: Set[int] = set()
 
         # Conversation history: list of {"role": "user"|"assistant", "content": str}
@@ -1329,10 +1323,6 @@ class UserSession:
     def advance(self):
         """Move to next request"""
         if self.current_idx < len(self.requests):
-            # Update prev_hash_ids for cache tracking
-            request = self.requests[self.current_idx]
-            current_hash_ids = set(request.get('hash_ids', []))
-            self.prev_hash_ids = current_hash_ids
             self.current_idx += 1
             self.last_request_time = time.time()
 
@@ -1347,8 +1337,12 @@ class UserSession:
 
         prev_request = self.requests[start_idx - 1]
 
-        # Set hash_id state from previous request for cache tracking
-        self.prev_hash_ids = set(prev_request.get('hash_ids', []))
+        # Seed seen_hash_ids with every hash_id from requests 0..start_idx-1
+        # so cache-hit accounting reflects what the session would have seen
+        # if it had replayed those turns.
+        for req in self.requests[:start_idx]:
+            self.seen_hash_ids.update(req.get('hash_ids', []))
+
         self.prev_request_hash_ids = set(prev_request.get('hash_ids', []))
         self.prev_input_tokens = prev_request.get('input_tokens', 0)
 
@@ -1365,29 +1359,18 @@ class UserSession:
         content = self.generator.generate_user_text(target_tokens, generator_seed)
         self.conversation = [{"role": "user", "content": content}]
 
-    def calculate_cache_hits(self, request: dict) -> Tuple[int, int, int]:
-        """Calculate cache hits, misses, and theoretical (infinite-cache) hits.
+    def calculate_cache_hits(self, request: dict) -> Tuple[int, int]:
+        """Infinite-cache hit model: a block is a hit iff its hash_id has been
+        seen anywhere earlier in this session.
 
         Returns:
-            (hits, misses, theoretical_hits)
-            - hits: hash_ids shared with the immediately previous request
-                (lower-bound estimate — what a size-1 cache would deliver)
-            - misses: len(hash_ids) - hits
-            - theoretical_hits: hash_ids already seen anywhere earlier in this
-                session (upper-bound estimate — what an infinite cache delivers)
-
-        Also updates self.seen_hash_ids for subsequent theoretical calculations.
+            (hits, misses) where hits + misses == len(hash_ids)
         """
         current_hash_ids = set(request.get('hash_ids', []))
-        theoretical_hits = len(current_hash_ids & self.seen_hash_ids)
-        self.seen_hash_ids.update(current_hash_ids)
-
-        if not self.prev_hash_ids:
-            return 0, len(current_hash_ids), theoretical_hits
-
-        hits = len(current_hash_ids & self.prev_hash_ids)
+        hits = len(current_hash_ids & self.seen_hash_ids)
         misses = len(current_hash_ids) - hits
-        return hits, misses, theoretical_hits
+        self.seen_hash_ids.update(current_hash_ids)
+        return hits, misses
 
     def _get_user_message_type(self, request: dict) -> str:
         """Determine the type of user message to generate based on trace.
@@ -2369,7 +2352,6 @@ class TestOrchestrator:
         cum_cache_hits = sum(m.cache_hit_blocks for m in all_completed)
         cum_cache_misses = sum(m.cache_miss_blocks for m in all_completed)
         cum_cache_total = cum_cache_hits + cum_cache_misses
-        cum_theoretical_hits = sum(m.theoretical_cache_hit_blocks for m in all_completed)
 
         return AssessmentPeriodMetrics(
             period_number=period_number,
@@ -2416,9 +2398,6 @@ class TestOrchestrator:
             cumulative_input_tokens_per_second=cum_total_input / total_elapsed,
             cumulative_output_tokens_per_second=cum_total_output / total_elapsed,
             cumulative_cache_hit_rate=cum_cache_hits / cum_cache_total if cum_cache_total > 0 else 0,
-            theoretical_cumulative_cache_hit_rate=(
-                cum_theoretical_hits / cum_cache_total if cum_cache_total > 0 else 0
-            ),
         )
 
     def print_assessment(self, metrics: AssessmentPeriodMetrics):
@@ -2460,8 +2439,7 @@ class TestOrchestrator:
         logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
         logger.info(f"  Throughput (cumulative): {metrics.cumulative_input_tokens_per_second:,.0f} input tok/s | {metrics.cumulative_output_tokens_per_second:,.0f} output tok/s | {metrics.cumulative_requests_per_second:.2f} req/s")
         logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,}")
-        logger.info(f"  Cache Hit Rate (cumulative): {metrics.cumulative_cache_hit_rate:.1%} "
-                    f"| Theoretical cumulative (infinite cache): {metrics.theoretical_cumulative_cache_hit_rate:.1%}")
+        logger.info(f"  Cache Hit Rate (cumulative, infinite-cache model): {metrics.cumulative_cache_hit_rate:.1%}")
 
         logger.info(f"  Working Set: {working_set_tokens:,} tokens ({metrics.working_set_blocks} blocks)")
 
@@ -2509,8 +2487,8 @@ class TestOrchestrator:
             canonical_prefix_tokens=self.canonical_prefix_tokens
         )
 
-        # Calculate expected cache hits
-        cache_hits, cache_misses, theoretical_cache_hits = user.calculate_cache_hits(request)
+        # Calculate expected cache hits (infinite-cache model)
+        cache_hits, cache_misses = user.calculate_cache_hits(request)
 
         # Send request
         stream = True  # Always stream for accurate TTFT measurement
@@ -2594,7 +2572,6 @@ class TestOrchestrator:
             output_tokens_actual=actual_output,
             cache_hit_blocks=cache_hits,
             cache_miss_blocks=cache_misses,
-            theoretical_cache_hit_blocks=theoretical_cache_hits,
             ttft=ttft,
             ttlt=ttlt,
             itl=itl,
