@@ -332,7 +332,6 @@ class AssessmentPeriodMetrics:
     total_request_time: float  # Sum of all request durations (ttlt)
     idle_time_pct: float  # Percentage of period users were idle
     new_tokens_ingested: int = 0  # Cache miss tokens this period
-    ttft_headroom_pct: float = 0.0  # How much below threshold (0-100%)
     rate_limited_users: int = 0  # Users in rate_limited state at assessment time
     rate_limit_events: int = 0  # Total rate-limit events this period
     # Admission control metrics
@@ -2270,15 +2269,6 @@ class TestOrchestrator:
         # Store period metrics for print_assessment (filtered by prefill time)
         self.period_metrics = period_prefill_metrics
 
-        # Calculate TTFT headroom (None means no data = no headroom)
-        ttft_value = self.get_ttft_value()
-        if ttft_value is None:
-            ttft_headroom_pct = 0  # No data = no headroom claimed
-        elif self.config.max_ttft > 0:
-            ttft_headroom_pct = max(0, (self.config.max_ttft - ttft_value) / self.config.max_ttft * 100)
-        else:
-            ttft_headroom_pct = 0
-
         # Count rate-limited users
         rate_limited_users = sum(1 for u in self.users.values() if u.state == "rate_limited")
 
@@ -2322,7 +2312,6 @@ class TestOrchestrator:
             total_request_time=total_request_time,
             idle_time_pct=idle_time_pct,
             new_tokens_ingested=new_tokens,
-            ttft_headroom_pct=ttft_headroom_pct,
             rate_limited_users=rate_limited_users,
             rate_limit_events=self.period_rate_limit_events,
             admission_blocked_events=self.period_admission_blocked,
@@ -2347,24 +2336,18 @@ class TestOrchestrator:
         ttft_value = self.get_ttft_value()
 
         if ttft_value is None:
-            # No TTFT data available
             measured_ttft = None
             metric_name = "TTFT"
-            threshold_status = "⏳ No data"
         elif self.config.ttft_metric == 'max':
-            # For max, we need to compute it from individual metrics
             ttfts = [m.ttft for m in self.period_metrics if m.success]
             measured_ttft = max(ttfts) if ttfts else 0
             metric_name = "Max TTFT"
-            threshold_status = "✓" if measured_ttft < self.config.max_ttft else "⚠️ EXCEEDED"
         elif self.config.ttft_metric == 'avg':
             measured_ttft = metrics.ttft_avg
             metric_name = "Avg TTFT"
-            threshold_status = "✓" if measured_ttft < self.config.max_ttft else "⚠️ EXCEEDED"
         else:  # p95
             measured_ttft = metrics.ttft_p95
             metric_name = "P95 TTFT"
-            threshold_status = "✓" if measured_ttft < self.config.max_ttft else "⚠️ EXCEEDED"
         working_set_tokens = metrics.working_set_blocks * self.config.chunk_size
 
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
@@ -2373,9 +2356,9 @@ class TestOrchestrator:
         logger.info(f"  Users: {metrics.active_users + metrics.idle_users} total ({metrics.users_with_requests} active this period)")
         logger.info(f"  Requests: {metrics.requests_launched} launched | {metrics.requests_completed} completed ({metrics.requests_completed_new} new, {metrics.requests_completed_prior} prior) | {metrics.requests_in_progress} in-progress ({metrics.requests_in_progress_new} new, {metrics.requests_in_progress_prior} prior) ({metrics.requests_per_second:.2f} req/s)")
         if measured_ttft is None:
-            logger.info(f"  {metric_name}: {threshold_status} (threshold: {self.config.max_ttft}s)")
+            logger.info(f"  {metric_name}: no data")
         else:
-            logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
+            logger.info(f"  {metric_name}: {measured_ttft:.2f}s")
         logger.info(f"  {metric_name} (cumulative): avg={metrics.cumulative_ttft_avg:.2f}s | p50={metrics.cumulative_ttft_p50:.2f}s | p95={metrics.cumulative_ttft_p95:.2f}s | p99={metrics.cumulative_ttft_p99:.2f}s ({metrics.cumulative_requests_completed} reqs)")
         logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
         logger.info(f"  Throughput (cumulative): {metrics.cumulative_input_tokens_per_second:,.0f} input tok/s | {metrics.cumulative_output_tokens_per_second:,.0f} output tok/s | {metrics.cumulative_requests_per_second:.2f} req/s")
