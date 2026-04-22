@@ -42,11 +42,13 @@ This branch is based on `agentx` with the following removed:
 - `cache_rate_tester.py`, `working_set_tester.py`, `single_prompt_tester.py`
 - `combine_graphs.py`, `regenerate_graphs.py`, `generate_index.py`, `kv_cache_size.py`
 - `build_traces_from_neon.py` (Postgres → trace converter)
-- `vocabulary.py` (used only by `cache_rate_tester`)
 - `debug_request.py` (ad-hoc streaming-response debugger)
 - `launcher/` (alternate vLLM server harness)
 - `traces/`, `traces_neon/` (~1.5 GB of bundled sample traces)
 - `docs/{cache_rate,working_set,single_prompt,utilities}.md`
+
+`vocabulary.py` is kept because `trace_replay_tester.py` imports it lazily
+inside `_ensure_user_text_pool()` when it synthesizes user-message content.
 
 Anything needed to run `trace_replay_tester.py` against a Hugging Face dataset
 stays.
