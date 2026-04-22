@@ -183,7 +183,6 @@ With `hash_id_scope: "global"` traces, sub-agents sharing the same tool definiti
 | `test_metadata.json` | Configuration and trace stats |
 | `progress.json` | Resume state |
 | `*.html` | Plotly visualizations |
-| `index.html` | Dashboard (via generate_index.py) |
 
 ## Trace Format
 
