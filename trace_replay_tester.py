@@ -3328,21 +3328,12 @@ async def main():
     # Save results
     save_results(orchestrator, config)
 
-    # Generate graphs and index.html
+    # Generate graphs
     if not args.skip_graphs:
         try:
             generate_graphs(orchestrator, config)
         except Exception as e:
             logger.warning(f"Failed to generate graphs: {e}")
-
-        try:
-            import subprocess
-            subprocess.run([
-                sys.executable, "generate_index.py",
-                config.output_dir
-            ], check=True)
-        except Exception as e:
-            logger.warning(f"Failed to generate index.html: {e}")
 
 
 if __name__ == "__main__":
