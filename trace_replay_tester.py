@@ -39,6 +39,12 @@ except ImportError as e:
     print("Please install: pip install openai transformers plotly pandas numpy")
     sys.exit(1)
 
+# Optional server metrics collector (enabled via --metrics-output-prefix)
+try:
+    from server_metrics import MetricsCollector
+except ImportError:
+    MetricsCollector = None
+
 
 # =============================================================================
 # ANSI Colors for Terminal Output
@@ -253,6 +259,7 @@ class TestConfig:
     hash_block_mode: bool = False
     debug_trace: bool = False  # Store full request/response bodies to JSONL
     no_max_tokens: bool = False  # Don't enforce max_tokens from trace; let model generate freely
+    metrics_output_prefix: Optional[str] = None  # Enable server metrics collection
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1911,6 +1918,14 @@ class TestOrchestrator:
         self.canonical_prefix_content: str = ""
         self.canonical_prefix_tokens: int = 0
 
+        # Server metrics collector (optional, enabled via --metrics-output-prefix)
+        self.metrics_collector = None
+        if config.metrics_output_prefix and MetricsCollector is not None:
+            self.metrics_collector = MetricsCollector(
+                base_url=config.api_endpoint,
+                poll_interval=1.0,
+            )
+
         self.running = True
 
     def create_user(self, advance: bool = True) -> Optional[UserSession]:
@@ -2556,6 +2571,10 @@ class TestOrchestrator:
         # Create initial users (with delay between each to avoid overwhelming server)
         await self.create_users_batch(self.config.start_users, advance=True)
 
+        if self.metrics_collector:
+            self.metrics_collector.start()
+            logger.info(f"Server metrics collector started (polling {self.config.api_endpoint}/metrics)")
+
         # Track in-flight tasks: maps task -> (user_id, start_time)
         pending_tasks: Dict[asyncio.Task, Tuple[str, float]] = {}
 
@@ -2755,6 +2774,10 @@ class TestOrchestrator:
                 logger.warning(f"{len(pending)} requests still outstanding after 60s timeout — cancelling")
                 for task in pending:
                     task.cancel()
+
+        if self.metrics_collector:
+            await self.metrics_collector.stop()
+            logger.info("Server metrics collector stopped")
 
         self.running = False
         self.print_summary()
@@ -3133,6 +3156,14 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible trace selection")
 
+    # Server metrics collection
+    parser.add_argument("--metrics-output-prefix", type=str, default=None,
+                        help="Enable server metrics collection and write output to this prefix "
+                             "(e.g., results/metrics → results/metrics_server_metrics.csv, "
+                             "results/metrics_plots.png). Polls the server /metrics endpoint "
+                             "during the test and generates plots/CSVs with both server and "
+                             "client metrics.")
+
     # Generation parameter overrides (None = use model-specific defaults if available)
     parser.add_argument("--temperature", type=float, default=None,
                         help="Override temperature for generation (e.g., 0.7)")
@@ -3197,6 +3228,31 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def _adapt_metrics_for_collector(all_metrics):
+    """Convert RequestMetrics to the format expected by MetricsCollector plots/CSV."""
+    from types import SimpleNamespace
+    adapted = []
+    for m in all_metrics:
+        if not m.success:
+            continue
+        total_blocks = m.cache_hit_blocks + m.cache_miss_blocks
+        adapted.append(SimpleNamespace(
+            start_time_ms=m.request_start_time * 1000,
+            ttft_ms=m.ttft * 1000,
+            tpot_ms=m.itl * 1000,
+            latency_ms=m.ttlt * 1000,
+            input_num_turns=m.request_idx + 1,
+            input_num_tokens=m.input_tokens,
+            output_num_tokens=m.output_tokens_actual,
+            output_num_chunks=len(m.tokens_per_chunk),
+            output_num_first_chunk_tokens=m.tokens_per_chunk[0] if m.tokens_per_chunk else 0,
+            approx_cached_percent=(m.cache_hit_blocks / total_blocks * 100) if total_blocks > 0 else 0,
+            conversation_id=m.trace_id,
+            client_id=m.user_id,
+        ))
+    return adapted
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -3256,6 +3312,7 @@ async def main():
         hash_block_mode=args.hash_block_mode,
         debug_trace=args.debug_trace,
         no_max_tokens=args.no_max_tokens,
+        metrics_output_prefix=args.metrics_output_prefix,
     )
 
     # Print header
@@ -3353,6 +3410,21 @@ async def main():
 
     # Save results
     save_results(orchestrator, config)
+
+    # Export server metrics (plots + CSV)
+    if orchestrator.metrics_collector and config.metrics_output_prefix:
+        try:
+            client_metrics = _adapt_metrics_for_collector(orchestrator.all_metrics)
+            orchestrator.metrics_collector.generate_plots(
+                output_prefix=config.metrics_output_prefix,
+                client_metrics=client_metrics,
+            )
+            orchestrator.metrics_collector.export_csv(
+                output_prefix=config.metrics_output_prefix,
+                client_metrics=client_metrics,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to generate server metrics output: {e}")
 
     # Generate graphs
     if not args.skip_graphs:
