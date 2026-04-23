@@ -2399,12 +2399,16 @@ class TestOrchestrator:
         user.state = "active"
         logger.debug(f"  📤 {user.user_id} req {user.current_idx + 1}: firing ({request['input_tokens']:,} input tokens)")
 
+        block_keys = [(user.trace_id, h) for h in request.get('hash_ids', [])]
+        previous_block_access = {key: self.block_last_access.get(key) for key in block_keys}
+        block_access_order_len = len(self.block_access_order)
+        seen_hash_ids_before_request = set(user.seen_hash_ids)
+
         # Track hash_ids for working set when request fires (not when it completes)
         # Prefix with trace_id to make hash_ids unique per conversation
         # (raw hash_ids are sequential integers that overlap across traces)
         current_time = time.time()
-        for h in request.get('hash_ids', []):
-            key = (user.trace_id, h)
+        for key in block_keys:
             self.block_last_access[key] = current_time
             self.block_access_order.append((current_time, key))
 
@@ -2461,6 +2465,14 @@ class TestOrchestrator:
         tokens_per_chunk = result['tokens_per_chunk']
 
         if error_type == "context_length":
+            while len(self.block_access_order) > block_access_order_len:
+                self.block_access_order.pop()
+            for key, previous_access in previous_block_access.items():
+                if previous_access is None:
+                    self.block_last_access.pop(key, None)
+                else:
+                    self.block_last_access[key] = previous_access
+            user.seen_hash_ids = seen_hash_ids_before_request
             user.state = "truncated"
             logger.warning(
                 f"  ⚠️ {user.user_id} truncated at request {user.current_idx + 1}: "
