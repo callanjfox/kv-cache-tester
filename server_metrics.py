@@ -153,7 +153,7 @@ class SGLangMetricsParser:
 
 
 def detect_backend(text: str) -> str:
-    """Auto-detect backend from metrics text."""
+    """Very sophisticated way to auto-detect backend from metrics text."""
     if 'vllm:' in text:
         return 'vllm'
     elif 'sglang:' in text:
@@ -642,65 +642,64 @@ class MetricsCollector:
         final = self.snapshots[-1]
         initial = self.snapshots[0]
 
-        logger.info(f"{'='*60}")
-        logger.info(f"SERVER METRICS SUMMARY")
-        logger.info(f"{'='*60}")
-        logger.info(f"Duration: {duration:.1f}s")
-        logger.info(f"Total prompt tokens: {total_prompt_tokens:,}")
-        logger.info(f"Total generation tokens: {total_gen_tokens:,}")
-        logger.info(f"Avg generation throughput: {total_gen_tokens/duration:.1f} tok/s")
-        logger.info(f"Peak KV cache usage: {max(s.kv_cache_usage for s in self.snapshots)*100:.1f}%")
-        logger.info(f"Peak running requests: {max(s.num_requests_running for s in self.snapshots)}")
-        logger.info(f"Peak waiting requests: {max(s.num_requests_waiting for s in self.snapshots)}")
-        logger.info(f"Total preemptions: {final.num_preemptions - initial.num_preemptions}")
+        lines = [
+            "=" * 60,
+            "SERVER METRICS SUMMARY",
+            "=" * 60,
+            f"Duration: {duration:.1f}s",
+            f"Total prompt tokens: {total_prompt_tokens:,}",
+            f"Total generation tokens: {total_gen_tokens:,}",
+            f"Avg generation throughput: {total_gen_tokens/duration:.1f} tok/s",
+            f"Peak KV cache usage: {max(s.kv_cache_usage for s in self.snapshots)*100:.1f}%",
+            f"Peak running requests: {max(s.num_requests_running for s in self.snapshots)}",
+            f"Peak waiting requests: {max(s.num_requests_waiting for s in self.snapshots)}",
+            f"Total preemptions: {final.num_preemptions - initial.num_preemptions}",
+        ]
 
         if final.prefix_cache_queries > initial.prefix_cache_queries:
             delta_hits = final.prefix_cache_hits - initial.prefix_cache_hits
             delta_queries = final.prefix_cache_queries - initial.prefix_cache_queries
             hit_rate = 100.0 * delta_hits / delta_queries
-            logger.info(f"Overall GPU cache hit rate: {hit_rate:.1f}%")
-            logger.info(f"  - Cache hits: {delta_hits:,} tokens")
-            logger.info(f"  - Cache queries: {delta_queries:,} tokens")
+            lines.append(f"Overall GPU cache hit rate: {hit_rate:.1f}%")
+            lines.append(f"  - Cache hits: {delta_hits:,} tokens")
+            lines.append(f"  - Cache queries: {delta_queries:,} tokens")
 
-        # External/offloaded cache stats if available
         if final.cpu_prefix_cache_queries > initial.cpu_prefix_cache_queries:
             cpu_delta_hits = final.cpu_prefix_cache_hits - initial.cpu_prefix_cache_hits
             cpu_delta_queries = final.cpu_prefix_cache_queries - initial.cpu_prefix_cache_queries
             cpu_hit_rate = 100.0 * cpu_delta_hits / cpu_delta_queries
-            logger.info(f"Overall external cache hit rate: {cpu_hit_rate:.1f}%")
-            logger.info(f"  - Cache hits: {cpu_delta_hits:,} tokens")
-            logger.info(f"  - Cache queries: {cpu_delta_queries:,} tokens")
+            lines.append(f"Overall external cache hit rate: {cpu_hit_rate:.1f}%")
+            lines.append(f"  - Cache hits: {cpu_delta_hits:,} tokens")
+            lines.append(f"  - Cache queries: {cpu_delta_queries:,} tokens")
 
-        # Prompt tokens by source
         total_compute = final.prompt_tokens_local_compute - initial.prompt_tokens_local_compute
         total_cache_hit = final.prompt_tokens_local_cache_hit - initial.prompt_tokens_local_cache_hit
         total_ext = final.prompt_tokens_external_kv_transfer - initial.prompt_tokens_external_kv_transfer
         total_by_source = total_compute + total_cache_hit + total_ext
         if total_by_source > 0:
-            logger.info(f"Prompt token sources:")
-            logger.info(f"  - Prefill:            {total_compute:>12,} ({100*total_compute/total_by_source:.1f}%)")
-            logger.info(f"  - HBM cache hit:      {total_cache_hit:>12,} ({100*total_cache_hit/total_by_source:.1f}%)")
-            logger.info(f"  - Offload cache hit:  {total_ext:>12,} ({100*total_ext/total_by_source:.1f}%)")
+            lines.append(f"Prompt token sources:")
+            lines.append(f"  - Prefill:            {total_compute:>12,} ({100*total_compute/total_by_source:.1f}%)")
+            lines.append(f"  - HBM cache hit:      {total_cache_hit:>12,} ({100*total_cache_hit/total_by_source:.1f}%)")
+            lines.append(f"  - Offload cache hit:  {total_ext:>12,} ({100*total_ext/total_by_source:.1f}%)")
 
-        # KV offload transfer stats
         g2c_bytes = final.kv_offload_bytes_gpu_to_cpu - initial.kv_offload_bytes_gpu_to_cpu
         c2g_bytes = final.kv_offload_bytes_cpu_to_gpu - initial.kv_offload_bytes_cpu_to_gpu
         g2c_time = final.kv_offload_time_gpu_to_cpu - initial.kv_offload_time_gpu_to_cpu
         c2g_time = final.kv_offload_time_cpu_to_gpu - initial.kv_offload_time_cpu_to_gpu
         if g2c_bytes > 0 or c2g_bytes > 0:
-            logger.info(f"KV offload transfers:")
-            logger.info(f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB in {g2c_time:.2f}s ({g2c_bytes/g2c_time/1e9:.1f} GB/s)" if g2c_time > 0 else f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB")
-            logger.info(f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB in {c2g_time:.2f}s ({c2g_bytes/c2g_time/1e9:.1f} GB/s)" if c2g_time > 0 else f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB")
+            lines.append(f"KV offload transfers:")
+            lines.append(f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB in {g2c_time:.2f}s ({g2c_bytes/g2c_time/1e9:.1f} GB/s)" if g2c_time > 0 else f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB")
+            lines.append(f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB in {c2g_time:.2f}s ({c2g_bytes/c2g_time/1e9:.1f} GB/s)" if c2g_time > 0 else f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB")
 
-        # Prefill KV computed tokens
         delta_kv_sum = final.prefill_kv_computed_tokens_sum - initial.prefill_kv_computed_tokens_sum
         delta_kv_count = final.prefill_kv_computed_tokens_count - initial.prefill_kv_computed_tokens_count
         if delta_kv_count > 0:
-            logger.info(f"Prefill KV computed tokens (excluding cached):")
-            logger.info(f"  Total: {delta_kv_sum:,} tokens across {delta_kv_count:,} requests")
-            logger.info(f"  Avg per request: {delta_kv_sum/delta_kv_count:.0f} tokens")
+            lines.append(f"Prefill KV computed tokens (excluding cached):")
+            lines.append(f"  Total: {delta_kv_sum:,} tokens across {delta_kv_count:,} requests")
+            lines.append(f"  Avg per request: {delta_kv_sum/delta_kv_count:.0f} tokens")
 
-        logger.info(f"{'='*60}")
+        lines.append("=" * 60)
+        logger.info("\n" + "\n".join(lines))
 
     def export_csv(
         self,
