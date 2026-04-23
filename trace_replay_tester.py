@@ -1822,6 +1822,11 @@ class APIClient:
             if "connection" in error_str or "connect" in error_str or "refused" in error_str:
                 error_type = "connection"
                 logger.error(f"Connection error: {e}")
+            elif ("maximum context length" in error_str or
+                  "context length" in error_str or
+                  ("input length" in error_str and "context" in error_str)):
+                error_type = "context_length"
+                logger.warning(f"Request exceeded model context length: {e}")
             else:
                 error_type = "other"
                 logger.error(f"Request failed: {e}")
@@ -2454,6 +2459,15 @@ class TestOrchestrator:
         request_complete_time = result['complete_time']
         token_timestamps = result['token_timestamps']
         tokens_per_chunk = result['tokens_per_chunk']
+
+        if error_type == "context_length":
+            user.state = "truncated"
+            logger.warning(
+                f"  ⚠️ {user.user_id} truncated at request {user.current_idx + 1}: "
+                f"server rejected context length "
+                f"(trace input_tokens={request['input_tokens']:,})"
+            )
+            return None
 
         # Track connection errors
         if error_type == "connection":
