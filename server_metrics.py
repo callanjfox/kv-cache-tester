@@ -6,6 +6,7 @@ Supports vLLM and sglang backends (auto-detected from metrics prefix).
 
 import asyncio
 import csv
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from pathlib import Path
 
 import aiohttp
 import matplotlib.pyplot as plt
+
+logger = logging.getLogger("trace_replay")
 
 
 @dataclass
@@ -182,7 +185,7 @@ class MetricsCollector:
             self._backend = detect_backend(text)
             self._parser = get_parser(self._backend)
             if self._backend != 'unknown':
-                print(f"Auto-detected metrics backend: {self._backend}")
+                logger.info(f"Auto-detected metrics backend: {self._backend}")
         return self._parser.parse(text)
 
     async def _poll_loop(self) -> None:
@@ -197,7 +200,7 @@ class MetricsCollector:
                             snapshot = self._parse_metrics(text)
                             self.snapshots.append(snapshot)
                 except Exception as e:
-                    print(f"Metrics poll error: {e}")
+                    logger.warning(f"Metrics poll error: {e}")
 
                 await asyncio.sleep(self.poll_interval)
 
@@ -233,7 +236,7 @@ class MetricsCollector:
         if first_active is not None and first_active > 0:
             dropped = first_active
             self.snapshots = self.snapshots[first_active:]
-            print(f"Trimmed {dropped} idle leading snapshots before output")
+            logger.info(f"Trimmed {dropped} idle leading snapshots before output")
 
     def generate_plots(
         self,
@@ -249,7 +252,7 @@ class MetricsCollector:
         self._trim_idle_prefix()
 
         if len(self.snapshots) < 2:
-            print("Not enough data points for plots")
+            logger.warning("Not enough data points for plots")
             return
 
         # Convert to relative time (seconds from start)
@@ -621,7 +624,7 @@ class MetricsCollector:
 
         plt.tight_layout()
         plt.savefig(f"{output_prefix}_plots.png", dpi=150)
-        print(f"Saved plots to {output_prefix}_plots.png")
+        logger.info(f"Saved plots to {output_prefix}_plots.png")
         plt.close()
 
         # Also generate a summary
@@ -639,34 +642,34 @@ class MetricsCollector:
         final = self.snapshots[-1]
         initial = self.snapshots[0]
 
-        print("\n" + "="*60)
-        print("METRICS SUMMARY")
-        print("="*60)
-        print(f"Duration: {duration:.1f}s")
-        print(f"Total prompt tokens: {total_prompt_tokens:,}")
-        print(f"Total generation tokens: {total_gen_tokens:,}")
-        print(f"Avg generation throughput: {total_gen_tokens/duration:.1f} tok/s")
-        print(f"Peak KV cache usage: {max(s.kv_cache_usage for s in self.snapshots)*100:.1f}%")
-        print(f"Peak running requests: {max(s.num_requests_running for s in self.snapshots)}")
-        print(f"Peak waiting requests: {max(s.num_requests_waiting for s in self.snapshots)}")
-        print(f"Total preemptions: {final.num_preemptions - initial.num_preemptions}")
+        logger.info(f"{'='*60}")
+        logger.info(f"SERVER METRICS SUMMARY")
+        logger.info(f"{'='*60}")
+        logger.info(f"Duration: {duration:.1f}s")
+        logger.info(f"Total prompt tokens: {total_prompt_tokens:,}")
+        logger.info(f"Total generation tokens: {total_gen_tokens:,}")
+        logger.info(f"Avg generation throughput: {total_gen_tokens/duration:.1f} tok/s")
+        logger.info(f"Peak KV cache usage: {max(s.kv_cache_usage for s in self.snapshots)*100:.1f}%")
+        logger.info(f"Peak running requests: {max(s.num_requests_running for s in self.snapshots)}")
+        logger.info(f"Peak waiting requests: {max(s.num_requests_waiting for s in self.snapshots)}")
+        logger.info(f"Total preemptions: {final.num_preemptions - initial.num_preemptions}")
 
         if final.prefix_cache_queries > initial.prefix_cache_queries:
             delta_hits = final.prefix_cache_hits - initial.prefix_cache_hits
             delta_queries = final.prefix_cache_queries - initial.prefix_cache_queries
             hit_rate = 100.0 * delta_hits / delta_queries
-            print(f"Overall GPU cache hit rate: {hit_rate:.1f}%")
-            print(f"  - Cache hits: {delta_hits:,} tokens")
-            print(f"  - Cache queries: {delta_queries:,} tokens")
+            logger.info(f"Overall GPU cache hit rate: {hit_rate:.1f}%")
+            logger.info(f"  - Cache hits: {delta_hits:,} tokens")
+            logger.info(f"  - Cache queries: {delta_queries:,} tokens")
 
         # External/offloaded cache stats if available
         if final.cpu_prefix_cache_queries > initial.cpu_prefix_cache_queries:
             cpu_delta_hits = final.cpu_prefix_cache_hits - initial.cpu_prefix_cache_hits
             cpu_delta_queries = final.cpu_prefix_cache_queries - initial.cpu_prefix_cache_queries
             cpu_hit_rate = 100.0 * cpu_delta_hits / cpu_delta_queries
-            print(f"Overall external cache hit rate: {cpu_hit_rate:.1f}%")
-            print(f"  - Cache hits: {cpu_delta_hits:,} tokens")
-            print(f"  - Cache queries: {cpu_delta_queries:,} tokens")
+            logger.info(f"Overall external cache hit rate: {cpu_hit_rate:.1f}%")
+            logger.info(f"  - Cache hits: {cpu_delta_hits:,} tokens")
+            logger.info(f"  - Cache queries: {cpu_delta_queries:,} tokens")
 
         # Prompt tokens by source
         total_compute = final.prompt_tokens_local_compute - initial.prompt_tokens_local_compute
@@ -674,10 +677,10 @@ class MetricsCollector:
         total_ext = final.prompt_tokens_external_kv_transfer - initial.prompt_tokens_external_kv_transfer
         total_by_source = total_compute + total_cache_hit + total_ext
         if total_by_source > 0:
-            print(f"Prompt token sources:")
-            print(f"  - Prefill:            {total_compute:>12,} ({100*total_compute/total_by_source:.1f}%)")
-            print(f"  - HBM cache hit:      {total_cache_hit:>12,} ({100*total_cache_hit/total_by_source:.1f}%)")
-            print(f"  - Offload cache hit:  {total_ext:>12,} ({100*total_ext/total_by_source:.1f}%)")
+            logger.info(f"Prompt token sources:")
+            logger.info(f"  - Prefill:            {total_compute:>12,} ({100*total_compute/total_by_source:.1f}%)")
+            logger.info(f"  - HBM cache hit:      {total_cache_hit:>12,} ({100*total_cache_hit/total_by_source:.1f}%)")
+            logger.info(f"  - Offload cache hit:  {total_ext:>12,} ({100*total_ext/total_by_source:.1f}%)")
 
         # KV offload transfer stats
         g2c_bytes = final.kv_offload_bytes_gpu_to_cpu - initial.kv_offload_bytes_gpu_to_cpu
@@ -685,19 +688,19 @@ class MetricsCollector:
         g2c_time = final.kv_offload_time_gpu_to_cpu - initial.kv_offload_time_gpu_to_cpu
         c2g_time = final.kv_offload_time_cpu_to_gpu - initial.kv_offload_time_cpu_to_gpu
         if g2c_bytes > 0 or c2g_bytes > 0:
-            print(f"KV offload transfers:")
-            print(f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB in {g2c_time:.2f}s ({g2c_bytes/g2c_time/1e9:.1f} GB/s)" if g2c_time > 0 else f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB")
-            print(f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB in {c2g_time:.2f}s ({c2g_bytes/c2g_time/1e9:.1f} GB/s)" if c2g_time > 0 else f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB")
+            logger.info(f"KV offload transfers:")
+            logger.info(f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB in {g2c_time:.2f}s ({g2c_bytes/g2c_time/1e9:.1f} GB/s)" if g2c_time > 0 else f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB")
+            logger.info(f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB in {c2g_time:.2f}s ({c2g_bytes/c2g_time/1e9:.1f} GB/s)" if c2g_time > 0 else f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB")
 
         # Prefill KV computed tokens
         delta_kv_sum = final.prefill_kv_computed_tokens_sum - initial.prefill_kv_computed_tokens_sum
         delta_kv_count = final.prefill_kv_computed_tokens_count - initial.prefill_kv_computed_tokens_count
         if delta_kv_count > 0:
-            print(f"Prefill KV computed tokens (excluding cached):")
-            print(f"  Total: {delta_kv_sum:,} tokens across {delta_kv_count:,} requests")
-            print(f"  Avg per request: {delta_kv_sum/delta_kv_count:.0f} tokens")
+            logger.info(f"Prefill KV computed tokens (excluding cached):")
+            logger.info(f"  Total: {delta_kv_sum:,} tokens across {delta_kv_count:,} requests")
+            logger.info(f"  Avg per request: {delta_kv_sum/delta_kv_count:.0f} tokens")
 
-        print("="*60 + "\n")
+        logger.info(f"{'='*60}")
 
     def export_csv(
         self,
@@ -807,7 +810,7 @@ class MetricsCollector:
                         f"{throughput:.2f}",
                     ])
 
-            print(f"Exported server metrics to {server_csv}")
+            logger.info(f"Exported server metrics to {server_csv}")
 
         # 2. Export GPU transfer stats (DEPRECATED - kept for backward compat)
         if self.gpu_transfer_collector and self.gpu_transfer_collector.snapshots:
@@ -846,7 +849,7 @@ class MetricsCollector:
                         f"{cumulative_rx:.4f}",
                     ])
 
-            print(f"Exported GPU transfer metrics to {gpu_csv}")
+            logger.info(f"Exported GPU transfer metrics to {gpu_csv}")
 
         # 3. Export client metrics (per-request stats)
         if client_metrics and len(client_metrics) > 0:
@@ -894,4 +897,4 @@ class MetricsCollector:
                         f"{interactivity:.2f}",
                     ])
 
-            print(f"Exported client metrics to {client_csv}")
+            logger.info(f"Exported client metrics to {client_csv}")
