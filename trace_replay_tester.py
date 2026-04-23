@@ -2842,6 +2842,12 @@ class TestOrchestrator:
         except KeyboardInterrupt:
             logger.info(f"\n{Colors.WARNING}Test interrupted by user{Colors.ENDC}")
 
+        # Stop metrics collector immediately so the tail-end drain of in-flight
+        # requests isn't measured as part of the benchmark.
+        if self.metrics_collector:
+            await self.metrics_collector.stop()
+            logger.info("Server metrics collector stopped")
+
         # Wait for remaining in-flight requests to complete
         if pending_tasks:
             logger.info(f"Waiting for {len(pending_tasks)} in-flight requests to complete...")
@@ -2857,10 +2863,6 @@ class TestOrchestrator:
                 logger.warning(f"{len(pending)} requests still outstanding after 60s timeout — cancelling")
                 for task in pending:
                     task.cancel()
-
-        if self.metrics_collector:
-            await self.metrics_collector.stop()
-            logger.info("Server metrics collector stopped")
 
         self.running = False
         self.print_summary()
