@@ -2090,6 +2090,15 @@ class TestOrchestrator:
         logger.info(f"{Colors.HEADER}  🔀 {sa_id} spawned from {parent.user_id} "
                      f"({sa_reqs} requests, {subagent_entry.get('subagent_type', 'unknown')}){Colors.ENDC}")
 
+    def process_subagent_markers(self, user: UserSession):
+        """Spawn consecutive sub-agent markers at the user's current position."""
+        while user.current_idx < len(user.requests):
+            req = user.requests[user.current_idx]
+            if req.get('type') != 'subagent':
+                break
+            self.spawn_subagent(user, req)
+            user.current_idx += 1
+
     def log_lifecycle_event(self, user_id: str, event_type: str, trace_id: str, details: str = ""):
         """Log a user lifecycle event"""
         event = UserLifecycleEvent(
@@ -2406,7 +2415,7 @@ class TestOrchestrator:
                 logger.warning(f"{Colors.WARNING}  ⚠️ Max concurrent requests limit ({self.config.max_concurrent_requests}) "
                               f"may be constraining throughput. Consider increasing --max-concurrent-requests{Colors.ENDC}")
 
-    async def run_user_request(self, user: UserSession) -> Optional[RequestMetrics]:
+    async def run_user_request(self, user: UserSession, record_user_metrics: bool = True) -> Optional[RequestMetrics]:
         """Execute a single request for a user"""
         request = user.get_next_request()
         if request is None:
@@ -2551,7 +2560,8 @@ class TestOrchestrator:
             tokens_per_chunk=tokens_per_chunk
         )
 
-        user.metrics.append(metrics)
+        if record_user_metrics:
+            user.metrics.append(metrics)
         user.advance()
 
         if user.current_idx >= len(user.requests):
@@ -2580,45 +2590,45 @@ class TestOrchestrator:
         logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
 
         tasks = []
-        for uid, user in advanced:
-            while user.current_idx < len(user.requests):
-                req = user.requests[user.current_idx]
-                if req.get('type') != 'subagent':
-                    break
-                self.spawn_subagent(user, req)
-                user.current_idx += 1
+        users_to_warm = deque(user for _, user in advanced)
+        seen_warmup_users = set()
+        while users_to_warm:
+            user = users_to_warm.popleft()
+            if user.user_id in seen_warmup_users:
+                continue
+            seen_warmup_users.add(user.user_id)
+
+            self.process_subagent_markers(user)
+            for sa_id in list(user.pending_subagents):
+                sa_user = self.users.get(sa_id)
+                if sa_user:
+                    users_to_warm.append(sa_user)
 
             if user.current_idx >= len(user.requests):
+                if user.pending_subagents:
+                    continue
                 user.state = "completed"
                 continue
 
+            if user.pending_subagents:
+                continue
+
             req = user.requests[user.current_idx]
-            logger.info(f"  {uid}: {req['input_tokens']:,} tokens "
+            logger.info(f"  {user.user_id}: {req['input_tokens']:,} tokens "
                         f"(req {user.current_idx + 1}/{len(user.requests)})")
 
             self.in_flight_requests += 1
-            tasks.append(asyncio.create_task(self.run_user_request(user)))
+            tasks.append(asyncio.create_task(self.run_user_request(user, record_user_metrics=False)))
 
-        # Also dispatch one request per spawned subagent
-        for uid, user in advanced:
-            for sa_id in list(user.pending_subagents):
-                sa_user = self.users.get(sa_id)
-                if not sa_user:
-                    continue
-                while sa_user.current_idx < len(sa_user.requests):
-                    if sa_user.requests[sa_user.current_idx].get('type') != 'subagent':
-                        break
-                    sa_user.current_idx += 1
-                if sa_user.current_idx < len(sa_user.requests):
-                    self.in_flight_requests += 1
-                    tasks.append(asyncio.create_task(self.run_user_request(sa_user)))
-
+        warmup_count = 0
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=300)
             for task in done:
                 self.in_flight_requests -= 1
                 try:
-                    await task
+                    result = await task
+                    if isinstance(result, RequestMetrics):
+                        warmup_count += 1
                 except Exception as e:
                     logger.warning(f"Warmup request failed: {e}")
             for task in pending:
@@ -2626,7 +2636,6 @@ class TestOrchestrator:
                 task.cancel()
                 logger.warning("Warmup request timed out (300s)")
 
-        warmup_count = len(self.all_metrics)
         self.all_metrics.clear()
         self.output_token_log.clear()
 
@@ -2683,14 +2692,9 @@ class TestOrchestrator:
                     if user.state != "idle":
                         continue
                     # Process consecutive sub-agent markers (e.g., 4 agents spawned at once)
-                    while user.current_idx < len(user.requests):
-                        req = user.requests[user.current_idx]
-                        if req.get('type') != 'subagent':
-                            break
-                        self.spawn_subagent(user, req)
-                        user.current_idx += 1
+                    self.process_subagent_markers(user)
                     # Check if we exhausted all requests (only had sub-agents left)
-                    if user.current_idx >= len(user.requests):
+                    if user.current_idx >= len(user.requests) and not user.pending_subagents:
                         user.state = "completed"
 
                 # Phase 1: Collect ready users with their ready_at times
