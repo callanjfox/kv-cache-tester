@@ -260,6 +260,7 @@ class TestConfig:
     debug_trace: bool = False  # Store full request/response bodies to JSONL
     no_max_tokens: bool = False  # Don't enforce max_tokens from trace; let model generate freely
     metrics_output_prefix: Optional[str] = None  # Enable server metrics collection
+    warmup_enabled: bool = False  # Pre-send one request per advanced user before metrics start
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -2560,6 +2561,78 @@ class TestOrchestrator:
 
         return metrics
 
+    async def warmup_advanced_users(self):
+        """Send one request per advanced user to warm the server's KV cache.
+
+        Dispatches all warmup requests concurrently. Metrics from warmup
+        are discarded so they don't affect benchmark results.
+        """
+        advanced = [
+            (uid, user) for uid, user in self.users.items()
+            if user.current_idx > 0
+        ]
+        if not advanced:
+            logger.info(f"{Colors.PHASE}Warmup: no advanced users, skipping{Colors.ENDC}")
+            return
+
+        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}WARMUP: Prefilling {len(advanced)} advanced conversations...{Colors.ENDC}")
+        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+
+        tasks = []
+        for uid, user in advanced:
+            while user.current_idx < len(user.requests):
+                req = user.requests[user.current_idx]
+                if req.get('type') != 'subagent':
+                    break
+                self.spawn_subagent(user, req)
+                user.current_idx += 1
+
+            if user.current_idx >= len(user.requests):
+                user.state = "completed"
+                continue
+
+            req = user.requests[user.current_idx]
+            logger.info(f"  {uid}: {req['input_tokens']:,} tokens "
+                        f"(req {user.current_idx + 1}/{len(user.requests)})")
+
+            self.in_flight_requests += 1
+            tasks.append(asyncio.create_task(self.run_user_request(user)))
+
+        # Also dispatch one request per spawned subagent
+        for uid, user in advanced:
+            for sa_id in list(user.pending_subagents):
+                sa_user = self.users.get(sa_id)
+                if not sa_user:
+                    continue
+                while sa_user.current_idx < len(sa_user.requests):
+                    if sa_user.requests[sa_user.current_idx].get('type') != 'subagent':
+                        break
+                    sa_user.current_idx += 1
+                if sa_user.current_idx < len(sa_user.requests):
+                    self.in_flight_requests += 1
+                    tasks.append(asyncio.create_task(self.run_user_request(sa_user)))
+
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=300)
+            for task in done:
+                self.in_flight_requests -= 1
+                try:
+                    await task
+                except Exception as e:
+                    logger.warning(f"Warmup request failed: {e}")
+            for task in pending:
+                self.in_flight_requests -= 1
+                task.cancel()
+                logger.warning("Warmup request timed out (300s)")
+
+        warmup_count = len(self.all_metrics)
+        self.all_metrics.clear()
+        self.output_token_log.clear()
+
+        logger.info(f"{Colors.PHASE}WARMUP COMPLETE: {warmup_count} requests prefilled, "
+                     f"metrics cleared{Colors.ENDC}")
+
     async def run(self):
         """Main test loop"""
         self.test_start_time = time.time()
@@ -2570,6 +2643,12 @@ class TestOrchestrator:
 
         # Create initial users (with delay between each to avoid overwhelming server)
         await self.create_users_batch(self.config.start_users, advance=True)
+
+        # Warmup: pre-send one request per advanced user before metrics start
+        if self.config.warmup_enabled:
+            await self.warmup_advanced_users()
+            self.test_start_time = time.time()
+            self.current_period_start = time.time()
 
         if self.metrics_collector:
             self.metrics_collector.start()
@@ -3199,6 +3278,11 @@ def parse_arguments():
                         help="Maximum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
     parser.add_argument("--advance-all-users", action="store_true", default=False,
                         help="Advance all users (including ramp-up). Default: only initial users are advanced")
+    parser.add_argument("--warmup-enabled", action="store_true", default=False,
+                        help="Pre-send one request per advanced user before the benchmark starts. "
+                             "Warms the server's KV prefix cache so the test begins from steady "
+                             "state instead of a thundering herd of long-context prefills. "
+                             "Only affects users that were advanced mid-conversation.")
 
     # EOS control
     parser.add_argument("--ignore-eos", action="store_true", default=False,
@@ -3313,6 +3397,7 @@ async def main():
         debug_trace=args.debug_trace,
         no_max_tokens=args.no_max_tokens,
         metrics_output_prefix=args.metrics_output_prefix,
+        warmup_enabled=args.warmup_enabled,
     )
 
     # Print header
