@@ -2509,17 +2509,19 @@ class TestOrchestrator:
 
         in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
 
-        def _latency(name: str, avg: float, p50: float, p95: float, p99: float, unit: str) -> str:
-            return (
-                f"  {name:<22} avg={avg:.2f}{unit} | p50={p50:.2f}{unit} | "
-                f"p95={p95:.2f}{unit} | p99={p99:.2f}{unit}"
-            )
+        label_width = 24
+        col_width = 12
 
-        def _tokens(name: str, avg: float, p50: float, p95: float, p99: float) -> str:
-            return (
-                f"  {name:<22} avg={avg:,.0f} | p50={p50:,.0f} | "
-                f"p95={p95:,.0f} | p99={p99:,.0f}"
-            )
+        def _row(label: str, avg, p50, p95, p99, num_fmt: str) -> str:
+            vals = "".join(num_fmt.format(v) for v in (avg, p50, p95, p99))
+            return f"  {label:<{label_width}}{vals}"
+
+        header_cols = "".join(c.rjust(col_width) for c in ("avg", "p50", "p95", "p99"))
+        header_row = f"  {'':<{label_width}}{header_cols}"
+
+        lat_fmt = f"{{:>{col_width},.2f}}"
+        tok_fmt = f"{{:>{col_width},.0f}}"
+        pct_fmt = f"{{:>{col_width - 1},.1f}}%"  # "%" eats one char → keep right-alignment
 
         lines = [
             f"{Colors.PHASE}{'=' * 120}{Colors.ENDC}",
@@ -2530,47 +2532,52 @@ class TestOrchestrator:
             f"  Completed: {metrics.cumulative_requests_completed:,} requests | "
             f"{metrics.conversations_finished} conversations finished",
             "",
-            _latency("TTFT (s):",
-                     metrics.cumulative_ttft_avg, metrics.cumulative_ttft_p50,
-                     metrics.cumulative_ttft_p95, metrics.cumulative_ttft_p99, "s"),
-            _latency("Interactivity (tok/s):",
-                     metrics.cumulative_interactivity_avg, metrics.cumulative_interactivity_p50,
-                     metrics.cumulative_interactivity_p95, metrics.cumulative_interactivity_p99, ""),
-            _latency("Wait time (s):",
-                     metrics.cumulative_wait_time_avg, metrics.cumulative_wait_time_p50,
-                     metrics.cumulative_wait_time_p95, metrics.cumulative_wait_time_p99, "s"),
-            "",
-            _tokens("ISL (tokens):",
-                    metrics.cumulative_isl_avg, metrics.cumulative_isl_p50,
-                    metrics.cumulative_isl_p95, metrics.cumulative_isl_p99),
-            _tokens("OSL (tokens):",
-                    metrics.cumulative_osl_avg, metrics.cumulative_osl_p50,
-                    metrics.cumulative_osl_p95, metrics.cumulative_osl_p99),
-            f"  Totals:                input={metrics.cumulative_total_input_tokens:,} tokens | "
-            f"output={metrics.cumulative_total_output_tokens:,} tokens",
+            header_row,
+            _row("TTFT (s)",
+                 metrics.cumulative_ttft_avg, metrics.cumulative_ttft_p50,
+                 metrics.cumulative_ttft_p95, metrics.cumulative_ttft_p99, lat_fmt),
+            _row("Interactivity (tok/s)",
+                 metrics.cumulative_interactivity_avg, metrics.cumulative_interactivity_p50,
+                 metrics.cumulative_interactivity_p95, metrics.cumulative_interactivity_p99, lat_fmt),
+            _row("Wait time (s)",
+                 metrics.cumulative_wait_time_avg, metrics.cumulative_wait_time_p50,
+                 metrics.cumulative_wait_time_p95, metrics.cumulative_wait_time_p99, lat_fmt),
+            _row("ISL (tokens)",
+                 metrics.cumulative_isl_avg, metrics.cumulative_isl_p50,
+                 metrics.cumulative_isl_p95, metrics.cumulative_isl_p99, tok_fmt),
+            _row("OSL (tokens)",
+                 metrics.cumulative_osl_avg, metrics.cumulative_osl_p50,
+                 metrics.cumulative_osl_p95, metrics.cumulative_osl_p99, tok_fmt),
         ]
 
-        has_server = metrics.server_gpu_cache_hit_rate_avg is not None or metrics.server_kv_cache_usage_current is not None
-        if has_server:
-            lines.append("")
-            if metrics.server_gpu_cache_hit_rate_avg is not None:
-                lines.append(
-                    f"  Server GPU hit rate:   avg={metrics.server_gpu_cache_hit_rate_avg:.1%} | "
-                    f"p50={metrics.server_gpu_cache_hit_rate_p50:.1%} | "
-                    f"p95={metrics.server_gpu_cache_hit_rate_p95:.1%} | "
-                    f"p99={metrics.server_gpu_cache_hit_rate_p99:.1%}"
-                )
-            if metrics.server_cpu_cache_hit_rate_avg is not None:
-                lines.append(
-                    f"  Server CPU hit rate:   avg={metrics.server_cpu_cache_hit_rate_avg:.1%} | "
-                    f"p50={metrics.server_cpu_cache_hit_rate_p50:.1%} | "
-                    f"p95={metrics.server_cpu_cache_hit_rate_p95:.1%} | "
-                    f"p99={metrics.server_cpu_cache_hit_rate_p99:.1%}"
-                )
-            if metrics.server_kv_cache_usage_current is not None:
-                lines.append(
-                    f"  KV cache usage (now):  {metrics.server_kv_cache_usage_current:.1%}"
-                )
+        if metrics.server_gpu_cache_hit_rate_avg is not None:
+            lines.append(_row(
+                "Server GPU hit rate",
+                metrics.server_gpu_cache_hit_rate_avg * 100,
+                metrics.server_gpu_cache_hit_rate_p50 * 100,
+                metrics.server_gpu_cache_hit_rate_p95 * 100,
+                metrics.server_gpu_cache_hit_rate_p99 * 100,
+                pct_fmt,
+            ))
+        if metrics.server_cpu_cache_hit_rate_avg is not None:
+            lines.append(_row(
+                "Server CPU hit rate",
+                metrics.server_cpu_cache_hit_rate_avg * 100,
+                metrics.server_cpu_cache_hit_rate_p50 * 100,
+                metrics.server_cpu_cache_hit_rate_p95 * 100,
+                metrics.server_cpu_cache_hit_rate_p99 * 100,
+                pct_fmt,
+            ))
+
+        lines.append("")
+        lines.append(
+            f"  Total tokens:           input={metrics.cumulative_total_input_tokens:,} | "
+            f"output={metrics.cumulative_total_output_tokens:,}"
+        )
+        if metrics.server_kv_cache_usage_current is not None:
+            lines.append(
+                f"  KV cache usage (now):   {metrics.server_kv_cache_usage_current:.1%}"
+            )
 
         logger.info("\n".join(lines))
 
