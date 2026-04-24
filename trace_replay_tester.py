@@ -358,6 +358,47 @@ class AssessmentPeriodMetrics:
     # Infinite-cache hit rate over all completed requests so far.
     cumulative_cache_hit_rate: float = 0.0
 
+    # Cumulative interactivity (1/TPOT, tokens/sec)
+    cumulative_interactivity_avg: float = 0.0
+    cumulative_interactivity_p50: float = 0.0
+    cumulative_interactivity_p95: float = 0.0
+    cumulative_interactivity_p99: float = 0.0
+
+    # Cumulative wait time (dispatch delay, seconds)
+    cumulative_wait_time_avg: float = 0.0
+    cumulative_wait_time_p50: float = 0.0
+    cumulative_wait_time_p95: float = 0.0
+    cumulative_wait_time_p99: float = 0.0
+
+    # Cumulative ISL / OSL distributions
+    cumulative_isl_avg: float = 0.0
+    cumulative_isl_p50: float = 0.0
+    cumulative_isl_p95: float = 0.0
+    cumulative_isl_p99: float = 0.0
+    cumulative_osl_avg: float = 0.0
+    cumulative_osl_p50: float = 0.0
+    cumulative_osl_p95: float = 0.0
+    cumulative_osl_p99: float = 0.0
+
+    cumulative_total_input_tokens: int = 0
+    cumulative_total_output_tokens: int = 0
+
+    conversations_finished: int = 0
+
+    # Server metrics (None when metrics collector disabled)
+    server_gpu_cache_hit_rate_avg: Optional[float] = None
+    server_gpu_cache_hit_rate_p50: Optional[float] = None
+    server_gpu_cache_hit_rate_p95: Optional[float] = None
+    server_gpu_cache_hit_rate_p99: Optional[float] = None
+    server_cpu_cache_hit_rate_avg: Optional[float] = None
+    server_cpu_cache_hit_rate_p50: Optional[float] = None
+    server_cpu_cache_hit_rate_p95: Optional[float] = None
+    server_cpu_cache_hit_rate_p99: Optional[float] = None
+    server_kv_cache_usage_current: Optional[float] = None
+
+    # Time remaining in benchmark (seconds, 0 if no test_duration)
+    time_remaining_s: int = 0
+
 
 # =============================================================================
 # Trace Normalization (new format support)
@@ -1901,6 +1942,8 @@ class TestOrchestrator:
         self.in_flight_decoding: int = 0  # Requests that have received first token (in decode phase)
         self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
+        self.all_dispatch_delays: List[float] = []  # Dispatch delays across all periods (cumulative)
+        self.conversations_finished: int = 0  # Cumulative count of users that reached 'completed' state
 
 
         # Error tracking
@@ -2003,6 +2046,7 @@ class TestOrchestrator:
                                  f"{summary['requests_completed']}/{summary['requests_total']} requests, {summary['avg_cache_hit_rate']:.1%} cache hit")
 
         if reason == "completed":
+            self.conversations_finished += 1
             logger.info(f"{Colors.SUCCESS}  ✓ {user_id} completed{Colors.ENDC} ({summary['requests_completed']}/{summary['requests_total']} requests, {summary['avg_cache_hit_rate']:.1%} cache hit)")
         else:
             logger.warning(f"  ⚠️ {user_id} stopped at request {summary['requests_completed']}/{summary['requests_total']} (next request exceeds --max-context {self.config.max_context:,} tokens)")
@@ -2299,11 +2343,55 @@ class TestOrchestrator:
         total_elapsed = max(total_elapsed, 0.001)
 
         all_ttfts = [m.ttft for m in all_completed if m.ttft > 0]
-        cum_total_input = sum(m.input_tokens for m in all_completed)
-        cum_total_output = sum(m.output_tokens_actual for m in all_completed)
+        # Interactivity = 1/TPOT (tokens/sec) — skip metrics with no decode phase
+        all_interactivity = [1.0 / m.itl for m in all_completed if m.itl > 0]
+        all_isls = [m.input_tokens for m in all_completed]
+        all_osls = [m.output_tokens_actual for m in all_completed]
+        cum_total_input = sum(all_isls)
+        cum_total_output = sum(all_osls)
         cum_cache_hits = sum(m.cache_hit_blocks for m in all_completed)
         cum_cache_misses = sum(m.cache_miss_blocks for m in all_completed)
         cum_cache_total = cum_cache_hits + cum_cache_misses
+
+        # Server cache hit rate per-interval from collector snapshots
+        def _percentile_stats(values: List[float]) -> Tuple[float, float, float, float]:
+            if not values:
+                return 0.0, 0.0, 0.0, 0.0
+            return (
+                float(np.mean(values)),
+                float(np.percentile(values, 50)),
+                float(np.percentile(values, 95)),
+                float(np.percentile(values, 99)),
+            )
+
+        gpu_hit_rates: List[float] = []
+        cpu_hit_rates: List[float] = []
+        kv_usage_current: Optional[float] = None
+        if self.metrics_collector and self.metrics_collector.snapshots:
+            snaps = self.metrics_collector.snapshots
+            kv_usage_current = snaps[-1].kv_cache_usage
+            for i in range(1, len(snaps)):
+                prev, cur = snaps[i - 1], snaps[i]
+                dq = cur.prefix_cache_queries - prev.prefix_cache_queries
+                if dq > 0:
+                    dh = cur.prefix_cache_hits - prev.prefix_cache_hits
+                    gpu_hit_rates.append(dh / dq)
+                cdq = cur.cpu_prefix_cache_queries - prev.cpu_prefix_cache_queries
+                if cdq > 0:
+                    cdh = cur.cpu_prefix_cache_hits - prev.cpu_prefix_cache_hits
+                    cpu_hit_rates.append(cdh / cdq)
+        gpu_avg, gpu_p50, gpu_p95, gpu_p99 = _percentile_stats(gpu_hit_rates)
+        cpu_avg, cpu_p50, cpu_p95, cpu_p99 = _percentile_stats(cpu_hit_rates)
+
+        ttft_avg_c, ttft_p50_c, ttft_p95_c, ttft_p99_c = _percentile_stats(all_ttfts)
+        intvty_avg, intvty_p50, intvty_p95, intvty_p99 = _percentile_stats(all_interactivity)
+        wait_avg, wait_p50, wait_p95, wait_p99 = _percentile_stats(self.all_dispatch_delays)
+        isl_avg, isl_p50, isl_p95, isl_p99 = _percentile_stats([float(v) for v in all_isls])
+        osl_avg, osl_p50, osl_p95, osl_p99 = _percentile_stats([float(v) for v in all_osls])
+
+        time_remaining_s = 0
+        if self.config.test_duration and self.test_start_time:
+            time_remaining_s = max(0, int(self.config.test_duration - (end_time - self.test_start_time)))
 
         return AssessmentPeriodMetrics(
             period_number=period_number,
@@ -2340,71 +2428,128 @@ class TestOrchestrator:
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
             in_flight_decoding=self.in_flight_decoding,
-            cumulative_ttft_avg=np.mean(all_ttfts) if all_ttfts else 0,
-            cumulative_ttft_p50=np.percentile(all_ttfts, 50) if all_ttfts else 0,
-            cumulative_ttft_p95=np.percentile(all_ttfts, 95) if all_ttfts else 0,
-            cumulative_ttft_p99=np.percentile(all_ttfts, 99) if all_ttfts else 0,
+            cumulative_ttft_avg=ttft_avg_c,
+            cumulative_ttft_p50=ttft_p50_c,
+            cumulative_ttft_p95=ttft_p95_c,
+            cumulative_ttft_p99=ttft_p99_c,
             cumulative_requests_completed=len(all_completed),
             cumulative_requests_per_second=len(all_completed) / total_elapsed,
             cumulative_input_tokens_per_second=cum_total_input / total_elapsed,
             cumulative_output_tokens_per_second=cum_total_output / total_elapsed,
             cumulative_cache_hit_rate=cum_cache_hits / cum_cache_total if cum_cache_total > 0 else 0,
+            cumulative_interactivity_avg=intvty_avg,
+            cumulative_interactivity_p50=intvty_p50,
+            cumulative_interactivity_p95=intvty_p95,
+            cumulative_interactivity_p99=intvty_p99,
+            cumulative_wait_time_avg=wait_avg,
+            cumulative_wait_time_p50=wait_p50,
+            cumulative_wait_time_p95=wait_p95,
+            cumulative_wait_time_p99=wait_p99,
+            cumulative_isl_avg=isl_avg,
+            cumulative_isl_p50=isl_p50,
+            cumulative_isl_p95=isl_p95,
+            cumulative_isl_p99=isl_p99,
+            cumulative_osl_avg=osl_avg,
+            cumulative_osl_p50=osl_p50,
+            cumulative_osl_p95=osl_p95,
+            cumulative_osl_p99=osl_p99,
+            cumulative_total_input_tokens=cum_total_input,
+            cumulative_total_output_tokens=cum_total_output,
+            conversations_finished=self.conversations_finished,
+            server_gpu_cache_hit_rate_avg=gpu_avg if gpu_hit_rates else None,
+            server_gpu_cache_hit_rate_p50=gpu_p50 if gpu_hit_rates else None,
+            server_gpu_cache_hit_rate_p95=gpu_p95 if gpu_hit_rates else None,
+            server_gpu_cache_hit_rate_p99=gpu_p99 if gpu_hit_rates else None,
+            server_cpu_cache_hit_rate_avg=cpu_avg if cpu_hit_rates else None,
+            server_cpu_cache_hit_rate_p50=cpu_p50 if cpu_hit_rates else None,
+            server_cpu_cache_hit_rate_p95=cpu_p95 if cpu_hit_rates else None,
+            server_cpu_cache_hit_rate_p99=cpu_p99 if cpu_hit_rates else None,
+            server_kv_cache_usage_current=kv_usage_current,
+            time_remaining_s=time_remaining_s,
         )
 
     def print_assessment(self, metrics: AssessmentPeriodMetrics):
-        """Print assessment period summary"""
-        # Select the right metric based on config
-        ttft_value = self.get_ttft_value()
+        """Print assessment period summary (cumulative stats only)."""
 
-        if ttft_value is None:
-            measured_ttft = None
-            metric_name = "TTFT"
-        elif self.config.ttft_metric == 'max':
-            ttfts = [m.ttft for m in self.period_metrics if m.success]
-            measured_ttft = max(ttfts) if ttfts else 0
-            metric_name = "Max TTFT"
-        elif self.config.ttft_metric == 'avg':
-            measured_ttft = metrics.ttft_avg
-            metric_name = "Avg TTFT"
-        else:  # p95
-            measured_ttft = metrics.ttft_p95
-            metric_name = "P95 TTFT"
-        working_set_tokens = metrics.working_set_blocks * self.config.chunk_size
+        def _fmt_dur(seconds: int) -> str:
+            seconds = max(0, int(seconds))
+            if seconds >= 3600:
+                return f"{seconds // 3600:d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+            return f"{seconds // 60:d}:{seconds % 60:02d}"
 
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}Assessment Period {metrics.period_number}{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        logger.info(f"  Users: {metrics.active_users + metrics.idle_users} total ({metrics.users_with_requests} active this period)")
-        logger.info(f"  Requests: {metrics.requests_launched} launched | {metrics.requests_completed} completed ({metrics.requests_completed_new} new, {metrics.requests_completed_prior} prior) | {metrics.requests_in_progress} in-progress ({metrics.requests_in_progress_new} new, {metrics.requests_in_progress_prior} prior) ({metrics.requests_per_second:.2f} req/s)")
-        if measured_ttft is None:
-            logger.info(f"  {metric_name}: no data")
-        else:
-            logger.info(f"  {metric_name}: {measured_ttft:.2f}s")
-        logger.info(f"  {metric_name} (cumulative): avg={metrics.cumulative_ttft_avg:.2f}s | p50={metrics.cumulative_ttft_p50:.2f}s | p95={metrics.cumulative_ttft_p95:.2f}s | p99={metrics.cumulative_ttft_p99:.2f}s ({metrics.cumulative_requests_completed} reqs)")
-        logger.info(f"  Throughput: {metrics.input_tokens_per_second:,.0f} input tok/s | {metrics.output_tokens_per_second:,.0f} output tok/s")
-        logger.info(f"  Throughput (cumulative): {metrics.cumulative_input_tokens_per_second:,.0f} input tok/s | {metrics.cumulative_output_tokens_per_second:,.0f} output tok/s | {metrics.cumulative_requests_per_second:.2f} req/s")
-        logger.info(f"  Workload Cache Hit Rate: {metrics.avg_cache_hit_rate:.1%} | New input tokens: {metrics.new_tokens_ingested:,}")
-        logger.info(f"  Cache Hit Rate (cumulative, infinite-cache model): {metrics.cumulative_cache_hit_rate:.1%}")
+        header_suffix = ""
+        if self.config.test_duration:
+            header_suffix = (
+                f" ({_fmt_dur(metrics.time_remaining_s)} remaining "
+                f"/ {_fmt_dur(self.config.test_duration)})"
+            )
 
-        logger.info(f"  Working Set: {working_set_tokens:,} tokens ({metrics.working_set_blocks} blocks)")
+        in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
 
-        # Show time-windowed working set (1m, 5m, 15m)
-        windowed = self.compute_windowed_working_set()
-        logger.info(f"  Working Set by Age: 1m: {windowed['1m']:,} | 5m: {windowed['5m']:,} | 15m: {windowed['15m']:,} tokens")
+        def _latency(name: str, avg: float, p50: float, p95: float, p99: float, unit: str) -> str:
+            return (
+                f"  {name:<22} avg={avg:.2f}{unit} | p50={p50:.2f}{unit} | "
+                f"p95={p95:.2f}{unit} | p99={p99:.2f}{unit}"
+            )
 
+        def _tokens(name: str, avg: float, p50: float, p95: float, p99: float) -> str:
+            return (
+                f"  {name:<22} avg={avg:,.0f} | p50={p50:,.0f} | "
+                f"p95={p95:,.0f} | p99={p99:,.0f}"
+            )
 
-        # Show admission control metrics if enabled
-        if self.config.max_concurrent_requests:
-            total_in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
-            logger.info(f"  Admission Control: {total_in_flight}/{self.config.max_concurrent_requests} in-flight "
-                       f"({metrics.in_flight_prefilling} prefilling, {metrics.in_flight_decoding} decoding) | "
-                       f"{metrics.admission_blocked_events} blocked | "
-                       f"dispatch delay: {metrics.dispatch_delay_avg:.2f}s avg, {metrics.dispatch_delay_max:.2f}s max")
+        lines = [
+            f"{Colors.PHASE}{'=' * 120}{Colors.ENDC}",
+            f"{Colors.PHASE}Period {metrics.period_number}{header_suffix}{Colors.ENDC}",
+            f"{Colors.PHASE}{'=' * 120}{Colors.ENDC}",
+            f"  In-flight: {in_flight} ({metrics.in_flight_prefilling} prefilling, "
+            f"{metrics.in_flight_decoding} decoding)",
+            f"  Completed: {metrics.cumulative_requests_completed:,} requests | "
+            f"{metrics.conversations_finished} conversations finished",
+            "",
+            _latency("TTFT (s):",
+                     metrics.cumulative_ttft_avg, metrics.cumulative_ttft_p50,
+                     metrics.cumulative_ttft_p95, metrics.cumulative_ttft_p99, "s"),
+            _latency("Interactivity (tok/s):",
+                     metrics.cumulative_interactivity_avg, metrics.cumulative_interactivity_p50,
+                     metrics.cumulative_interactivity_p95, metrics.cumulative_interactivity_p99, ""),
+            _latency("Wait time (s):",
+                     metrics.cumulative_wait_time_avg, metrics.cumulative_wait_time_p50,
+                     metrics.cumulative_wait_time_p95, metrics.cumulative_wait_time_p99, "s"),
+            "",
+            _tokens("ISL (tokens):",
+                    metrics.cumulative_isl_avg, metrics.cumulative_isl_p50,
+                    metrics.cumulative_isl_p95, metrics.cumulative_isl_p99),
+            _tokens("OSL (tokens):",
+                    metrics.cumulative_osl_avg, metrics.cumulative_osl_p50,
+                    metrics.cumulative_osl_p95, metrics.cumulative_osl_p99),
+            f"  Totals:                input={metrics.cumulative_total_input_tokens:,} tokens | "
+            f"output={metrics.cumulative_total_output_tokens:,} tokens",
+        ]
 
-            # Warn if the limit appears to be constraining throughput
-            if metrics.admission_blocked_events > 100 or metrics.dispatch_delay_avg > 10.0:
-                logger.warning(f"{Colors.WARNING}  ⚠️ Max concurrent requests limit ({self.config.max_concurrent_requests}) "
-                              f"may be constraining throughput. Consider increasing --max-concurrent-requests{Colors.ENDC}")
+        has_server = metrics.server_gpu_cache_hit_rate_avg is not None or metrics.server_kv_cache_usage_current is not None
+        if has_server:
+            lines.append("")
+            if metrics.server_gpu_cache_hit_rate_avg is not None:
+                lines.append(
+                    f"  Server GPU hit rate:   avg={metrics.server_gpu_cache_hit_rate_avg:.1%} | "
+                    f"p50={metrics.server_gpu_cache_hit_rate_p50:.1%} | "
+                    f"p95={metrics.server_gpu_cache_hit_rate_p95:.1%} | "
+                    f"p99={metrics.server_gpu_cache_hit_rate_p99:.1%}"
+                )
+            if metrics.server_cpu_cache_hit_rate_avg is not None:
+                lines.append(
+                    f"  Server CPU hit rate:   avg={metrics.server_cpu_cache_hit_rate_avg:.1%} | "
+                    f"p50={metrics.server_cpu_cache_hit_rate_p50:.1%} | "
+                    f"p95={metrics.server_cpu_cache_hit_rate_p95:.1%} | "
+                    f"p99={metrics.server_cpu_cache_hit_rate_p99:.1%}"
+                )
+            if metrics.server_kv_cache_usage_current is not None:
+                lines.append(
+                    f"  KV cache usage (now):  {metrics.server_kv_cache_usage_current:.1%}"
+                )
+
+        logger.info("\n".join(lines))
 
     async def run_user_request(self, user: UserSession, record_user_metrics: bool = True) -> Optional[RequestMetrics]:
         """Execute a single request for a user"""
@@ -2744,6 +2889,7 @@ class TestOrchestrator:
                     # Track dispatch delay (how far behind schedule)
                     dispatch_delay = now - ready_at
                     self.period_dispatch_delays.append(dispatch_delay)
+                    self.all_dispatch_delays.append(dispatch_delay)
 
                     # Increment in-flight counter and dispatch
                     self.in_flight_requests += 1
