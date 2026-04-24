@@ -2758,7 +2758,7 @@ class TestOrchestrator:
 
         warmup_count = 0
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=300)
+            done, pending = await asyncio.wait(tasks, timeout=900)
             for task in done:
                 self.in_flight_requests -= 1
                 try:
@@ -2770,7 +2770,7 @@ class TestOrchestrator:
             for task in pending:
                 self.in_flight_requests -= 1
                 task.cancel()
-                logger.warning("Warmup request timed out (300s)")
+                logger.warning("Warmup request timed out (900s)")
 
         self.all_metrics.clear()
         self.output_token_log.clear()
