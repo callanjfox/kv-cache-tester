@@ -1126,6 +1126,26 @@ class SyntheticMessageGenerator:
 
         return {"role": "user", "content": content}
 
+    def count_chat_tokens(self, messages: List[dict]) -> int:
+        """Count the actual prompt tokens sent to the OpenAI-compatible server."""
+        self.load_tokenizer()
+        try:
+            tokens = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            return len(tokens)
+        except Exception as e:
+            logger.debug(f"Falling back to approximate chat token count: {e}")
+
+        # Conservative fallback for tokenizers without a chat template.
+        total = 8
+        for msg in messages:
+            total += len(self.tokenizer.encode(msg.get('content', ''), add_special_tokens=False))
+            total += 4
+        return total
+
     def generate_canonical_prefix(self, num_tokens: int) -> str:
         """Generate the canonical shared prefix content (deterministic, no user salt).
 
@@ -1181,18 +1201,18 @@ def calculate_start_index(requests: list, rng: random.Random,
     min_idx = int(len(requests) * min_pct)
     max_idx = min(int(len(requests) * max_pct), len(requests) - 1)
 
-    # Clamp max_idx so we don't start beyond max_context
+    candidate_indices = list(range(min_idx, max_idx + 1))
     if max_context > 0:
-        while max_idx > min_idx and requests[max_idx].get('input_tokens', 0) > max_context:
-            max_idx -= 1
-        # If even min_idx exceeds context, return 0 (start from beginning)
-        if requests[min_idx].get('input_tokens', 0) > max_context:
-            return 0
+        candidate_indices = [
+            idx for idx in candidate_indices
+            if requests[idx].get('type') != 'subagent'
+            and requests[idx].get('input_tokens', 0) <= max_context
+        ]
 
-    if min_idx >= max_idx:
-        return min_idx
+    if not candidate_indices:
+        return 0
 
-    return rng.randint(min_idx, max_idx)
+    return rng.choice(candidate_indices)
 
 
 def adjust_for_request_pairs(requests: list, start_idx: int) -> int:
@@ -1987,6 +2007,9 @@ class TestOrchestrator:
                 self.config.max_context)
             start_idx = adjust_for_request_pairs(trace['requests'], start_idx)
             start_idx = skip_subagent_markers(trace['requests'], start_idx)
+            if (start_idx < len(trace['requests']) and
+                    trace['requests'][start_idx].get('input_tokens', 0) > self.config.max_context):
+                start_idx = 0
 
             if start_idx > 0 and start_idx < len(trace['requests']):
                 seed = hash(f"{user_id}_advanced_{start_idx}") % (2**32)
@@ -2580,6 +2603,23 @@ class TestOrchestrator:
             canonical_prefix=self.canonical_prefix_content,
             canonical_prefix_tokens=self.canonical_prefix_tokens
         )
+        actual_input_tokens = self.generator.count_chat_tokens(messages)
+        if actual_input_tokens > self.config.max_context:
+            while len(self.block_access_order) > block_access_order_len:
+                self.block_access_order.pop()
+            for key, previous_access in previous_block_access.items():
+                if previous_access is None:
+                    self.block_last_access.pop(key, None)
+                else:
+                    self.block_last_access[key] = previous_access
+            user.seen_hash_ids = seen_hash_ids_before_request
+            user.state = "truncated"
+            logger.warning(
+                f"  ⚠️ {user.user_id} truncated at request {user.current_idx + 1}: "
+                f"actual prompt tokens {actual_input_tokens:,} exceed --max-context "
+                f"{self.config.max_context:,} (trace input_tokens={request['input_tokens']:,})"
+            )
+            return None
 
         # Calculate expected cache hits (infinite-cache model)
         cache_hits, cache_misses = user.calculate_cache_hits(request)
@@ -2678,7 +2718,7 @@ class TestOrchestrator:
             trace_id=user.trace_id,
             timestamp=time.time(),
             request_type=request['type'],
-            input_tokens=request['input_tokens'],
+            input_tokens=actual_input_tokens,
             output_tokens_expected=expected_output,
             output_tokens_actual=actual_output,
             cache_hit_blocks=cache_hits,
