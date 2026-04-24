@@ -252,13 +252,11 @@ class TestConfig:
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
     advance_all_users: bool = False  # If True, advance all users; if False, only initial users
-    ignore_eos: bool = False  # If True, force generation of exact output_tokens (ignore EOS)
     # Hash-block mode: deterministic per-request content keyed by hash_ids,
     # bypassing pullback/growth heuristics. Intended for traces with interleaved
     # subagent requests (e.g. neon traces) where sequential hash_id diffs are noisy.
     hash_block_mode: bool = False
     debug_trace: bool = False  # Store full request/response bodies to JSONL
-    no_max_tokens: bool = False  # Don't enforce max_tokens from trace; let model generate freely
     metrics_output_prefix: Optional[str] = None  # Enable server metrics collection
     warmup_enabled: bool = False  # Pre-send one request per advanced user before metrics start
 
@@ -1211,13 +1209,12 @@ class UserSession:
     """
 
     def __init__(self, user_id: str, trace: dict, generator: SyntheticMessageGenerator, max_context: int,
-                 hash_block_mode: bool = False, no_max_tokens: bool = False):
+                 hash_block_mode: bool = False):
         self.user_id = user_id
         self.trace = trace
         self.generator = generator
         self.max_context = max_context
         self.hash_block_mode = hash_block_mode
-        self.no_max_tokens = no_max_tokens
 
         self.trace_id = trace['metadata']['conversation_id']
         self.requests = trace['requests']
@@ -1412,10 +1409,7 @@ class UserSession:
         Returns:
             Tuple of (messages list, max_tokens for this request)
         """
-        if self.no_max_tokens:
-            max_tokens = None
-        else:
-            max_tokens = max(1, request.get('output_tokens', 100))
+        max_tokens = max(1, request.get('output_tokens', 100))
         current_hash_ids = set(request.get('hash_ids', []))
         current_input_tokens = request.get('input_tokens', 0)
 
@@ -1587,11 +1581,9 @@ class APIClient:
                  top_p: Optional[float] = None,
                  top_k: Optional[int] = None,
                  repetition_penalty: Optional[float] = None,
-                 ignore_eos: bool = False,
                  debug_trace: bool = False):
         self.api_endpoint = api_endpoint
         self.model = model
-        self.ignore_eos = ignore_eos
         self.debug_trace = debug_trace
         self._debug_trace_records: List[dict] = []
 
@@ -1691,11 +1683,12 @@ class APIClient:
             extra_body["top_k"] = self.top_k
         if self.repetition_penalty is not None:
             extra_body["repetition_penalty"] = self.repetition_penalty
-        if self.ignore_eos:
-            extra_body["ignore_eos"] = True
+        # Always force exact output token counts from trace — every request
+        # generates exactly max_tokens regardless of EOS. This makes throughput
+        # comparable across models and removes any early-termination bias.
+        extra_body["ignore_eos"] = True
 
-        if extra_body:
-            params["extra_body"] = extra_body
+        params["extra_body"] = extra_body
 
         return params
 
@@ -1939,8 +1932,7 @@ class TestOrchestrator:
         user_id = f"User-{self.user_counter:03d}"
 
         user = UserSession(user_id, trace, self.generator, self.config.max_context,
-                           hash_block_mode=self.config.hash_block_mode,
-                           no_max_tokens=self.config.no_max_tokens)
+                           hash_block_mode=self.config.hash_block_mode)
         user.start_time = time.time()
 
         # Apply trace advancement if configured and allowed for this user
@@ -2077,8 +2069,7 @@ class TestOrchestrator:
         })
 
         sa_user = UserSession(sa_id, sa_trace, parent.generator, parent.max_context,
-                              hash_block_mode=parent.hash_block_mode,
-                              no_max_tokens=parent.no_max_tokens)
+                              hash_block_mode=parent.hash_block_mode)
         sa_user.is_subagent = True
         sa_user.parent_user_id = parent.user_id
         sa_user.start_time = time.time()
@@ -3290,17 +3281,6 @@ def parse_arguments():
                              "state instead of a thundering herd of long-context prefills. "
                              "Only affects users that were advanced mid-conversation.")
 
-    # EOS control
-    parser.add_argument("--ignore-eos", action="store_true", default=False,
-                        help="Ignore EOS token and force generation of exact output_tokens from trace. "
-                             "Useful for consistent throughput benchmarking.")
-
-    # Output token control
-    parser.add_argument("--no-max-tokens", action="store_true", default=False,
-                        help="Don't enforce max_tokens from trace. Let the model generate "
-                             "freely until EOS. Useful for reasoning models (e.g. DeepSeek R1) "
-                             "that need extra token budget for <think> blocks.")
-
     # Debug trace: store full request/response bodies
     parser.add_argument("--debug-trace", action="store_true", default=False,
                         help="Store full request/response text for every API call to "
@@ -3398,10 +3378,8 @@ async def main():
         advance_min=args.advance_min,
         advance_max=args.advance_max,
         advance_all_users=args.advance_all_users,
-        ignore_eos=args.ignore_eos,
         hash_block_mode=args.hash_block_mode,
         debug_trace=args.debug_trace,
-        no_max_tokens=args.no_max_tokens,
         metrics_output_prefix=args.metrics_output_prefix,
         warmup_enabled=args.warmup_enabled,
     )
@@ -3469,18 +3447,31 @@ async def main():
         logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%} ({scope})")
     logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
 
-    # Initialize components
-    generator = SyntheticMessageGenerator(config.tokenizer_id, config.chunk_size)
+    # Initialize API client first so we can discover the served model and
+    # use its tokenizer by default (keeps client/server tokenization aligned).
     api_client = APIClient(
         config.api_endpoint,
         temperature=config.temperature,
         top_p=config.top_p,
         top_k=config.top_k,
         repetition_penalty=config.repetition_penalty,
-        ignore_eos=config.ignore_eos,
         debug_trace=config.debug_trace,
     )
     await api_client.detect_model()
+
+    # Pick the tokenizer: prefer the served model, fall back to --tokenizer
+    # when the model can't be resolved via HuggingFace (e.g. local path, gated repo).
+    tokenizer_id = api_client.model or config.tokenizer_id
+    try:
+        AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
+    except Exception as e:
+        logger.warning(
+            f"Could not load tokenizer for served model '{tokenizer_id}' "
+            f"({e.__class__.__name__}); falling back to --tokenizer '{config.tokenizer_id}'"
+        )
+        tokenizer_id = config.tokenizer_id
+    logger.info(f"Using tokenizer: {tokenizer_id}")
+    generator = SyntheticMessageGenerator(tokenizer_id, config.chunk_size)
 
     # Create orchestrator
     orchestrator = TestOrchestrator(config, trace_manager, generator, api_client)
