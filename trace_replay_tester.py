@@ -2395,9 +2395,9 @@ class TestOrchestrator:
 
         header_suffix = ""
         if self.config.test_duration:
+            elapsed_s = max(0, self.config.test_duration - metrics.time_remaining_s)
             header_suffix = (
-                f" ({_fmt_dur(metrics.time_remaining_s)} remaining "
-                f"/ {_fmt_dur(self.config.test_duration)})"
+                f" ({_fmt_dur(elapsed_s)} / {_fmt_dur(self.config.test_duration)})"
             )
 
         in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
