@@ -47,28 +47,6 @@ except ImportError:
 
 
 # =============================================================================
-# ANSI Colors for Terminal Output
-# =============================================================================
-
-class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    INFO = ''                # Default terminal color
-    DEBUG = '\033[90m'
-    METRIC = '\033[96m'
-    SUCCESS = '\033[92m'
-    PHASE = '\033[95m'
-    USER = '\033[94m'
-
-
-# =============================================================================
 # Question Bank - Prompts to encourage detailed responses
 # =============================================================================
 
@@ -138,21 +116,6 @@ QUESTION_BANK = [
 # Logging Setup
 # =============================================================================
 
-class ColoredFormatter(logging.Formatter):
-    """Custom formatter with colors for console output"""
-
-    def format(self, record):
-        formats = {
-            logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
-            logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
-            logging.WARNING: Colors.WARNING + '[%(asctime)s] WARNING - %(message)s' + Colors.ENDC,
-            logging.ERROR: Colors.FAIL + '[%(asctime)s] ERROR - %(message)s' + Colors.ENDC,
-        }
-        log_fmt = formats.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
-
-
 def init_logger(name: str, level=logging.INFO) -> logging.Logger:
     """Initialize logger with console handler"""
     logger = logging.getLogger(name)
@@ -161,7 +124,7 @@ def init_logger(name: str, level=logging.INFO) -> logging.Logger:
     if not logger.handlers:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
-        console_handler.setFormatter(ColoredFormatter())
+        console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
         logger.addHandler(console_handler)
 
     return logger
@@ -1148,7 +1111,7 @@ class SyntheticMessageGenerator:
         seed = hash("canonical_warm_prefix_v1") % (2**32)
         self._canonical_prefix_content = self.generate_user_text(num_tokens, seed)
         self._canonical_prefix_tokens = num_tokens
-        logger.info(f"{Colors.OKCYAN}Generated canonical warm prefix: {num_tokens:,} tokens{Colors.ENDC}")
+        logger.info(f"Generated canonical warm prefix: {num_tokens:,} tokens")
         return self._canonical_prefix_content
 
     def get_canonical_prefix_tokens(self) -> int:
@@ -1607,16 +1570,6 @@ class UserSession:
 class APIClient:
     """Manages OpenAI API client"""
 
-    # Model-specific default generation parameters
-    MODEL_DEFAULTS = {
-        "qwen3-coder": {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "repetition_penalty": 1.05,
-        },
-    }
-
     def __init__(self, api_endpoint: str, model: str = "",
                  temperature: Optional[float] = None,
                  top_p: Optional[float] = None,
@@ -1628,13 +1581,6 @@ class APIClient:
         self.debug_trace = debug_trace
         self._debug_trace_records: List[dict] = []
 
-        # Store user-specified overrides (None means use model defaults or auto-detect)
-        self._user_temperature = temperature
-        self._user_top_p = top_p
-        self._user_top_k = top_k
-        self._user_repetition_penalty = repetition_penalty
-
-        # Actual parameters to use (set after model detection)
         self.temperature: Optional[float] = temperature
         self.top_p: Optional[float] = top_p
         self.top_k: Optional[int] = top_k
@@ -1652,39 +1598,8 @@ class APIClient:
 
         logger.info(f"API Client initialized: {api_endpoint}")
 
-    def _apply_model_defaults(self):
-        """Apply model-specific default parameters if not overridden by user."""
-        model_lower = self.model.lower()
-
-        # Check for matching model patterns
-        matched_defaults = None
-        matched_pattern = None
-        for pattern, defaults in self.MODEL_DEFAULTS.items():
-            if pattern in model_lower:
-                matched_defaults = defaults
-                matched_pattern = pattern
-                break
-
-        if matched_defaults:
-            applied_settings = []
-            if self._user_temperature is None and "temperature" in matched_defaults:
-                self.temperature = matched_defaults["temperature"]
-                applied_settings.append(f"temperature={self.temperature}")
-            if self._user_top_p is None and "top_p" in matched_defaults:
-                self.top_p = matched_defaults["top_p"]
-                applied_settings.append(f"top_p={self.top_p}")
-            if self._user_top_k is None and "top_k" in matched_defaults:
-                self.top_k = matched_defaults["top_k"]
-                applied_settings.append(f"top_k={self.top_k}")
-            if self._user_repetition_penalty is None and "repetition_penalty" in matched_defaults:
-                self.repetition_penalty = matched_defaults["repetition_penalty"]
-                applied_settings.append(f"repetition_penalty={self.repetition_penalty}")
-
-            if applied_settings:
-                logger.info(f"{Colors.OKCYAN}Detected {matched_pattern} model - applying settings: {', '.join(applied_settings)}{Colors.ENDC}")
-
     async def detect_model(self) -> str:
-        """Auto-detect model from API and apply model-specific settings."""
+        """Auto-detect model name from API."""
         try:
             models_url = self.api_endpoint.rstrip('/') + '/v1/models'
             import aiohttp
@@ -1694,8 +1609,6 @@ class APIClient:
                     if 'data' in data and len(data['data']) > 0:
                         self.model = data['data'][0]['id']
                         logger.info(f"Auto-detected model: {self.model}")
-                        # Apply model-specific defaults
-                        self._apply_model_defaults()
                         return self.model
         except Exception as e:
             logger.warning(f"Could not auto-detect model: {e}")
@@ -2040,14 +1953,14 @@ class TestOrchestrator:
             self.log_lifecycle_event(user_id, "started", trace['metadata']['conversation_id'],
                                      f"{remaining_reqs} requests remaining (advanced {advancement_pct:.0f}%), "
                                      f"{current_tokens:,} tokens at start")
-            logger.info(f"{Colors.USER}  👤 {user_id} started{Colors.ENDC} (trace: {user.trace_id[:10]}, "
+            logger.info(f"  👤 {user_id} started (trace: {user.trace_id[:10]}, "
                        f"📍 advanced to req {user.current_idx} ({advancement_pct:.0f}%), "
                        f"{remaining_reqs} remaining, {current_tokens:,} tokens)")
         else:
             initial_tokens = trace['requests'][0]['input_tokens']
             self.log_lifecycle_event(user_id, "started", trace['metadata']['conversation_id'],
                                      f"{len(trace['requests'])} requests, {initial_tokens:,} initial tokens")
-            logger.info(f"{Colors.USER}  👤 {user_id} started{Colors.ENDC} (trace: {user.trace_id[:10]}, {len(trace['requests'])} requests, {initial_tokens:,} initial tokens)")
+            logger.info(f"  👤 {user_id} started (trace: {user.trace_id[:10]}, {len(trace['requests'])} requests, {initial_tokens:,} initial tokens)")
 
         return user
 
@@ -2085,7 +1998,7 @@ class TestOrchestrator:
 
         if reason == "completed":
             self.conversations_finished += 1
-            logger.info(f"{Colors.SUCCESS}  ✓ {user_id} completed{Colors.ENDC} ({summary['requests_completed']}/{summary['requests_total']} requests, {summary['avg_cache_hit_rate']:.1%} cache hit)")
+            logger.info(f"  ✓ {user_id} completed ({summary['requests_completed']}/{summary['requests_total']} requests, {summary['avg_cache_hit_rate']:.1%} cache hit)")
         else:
             logger.warning(f"  ⚠️ {user_id} stopped at request {summary['requests_completed']}/{summary['requests_total']} (next request exceeds --max-context {self.config.max_context:,} tokens)")
 
@@ -2160,8 +2073,8 @@ class TestOrchestrator:
         parent.pending_subagents.append(sa_id)
 
         sa_reqs = len([r for r in sa_trace['requests'] if r.get('type') != 'subagent'])
-        logger.info(f"{Colors.HEADER}  🔀 {sa_id} spawned from {parent.user_id} "
-                     f"({sa_reqs} requests, {subagent_entry.get('subagent_type', 'unknown')}){Colors.ENDC}")
+        logger.info(f"  🔀 {sa_id} spawned from {parent.user_id} "
+                     f"({sa_reqs} requests, {subagent_entry.get('subagent_type', 'unknown')})")
 
     def process_subagent_markers(self, user: UserSession):
         """Spawn consecutive sub-agent markers at the user's current position."""
@@ -2539,9 +2452,9 @@ class TestOrchestrator:
         pct_fmt = f"{{:>{col_width - 1},.1f}}%"  # "%" eats one char → keep right-alignment
 
         lines = [
-            f"{Colors.PHASE}{'=' * 120}{Colors.ENDC}",
-            f"{Colors.PHASE}Period {metrics.period_number}{header_suffix}{Colors.ENDC}",
-            f"{Colors.PHASE}{'=' * 120}{Colors.ENDC}",
+            f"{'=' * 120}",
+            f"Period {metrics.period_number}{header_suffix}",
+            f"{'=' * 120}",
             f"  In-flight: {in_flight} ({metrics.in_flight_prefilling} prefilling, "
             f"{metrics.in_flight_decoding} decoding)",
             f"  Completed: {metrics.cumulative_requests_completed:,} requests | "
@@ -2710,8 +2623,8 @@ class TestOrchestrator:
             self.total_connection_errors += 1
             if self.consecutive_connection_errors >= self.max_consecutive_errors:
                 logger.error(
-                    f"{Colors.FAIL}FATAL: {self.consecutive_connection_errors} consecutive connection errors. "
-                    f"Server appears to be down. Stopping test.{Colors.ENDC}"
+                    f"FATAL: {self.consecutive_connection_errors} consecutive connection errors. "
+                    f"Server appears to be down. Stopping test."
                 )
                 self.running = False
                 return None
@@ -2780,12 +2693,12 @@ class TestOrchestrator:
             if user.current_idx > 0
         ]
         if not advanced:
-            logger.info(f"{Colors.PHASE}Warmup: no advanced users, skipping{Colors.ENDC}")
+            logger.info(f"Warmup: no advanced users, skipping")
             return
 
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}WARMUP: Prefilling {len(advanced)} advanced conversations...{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+        logger.info(f"{'='*120}")
+        logger.info(f"WARMUP: Prefilling {len(advanced)} advanced conversations...")
+        logger.info(f"{'='*120}")
 
         tasks = []
         users_to_warm = deque(user for _, user in advanced)
@@ -2837,8 +2750,8 @@ class TestOrchestrator:
         self.all_metrics.clear()
         self.output_token_log.clear()
 
-        logger.info(f"{Colors.PHASE}WARMUP COMPLETE: {warmup_count} requests prefilled, "
-                     f"metrics cleared{Colors.ENDC}")
+        logger.info(f"WARMUP COMPLETE: {warmup_count} requests prefilled, "
+                     f"metrics cleared")
 
     async def run(self):
         """Main test loop"""
@@ -2846,7 +2759,7 @@ class TestOrchestrator:
         self.current_period_start = time.time()
         period_number = 0
 
-        logger.info(f"\n{Colors.HEADER}Starting test with {self.config.start_users} user(s)...{Colors.ENDC}\n")
+        logger.info(f"\nStarting test with {self.config.start_users} user(s)...\n")
 
         # Create initial users (with delay between each to avoid overwhelming server)
         await self.create_users_batch(self.config.start_users, advance=True)
@@ -2870,7 +2783,7 @@ class TestOrchestrator:
                 if self.config.test_duration:
                     elapsed = time.time() - self.test_start_time
                     if elapsed >= self.config.test_duration:
-                        logger.info(f"\n{Colors.HEADER}Test duration reached ({self.config.test_duration}s){Colors.ENDC}")
+                        logger.info(f"\nTest duration reached ({self.config.test_duration}s)")
                         break
 
                 # Check if we have any users or pending tasks
@@ -2941,8 +2854,8 @@ class TestOrchestrator:
                         user.rate_limit_count += 1
                         user.total_rate_limit_count += 1
                         self.period_rate_limit_events += 1
-                        logger.info(f"{Colors.WARNING}  ⏱️ {user.user_id} rate-limited "
-                                   f"(backoff: {actual_backoff:.1f}s, attempt #{user.rate_limit_count}){Colors.ENDC}")
+                        logger.info(f"  ⏱️ {user.user_id} rate-limited "
+                                   f"(backoff: {actual_backoff:.1f}s, attempt #{user.rate_limit_count})")
                         continue
 
                     # Reset rate-limit count on successful dispatch
@@ -2968,7 +2881,7 @@ class TestOrchestrator:
                             parent = self.users[parent_id]
                             if user_id in parent.pending_subagents:
                                 parent.pending_subagents.remove(user_id)
-                        logger.info(f"{Colors.SUCCESS}  ✅ {user_id} subagent completed{Colors.ENDC}")
+                        logger.info(f"  ✅ {user_id} subagent completed")
                     self.remove_user(user_id, reason)
                     # Add replacement if recycling
                     if self.config.recycle and len(self.users) < self.config.max_users:
@@ -3029,7 +2942,7 @@ class TestOrchestrator:
                     if users_added > 0:
                         new_users = len(self.users)
                         old_users = new_users - users_added
-                        logger.info(f"{Colors.SUCCESS}  \u2192 Users {old_users} \u2192 {new_users} (+{users_added}){Colors.ENDC}")
+                        logger.info(f"  \u2192 Users {old_users} \u2192 {new_users} (+{users_added})")
 
                     # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
@@ -3039,7 +2952,7 @@ class TestOrchestrator:
                     self.period_dispatch_delays = []  # Reset dispatch delay tracking
 
         except KeyboardInterrupt:
-            logger.info(f"\n{Colors.WARNING}Test interrupted by user{Colors.ENDC}")
+            logger.info(f"\nTest interrupted by user")
 
         # Stop metrics collector immediately so the tail-end drain of in-flight
         # requests isn't measured as part of the benchmark.
@@ -3077,15 +2990,15 @@ class TestOrchestrator:
         cache_hits = sum(m.cache_hit_blocks for m in self.all_metrics)
         cache_total = cache_hits + sum(m.cache_miss_blocks for m in self.all_metrics)
 
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}{Colors.BOLD}Test Complete{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+        logger.info(f"{'='*120}")
+        logger.info(f"Test Complete")
+        logger.info(f"{'='*120}")
         logger.info(f"Duration: {elapsed:.1f}s")
         logger.info(f"Total Requests: {len(self.all_metrics)}")
         logger.info(f"Total Users Created: {self.user_counter}")
         logger.info(f"Peak Concurrent Users: {self.peak_users}")
         logger.info(f"")
-        logger.info(f"{Colors.METRIC}Performance Summary:{Colors.ENDC}")
+        logger.info(f"Performance Summary:")
         if ttfts:
             logger.info(f"  TTFT avg/p50/p95/max: {np.mean(ttfts):.2f}s / {np.percentile(ttfts, 50):.2f}s / {np.percentile(ttfts, 95):.2f}s / {max(ttfts):.2f}s")
         logger.info(f"  Throughput: {total_input/elapsed:,.0f} input tok/s | {total_output/elapsed:,.0f} output tok/s")
@@ -3094,10 +3007,10 @@ class TestOrchestrator:
         if self.canonical_prefix_tokens > 0:
             logger.info(f"  Warm Prefix: {self.canonical_prefix_tokens:,} tokens ({self.config.warm_prefix_pct:.0%} of max tool+system)")
         if self.total_connection_errors > 0:
-            logger.info(f"  {Colors.WARNING}Connection Errors: {self.total_connection_errors}{Colors.ENDC}")
+            logger.info(f"  Connection Errors: {self.total_connection_errors}")
         logger.info(f"")
-        logger.info(f"{Colors.SUCCESS}Results saved to: {self.config.output_dir}{Colors.ENDC}")
-        logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+        logger.info(f"Results saved to: {self.config.output_dir}")
+        logger.info(f"{'='*120}")
 
 
 # =============================================================================
@@ -3588,11 +3501,11 @@ async def main():
     )
 
     # Print header
-    logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
-    logger.info(f"{Colors.PHASE}{Colors.BOLD}Trace Replay Performance Tester v{__version__}{Colors.ENDC}")
-    logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+    logger.info(f"{'='*120}")
+    logger.info(f"Trace Replay Performance Tester v{__version__}")
+    logger.info(f"{'='*120}")
     if config.hash_block_mode:
-        logger.info(f"{Colors.BOLD}Replay mode: hash-block (deterministic per-request content from hash_ids){Colors.ENDC}")
+        logger.info(f"Replay mode: hash-block (deterministic per-request content from hash_ids)")
     else:
         logger.info(f"Replay mode: conversational (pullback/growth heuristics)")
 
@@ -3621,7 +3534,7 @@ async def main():
     logger.info(f"  Avg cache hit rate: {stats.avg_cache_hit_rate:.1%}")
     logger.info(f"  Traces with tool_use: {stats.traces_with_tool_use}")
     logger.info(f"  Max shared prefix (tool+system): {stats.max_shared_prefix_tokens:,} tokens")
-    logger.info(f"  {Colors.BOLD}Theoretical cache-hit ceilings (infinite cache, within-trace):{Colors.ENDC}")
+    logger.info(f"  Theoretical cache-hit ceilings (infinite cache, within-trace):")
     logger.info(f"    Set-based (any hash_id seen before):  {stats.theoretical_set_cache_hit_rate:.1%}")
     logger.info(f"    Prefix-chain (hash-block mode ceiling): {stats.theoretical_prefix_cache_hit_rate:.1%}")
 
@@ -3648,7 +3561,7 @@ async def main():
     if config.advance_max > 0:
         scope = "all users" if config.advance_all_users else "initial users only"
         logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%} ({scope})")
-    logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
+    logger.info(f"{'=' * 120}")
 
     # Initialize API client first so we can discover the served model and
     # use its tokenizer by default (keeps client/server tokenization aligned).
@@ -3686,10 +3599,10 @@ async def main():
             warm_tokens = int(config.warm_prefix_pct * max_shared)
             orchestrator.canonical_prefix_content = generator.generate_canonical_prefix(warm_tokens)
             orchestrator.canonical_prefix_tokens = warm_tokens
-            logger.info(f"{Colors.OKCYAN}Warm prefix enabled: {warm_tokens:,} tokens "
-                       f"(--warm-prefix-pct {config.warm_prefix_pct:.0%} of {max_shared:,} largest tool+system prefix across loaded traces){Colors.ENDC}")
+            logger.info(f"Warm prefix enabled: {warm_tokens:,} tokens "
+                       f"(--warm-prefix-pct {config.warm_prefix_pct:.0%} of {max_shared:,} largest tool+system prefix across loaded traces)")
         else:
-            logger.info(f"{Colors.WARNING}Warm prefix disabled: no tool_tokens/system_tokens in traces{Colors.ENDC}")
+            logger.info(f"Warm prefix disabled: no tool_tokens/system_tokens in traces")
 
     await orchestrator.run()
 
