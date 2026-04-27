@@ -1693,16 +1693,13 @@ class APIClient:
 
                 async for chunk in response:
                     if debug_chunks is not None:
-                        debug_chunks.append({
-                            'choices': [{
-                                'delta': {
-                                    'content': getattr(chunk.choices[0].delta, 'content', None) if chunk.choices else None,
-                                    'reasoning_content': getattr(chunk.choices[0].delta, 'reasoning_content', None) if chunk.choices else None,
-                                },
-                                'finish_reason': chunk.choices[0].finish_reason if chunk.choices else None,
-                            }] if chunk.choices else [],
-                            'usage': chunk.usage.model_dump() if hasattr(chunk, 'usage') and chunk.usage else None,
-                        })
+                        # Dump the entire pydantic chunk so debug-trace captures
+                        # every field the SDK deserialized — not just the ones we
+                        # currently inspect (content / reasoning_content).
+                        try:
+                            debug_chunks.append(chunk.model_dump())
+                        except Exception:
+                            debug_chunks.append({'_repr': repr(chunk)})
                     if completion_token_ids is not None and chunk.choices:
                         chunk_logprobs = getattr(chunk.choices[0], 'logprobs', None)
                         if chunk_logprobs is not None and tokenizer is not None:
