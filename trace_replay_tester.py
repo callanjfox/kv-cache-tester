@@ -1228,6 +1228,11 @@ class UserSession:
         # its hash_id is already in this set — the infinite-cache hit model.
         self.seen_hash_ids: Set[int] = set()
 
+        # Per-user salt prefix (lazy-generated on first build_messages call) —
+        # prepended at the start of the conversation so two users running the
+        # same trace_id at the same time don't share KV-cache blocks.
+        self.salt_content: str = ""
+
         # Conversation history: list of {"role": "user"|"assistant", "content": str}
         self.conversation: List[dict] = []
 
@@ -1406,6 +1411,14 @@ class UserSession:
         current_hash_ids = set(request.get('hash_ids', []))
         current_input_tokens = request.get('input_tokens', 0)
 
+        # Generate a unique per-user salt prefix once — prepended to the very
+        # first message below. Forces every user's KV-cache hash chain to
+        # diverge from token 0, even when multiple in-flight users replay the
+        # same trace_id (common when --recycle is set or conc > num_traces).
+        if not self.salt_content:
+            salt_seed = hash(self.user_id) % (2**32)
+            self.salt_content = self.generator.generate_user_text(8, salt_seed)
+
         # Hash-block mode: deterministic content keyed purely by hash_ids.
         # No conversation carry-over, no pullback/growth detection — prefix cache
         # hits fall out automatically from prefix-overlapping hash_id lists.
@@ -1425,7 +1438,7 @@ class UserSession:
             self.prev_input_tokens = current_input_tokens
             self.stored_response_tokens = 0
             self.token_shortfall = 0
-            return list(self.conversation), max_tokens
+            return self._finalize_messages(max_tokens)
 
         # For first request with warm prefix enabled - use canonical shared prefix
         if self.current_idx == 0 and canonical_prefix and canonical_prefix_tokens > 0:
@@ -1453,12 +1466,12 @@ class UserSession:
             self.prev_request_hash_ids = current_hash_ids
             self.prev_input_tokens = current_input_tokens
 
-            return list(self.conversation), max_tokens
+            return self._finalize_messages(max_tokens)
 
         # Check if this is a request pair (identical hash_ids to previous)
         if current_hash_ids == self.prev_request_hash_ids and len(current_hash_ids) > 0:
             # Same content - re-send same conversation (cache hit test)
-            return list(self.conversation), max_tokens
+            return self._finalize_messages(max_tokens)
 
         # Analyze hash_id changes
         new_hash_ids = current_hash_ids - self.prev_request_hash_ids
@@ -1528,6 +1541,14 @@ class UserSession:
             seed = hash(f"{self.user_id}_{self.current_idx}_fallback") % (2**32)
             self.conversation.append(self.generator.build_user_message(max(100, current_input_tokens), 'text', seed))
 
+        return self._finalize_messages(max_tokens)
+
+    def _finalize_messages(self, max_tokens: int) -> Tuple[List[dict], int]:
+        """Prepend per-user salt to conversation[0] (idempotent) and return."""
+        if self.conversation and self.salt_content:
+            first = self.conversation[0]
+            if not first.get('content', '').startswith(self.salt_content):
+                self.conversation[0] = {**first, 'content': self.salt_content + first.get('content', '')}
         return list(self.conversation), max_tokens
 
     def record_shortfall(self, expected_tokens: int, actual_tokens: int):
