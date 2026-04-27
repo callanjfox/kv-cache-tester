@@ -23,8 +23,24 @@ import sys
 # from Moonshot's tokenization_kimi.py (line 209) on every encode(...) call
 # with kwargs. We re-encode every logprobs token per chunk under
 # --debug-trace, which would otherwise produce ~10K+ warnings per request.
+# When loaded via HF's trust_remote_code, the kimi tokenizer's logger ends
+# up under a dynamic name like
+# `transformers_modules.<repo>__<sha>.tokenization_kimi`, so a static
+# logger-name lookup doesn't match. Use a content-matching filter on the
+# root logger instead — drops any message containing the noisy substring
+# regardless of which logger emitted it.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-logging.getLogger("tokenization_kimi").setLevel(logging.ERROR)
+
+
+class _DropKimiSuperEncodeNoise(logging.Filter):
+    def filter(self, record):
+        try:
+            return "Calling super().encode" not in record.getMessage()
+        except Exception:
+            return True
+
+
+logging.getLogger().addFilter(_DropKimiSuperEncodeNoise())
 import time
 import random
 from dataclasses import dataclass, asdict, field
