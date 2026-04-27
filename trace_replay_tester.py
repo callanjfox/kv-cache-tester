@@ -67,25 +67,6 @@ class Colors:
     PHASE = '\033[95m'
     USER = '\033[94m'
 
-    @classmethod
-    def disable(cls):
-        """Disable all colors for terminals where colors are hard to read"""
-        cls.HEADER = ''
-        cls.OKBLUE = ''
-        cls.OKCYAN = ''
-        cls.OKGREEN = ''
-        cls.WARNING = ''
-        cls.FAIL = ''
-        cls.ENDC = ''
-        cls.BOLD = ''
-        cls.UNDERLINE = ''
-        cls.INFO = ''
-        cls.DEBUG = ''
-        cls.METRIC = ''
-        cls.SUCCESS = ''
-        cls.PHASE = ''
-        cls.USER = ''
-
 
 # =============================================================================
 # Question Bank - Prompts to encourage detailed responses
@@ -161,7 +142,6 @@ class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors for console output"""
 
     def format(self, record):
-        # Read colors dynamically to support --no-color flag
         formats = {
             logging.DEBUG: Colors.DEBUG + '[%(asctime)s] DEBUG - %(message)s' + Colors.ENDC,
             logging.INFO: Colors.INFO + '[%(asctime)s] INFO - %(message)s' + Colors.ENDC,
@@ -3451,8 +3431,6 @@ def parse_arguments():
                         help="Cache block size in tokens (default: 64)")
 
     # Output control
-    parser.add_argument("--no-color", action="store_true",
-                        help="Disable colored output (useful for light terminal backgrounds)")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging")
     parser.add_argument("--skip-graphs", action="store_true",
@@ -3564,9 +3542,6 @@ async def main():
     if not args.hf_dataset and not args.trace_directory:
         raise ValueError("Either --trace-directory or --hf-dataset must be provided")
 
-    # Disable colors if requested
-    if args.no_color:
-        Colors.disable()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
