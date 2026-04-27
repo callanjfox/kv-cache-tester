@@ -278,9 +278,6 @@ class AssessmentPeriodMetrics:
     total_request_time: float  # Sum of all request durations (ttlt)
     idle_time_pct: float  # Percentage of period users were idle
     new_tokens_ingested: int = 0  # Cache miss tokens this period
-    # Dispatch-delay metrics (ready_at vs actual dispatch)
-    dispatch_delay_avg: float = 0.0  # Avg seconds behind schedule
-    dispatch_delay_max: float = 0.0  # Max seconds behind schedule
     in_flight_prefilling: int = 0  # Requests awaiting/in prefill at assessment time
     in_flight_decoding: int = 0  # Requests in decode phase at assessment time
     # Cumulative (running) metrics across all periods
@@ -301,11 +298,13 @@ class AssessmentPeriodMetrics:
     cumulative_interactivity_p95: float = 0.0
     cumulative_interactivity_p99: float = 0.0
 
-    # Cumulative wait time (dispatch delay, seconds)
-    cumulative_wait_time_avg: float = 0.0
-    cumulative_wait_time_p50: float = 0.0
-    cumulative_wait_time_p95: float = 0.0
-    cumulative_wait_time_p99: float = 0.0
+    # Cumulative inter-turn time — gap between successive turns of the same
+    # conversation (i.e. the trace's per-request think_time). Reported across
+    # all completed requests where current_idx > 0.
+    cumulative_inter_turn_avg: float = 0.0
+    cumulative_inter_turn_p50: float = 0.0
+    cumulative_inter_turn_p95: float = 0.0
+    cumulative_inter_turn_p99: float = 0.0
 
     # Cumulative ISL / OSL distributions
     cumulative_isl_avg: float = 0.0
@@ -1931,8 +1930,6 @@ class TestOrchestrator:
         # Admission control
         self.in_flight_requests: int = 0  # Current count of requests in flight
         self.in_flight_decoding: int = 0  # Requests that have received first token (in decode phase)
-        self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
-        self.all_dispatch_delays: List[float] = []  # Dispatch delays across all periods (cumulative)
         self.conversations_finished: int = 0  # Cumulative count of users that reached 'completed' state
 
 
@@ -2334,7 +2331,10 @@ class TestOrchestrator:
 
         ttft_avg_c, ttft_p50_c, ttft_p95_c, ttft_p99_c = _percentile_stats(all_ttfts)
         intvty_avg, intvty_p50, intvty_p95, intvty_p99 = _percentile_stats(all_interactivity)
-        wait_avg, wait_p50, wait_p95, wait_p99 = _percentile_stats(self.all_dispatch_delays)
+        # Inter-turn time = trace's per-request think_time (delay_expected),
+        # restricted to non-first-turn successful requests where it's meaningful.
+        inter_turn_samples = [m.delay_expected for m in self.all_metrics if m.success and m.delay_expected > 0]
+        inter_turn_avg, inter_turn_p50, inter_turn_p95, inter_turn_p99 = _percentile_stats(inter_turn_samples)
         isl_avg, isl_p50, isl_p95, isl_p99 = _percentile_stats([float(v) for v in all_isls])
         osl_avg, osl_p50, osl_p95, osl_p99 = _percentile_stats([float(v) for v in all_osls])
 
@@ -2369,8 +2369,6 @@ class TestOrchestrator:
             total_request_time=total_request_time,
             idle_time_pct=idle_time_pct,
             new_tokens_ingested=new_tokens,
-            dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
-            dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
             in_flight_decoding=self.in_flight_decoding,
             cumulative_ttft_avg=ttft_avg_c,
@@ -2386,10 +2384,10 @@ class TestOrchestrator:
             cumulative_interactivity_p50=intvty_p50,
             cumulative_interactivity_p95=intvty_p95,
             cumulative_interactivity_p99=intvty_p99,
-            cumulative_wait_time_avg=wait_avg,
-            cumulative_wait_time_p50=wait_p50,
-            cumulative_wait_time_p95=wait_p95,
-            cumulative_wait_time_p99=wait_p99,
+            cumulative_inter_turn_avg=inter_turn_avg,
+            cumulative_inter_turn_p50=inter_turn_p50,
+            cumulative_inter_turn_p95=inter_turn_p95,
+            cumulative_inter_turn_p99=inter_turn_p99,
             cumulative_isl_avg=isl_avg,
             cumulative_isl_p50=isl_p50,
             cumulative_isl_p95=isl_p95,
@@ -2461,9 +2459,9 @@ class TestOrchestrator:
             _row("Interactivity (tok/s)",
                  metrics.cumulative_interactivity_avg, metrics.cumulative_interactivity_p50,
                  metrics.cumulative_interactivity_p95, metrics.cumulative_interactivity_p99, lat_fmt),
-            _row("Wait time (s)",
-                 metrics.cumulative_wait_time_avg, metrics.cumulative_wait_time_p50,
-                 metrics.cumulative_wait_time_p95, metrics.cumulative_wait_time_p99, lat_fmt),
+            _row("Inter-turn time (s)",
+                 metrics.cumulative_inter_turn_avg, metrics.cumulative_inter_turn_p50,
+                 metrics.cumulative_inter_turn_p95, metrics.cumulative_inter_turn_p99, lat_fmt),
             _row("ISL (tokens)",
                  metrics.cumulative_isl_avg, metrics.cumulative_isl_p50,
                  metrics.cumulative_isl_p95, metrics.cumulative_isl_p99, tok_fmt),
@@ -2837,11 +2835,6 @@ class TestOrchestrator:
                         self.in_flight_requests >= self.config.max_concurrent_requests):
                         continue  # At capacity, skip this user
 
-                    # Track dispatch delay (how far behind schedule)
-                    dispatch_delay = now - ready_at
-                    self.period_dispatch_delays.append(dispatch_delay)
-                    self.all_dispatch_delays.append(dispatch_delay)
-
                     # Increment in-flight counter and dispatch
                     self.in_flight_requests += 1
                     task = asyncio.create_task(self.run_user_request(user))
@@ -2920,9 +2913,7 @@ class TestOrchestrator:
                         old_users = new_users - users_added
                         logger.info(f"  \u2192 Users {old_users} \u2192 {new_users} (+{users_added})")
 
-                    # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
-                    self.period_dispatch_delays = []  # Reset dispatch delay tracking
 
         except KeyboardInterrupt:
             logger.info(f"\nTest interrupted by user")
