@@ -185,8 +185,6 @@ class TestConfig:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
-    # Rate limiting
-    enable_request_rate_limiting: bool = False
     # Admission control
     max_concurrent_requests: Optional[int] = None  # None = unlimited
     # Warm prefix for cross-conversation cache sharing
@@ -280,7 +278,6 @@ class AssessmentPeriodMetrics:
     total_request_time: float  # Sum of all request durations (ttlt)
     idle_time_pct: float  # Percentage of period users were idle
     new_tokens_ingested: int = 0  # Cache miss tokens this period
-    rate_limited_users: int = 0  # Users in rate_limited state at assessment time
     # Dispatch-delay metrics (ready_at vs actual dispatch)
     dispatch_delay_avg: float = 0.0  # Avg seconds behind schedule
     dispatch_delay_max: float = 0.0  # Max seconds behind schedule
@@ -1220,7 +1217,7 @@ class UserSession:
         self.trace_id = trace['metadata']['conversation_id']
         self.requests = trace['requests']
         self.current_idx = 0
-        self.state: Literal["active", "idle", "completed", "truncated", "rate_limited"] = "idle"
+        self.state: Literal["active", "idle", "completed", "truncated"] = "idle"
 
         self.start_time: Optional[float] = None
         self.last_request_time: Optional[float] = None
@@ -1244,11 +1241,6 @@ class UserSession:
         # Track token shortfall when model generates less than expected
         # This gets added to the next user message to maintain token counts
         self.token_shortfall: int = 0
-
-        # Rate-limiting state tracking
-        self.rate_limit_until: Optional[float] = None  # Timestamp when rate-limit expires
-        self.rate_limit_count: int = 0  # Times rate-limited for current request attempt
-        self.total_rate_limit_count: int = 0  # Total times rate-limited across all requests
 
         # Sub-agent tracking
         self.pending_subagents: List[str] = []      # user_ids of active sub-agent sessions
@@ -2093,47 +2085,6 @@ class TestOrchestrator:
         idle = sum(1 for u in self.users.values() if u.state == "idle")
         return active, idle
 
-    def get_ttft_value(self) -> Optional[float]:
-        """Get the current TTFT value based on configured metric. Returns None if no data."""
-        if not self.period_metrics:
-            return None  # No data available
-
-        ttfts = [m.ttft for m in self.period_metrics if m.success]
-        if not ttfts:
-            return None  # No successful requests
-
-        if self.config.ttft_metric == 'max':
-            return max(ttfts)
-        elif self.config.ttft_metric == 'avg':
-            return np.mean(ttfts)
-        else:  # p95
-            return np.percentile(ttfts, 95)
-
-    def should_rate_limit_dispatch(self) -> Tuple[bool, float]:
-        """Check if new request dispatch should be rate-limited.
-
-        When TTFT exceeds the configured threshold, we delay dispatching new
-        requests to reduce queue depth in vLLM's scheduler. This allows existing
-        prefills to complete faster, naturally reducing TTFT.
-
-        Returns:
-            (should_limit, backoff_seconds): Whether to rate-limit and how long to wait
-        """
-        if not self.config.enable_request_rate_limiting:
-            return False, 0.0
-
-        ttft_value = self.get_ttft_value()
-        if ttft_value is None:
-            return False, 0.0
-
-        if ttft_value <= self.config.max_ttft:
-            return False, 0.0
-
-        # Calculate backoff proportional to overage (1s base, capped at 10s)
-        overage_ratio = ttft_value / self.config.max_ttft
-        backoff = min(1.0 * overage_ratio, 10.0)
-        return True, backoff
-
     def prune_old_blocks(self, max_age: float = 900):
         """Remove blocks older than max_age seconds. O(k) where k = expired blocks.
 
@@ -2276,9 +2227,6 @@ class TestOrchestrator:
         # Store period metrics for print_assessment (filtered by prefill time)
         self.period_metrics = period_prefill_metrics
 
-        # Count rate-limited users
-        rate_limited_users = sum(1 for u in self.users.values() if u.state == "rate_limited")
-
         # Compute cumulative (running) metrics across all completed requests
         all_completed = [m for m in self.all_metrics if m.success]
         total_elapsed = end_time - self.test_start_time if self.test_start_time else 1.0
@@ -2362,7 +2310,6 @@ class TestOrchestrator:
             total_request_time=total_request_time,
             idle_time_pct=idle_time_pct,
             new_tokens_ingested=new_tokens,
-            rate_limited_users=rate_limited_users,
             dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
@@ -2495,7 +2442,8 @@ class TestOrchestrator:
                 f"  KV cache usage (now):   {metrics.server_kv_cache_usage_current:.1%}"
             )
 
-        logger.info("\n".join(lines))
+        for line in lines:
+            logger.info(line)
 
     async def run_user_request(self, user: UserSession, record_user_metrics: bool = True) -> Optional[RequestMetrics]:
         """Execute a single request for a user"""
@@ -2803,11 +2751,6 @@ class TestOrchestrator:
                         users_to_remove.append((user_id, "completed"))
                     elif user.state == "truncated":
                         users_to_remove.append((user_id, "truncated"))
-                    elif user.state == "rate_limited":
-                        # Check if backoff has elapsed
-                        if now >= user.rate_limit_until:
-                            user.state = "idle"  # Transition back for retry
-                            logger.debug(f"  ↻ {user.user_id} exiting rate-limit (attempt #{user.rate_limit_count})")
                     elif user.state == "idle":
                         # Parent waiting for sub-agents to complete — don't dispatch
                         if user.pending_subagents:
@@ -2830,22 +2773,6 @@ class TestOrchestrator:
                     if (self.config.max_concurrent_requests and
                         self.in_flight_requests >= self.config.max_concurrent_requests):
                         continue  # At capacity, skip this user
-
-                    # Check if rate-limiting is needed before dispatching
-                    should_limit, backoff = self.should_rate_limit_dispatch()
-                    if should_limit:
-                        # Apply exponential backoff (1.5x per retry)
-                        actual_backoff = backoff * (1.5 ** user.rate_limit_count)
-                        user.state = "rate_limited"
-                        user.rate_limit_until = now + actual_backoff
-                        user.rate_limit_count += 1
-                        user.total_rate_limit_count += 1
-                        logger.info(f"  ⏱️ {user.user_id} rate-limited "
-                                   f"(backoff: {actual_backoff:.1f}s, attempt #{user.rate_limit_count})")
-                        continue
-
-                    # Reset rate-limit count on successful dispatch
-                    user.rate_limit_count = 0
 
                     # Track dispatch delay (how far behind schedule)
                     dispatch_delay = now - ready_at
@@ -3352,11 +3279,6 @@ def parse_arguments():
     parser.add_argument("--repetition-penalty", type=float, default=None,
                         help="Override repetition_penalty for generation (e.g., 1.05)")
 
-    # Rate limiting
-    parser.add_argument("--enable-request-rate-limiting", action="store_true",
-                        help="Enable request-level rate-limiting when TTFT exceeds threshold "
-                             "(delays new request dispatch with exponential backoff)")
-
     # Admission control
     parser.add_argument("--max-concurrent-requests", type=int, default=50,
                         help="Max concurrent in-flight requests (admission control). "
@@ -3471,7 +3393,6 @@ async def main():
         top_p=args.top_p,
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
-        enable_request_rate_limiting=args.enable_request_rate_limiting,
         max_concurrent_requests=args.max_concurrent_requests,
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
