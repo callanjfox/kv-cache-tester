@@ -5,12 +5,12 @@ Trace Replay Performance Testing Tool
 Replays real agentic coding traces to benchmark LLM inference performance
 with realistic cache hit patterns, timing, and message structures.
 
-Version: 1.0
-Date: 2025-01-21
+Version: 0.1
+Date: 2026-04-27
 """
 
-__version__ = "1.0"
-__date__ = "2025-01-21"
+__version__ = "0.1"
+__date__ = "2026-04-27"
 
 import argparse
 import asyncio
