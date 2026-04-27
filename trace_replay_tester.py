@@ -1684,6 +1684,7 @@ class APIClient:
         token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
+        server_prompt_tokens: Optional[int] = None
         content_field, reasoning_field = delta_field_names_for(self.model)
         debug_chunks = [] if self.debug_trace else None
         completion_token_ids: Optional[List[int]] = [] if self.debug_trace else None
@@ -1714,6 +1715,8 @@ class APIClient:
                             debug_chunks.append(chunk.model_dump())
                         except Exception:
                             debug_chunks.append({'_repr': repr(chunk)})
+                    if getattr(chunk, 'usage', None) is not None:
+                        server_prompt_tokens = chunk.usage.prompt_tokens
                     if completion_token_ids is not None and chunk.choices:
                         chunk_logprobs = getattr(chunk.choices[0], 'logprobs', None)
                         if chunk_logprobs is not None and tokenizer is not None:
@@ -1768,6 +1771,8 @@ class APIClient:
                     response_text = getattr(msg, content_field, None) or ""
                     reasoning_text_full = getattr(msg, reasoning_field, None) or ""
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
+                if response.usage:
+                    server_prompt_tokens = response.usage.prompt_tokens
                     # For non-streaming, all tokens are attributed to completion time
                     token_timestamps.append(complete_time)
                     tokens_per_chunk.append(token_count)
@@ -1780,6 +1785,7 @@ class APIClient:
                 'ttft': ttft,
                 'ttlt': ttlt,
                 'output_tokens': token_count,
+                'server_prompt_tokens': server_prompt_tokens,
                 'error_type': None,
                 'start_time': start_time,
                 'first_token_time': first_token_time or start_time,
@@ -1847,6 +1853,7 @@ class APIClient:
                 'ttft': 0,
                 'ttlt': 0,
                 'output_tokens': 0,
+                'server_prompt_tokens': None,
                 'error_type': error_type,
                 'start_time': start_time,
                 'first_token_time': start_time,
@@ -2552,6 +2559,7 @@ class TestOrchestrator:
         ttft = result['ttft']
         ttlt = result['ttlt']
         actual_output = result['output_tokens']
+        server_prompt_tokens = result.get('server_prompt_tokens')
         error_type = result['error_type']
         request_start_time = result['start_time']
         prefill_complete_time = result['first_token_time']
@@ -2612,7 +2620,10 @@ class TestOrchestrator:
             trace_id=user.trace_id,
             timestamp=time.time(),
             request_type=request['type'],
-            input_tokens=actual_input_tokens,
+            # Prefer server-reported prompt_tokens (authoritative); fall back to
+            # the local apply_chat_template estimate if the response didn't carry
+            # usage (e.g. error path before the final chunk arrived).
+            input_tokens=server_prompt_tokens if server_prompt_tokens is not None else actual_input_tokens,
             output_tokens_expected=expected_output,
             output_tokens_actual=actual_output,
             cache_hit_blocks=cache_hits,
