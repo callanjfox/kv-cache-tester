@@ -1749,6 +1749,10 @@ class APIClient:
         # comparable across models and removes any early-termination bias.
         extra_body["ignore_eos"] = True
 
+        if self.debug_trace:
+            params["logprobs"] = True
+            params["top_logprobs"] = 0
+
         params["extra_body"] = extra_body
 
         return params
@@ -1777,10 +1781,22 @@ class APIClient:
         token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
+        debug_chunks = [] if self.debug_trace else None
+        completion_token_ids: Optional[List[int]] = [] if self.debug_trace else None
+        prompt_token_ids: Optional[List[int]] = None
+        if self.debug_trace and tokenizer is not None:
+            try:
+                prompt_token_ids = list(tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                ))
+            except Exception as e:
+                logger.debug(f"debug-trace: prompt token-id capture failed: {e}")
+                prompt_token_ids = None
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
-            debug_chunks = [] if self.debug_trace else None
 
             if stream:
                 response = await self.client.chat.completions.create(**params)
@@ -1797,6 +1813,19 @@ class APIClient:
                             }] if chunk.choices else [],
                             'usage': chunk.usage.model_dump() if hasattr(chunk, 'usage') and chunk.usage else None,
                         })
+                    if completion_token_ids is not None and chunk.choices:
+                        chunk_logprobs = getattr(chunk.choices[0], 'logprobs', None)
+                        if chunk_logprobs is not None and tokenizer is not None:
+                            for tok in (getattr(chunk_logprobs, 'content', None) or []):
+                                tok_str = getattr(tok, 'token', None)
+                                if not tok_str:
+                                    continue
+                                try:
+                                    completion_token_ids.extend(
+                                        tokenizer.encode(tok_str, add_special_tokens=False)
+                                    )
+                                except Exception:
+                                    pass
                     if chunk.choices:
                         delta = chunk.choices[0].delta
                         content_text = delta.content or ""
@@ -1865,6 +1894,8 @@ class APIClient:
                         'max_tokens': max_tokens,
                         'stream': stream,
                         'params': {k: v for k, v in params.items() if k != 'messages'},
+                        'prompt_token_ids': prompt_token_ids,
+                        'prompt_token_count': len(prompt_token_ids) if prompt_token_ids is not None else None,
                     },
                     'response': {
                         'content': response_text,
@@ -1872,6 +1903,8 @@ class APIClient:
                         'output_tokens': token_count,
                         'ttft': ttft,
                         'ttlt': ttlt,
+                        'completion_token_ids': completion_token_ids,
+                        'completion_token_count': len(completion_token_ids) if completion_token_ids is not None else None,
                     },
                     'raw_chunks': debug_chunks,
                     'error': None,
@@ -1900,6 +1933,8 @@ class APIClient:
                         'messages': messages,
                         'max_tokens': max_tokens,
                         'stream': stream,
+                        'prompt_token_ids': prompt_token_ids,
+                        'prompt_token_count': len(prompt_token_ids) if prompt_token_ids is not None else None,
                     },
                     'response': None,
                     'error': str(e),
