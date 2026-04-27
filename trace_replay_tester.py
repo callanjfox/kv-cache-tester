@@ -1556,6 +1556,27 @@ class UserSession:
 # API Client
 # =============================================================================
 
+# Streaming chunks expose model output via fields on `chunk.choices[0].delta`.
+# The OpenAI-compatible spec only standardizes `content`; reasoning/CoT models
+# put their thinking tokens in different model-specific fields. Map model-id
+# substrings to the (content_field, reasoning_field) pair on the delta object.
+# Default works for DeepSeek-R1, Qwen reasoning, etc.; gpt-oss via vLLM's
+# harmony parser uses `reasoning` instead of `reasoning_content`.
+_DEFAULT_DELTA_FIELDS = ("content", "reasoning_content")
+_MODEL_DELTA_FIELDS = {
+    "gpt-oss": ("content", "reasoning"),
+}
+
+
+def delta_field_names_for(model: str) -> Tuple[str, str]:
+    """Return (content_field, reasoning_field) for the given model id."""
+    model_lower = (model or "").lower()
+    for pattern, fields in _MODEL_DELTA_FIELDS.items():
+        if pattern in model_lower:
+            return fields
+    return _DEFAULT_DELTA_FIELDS
+
+
 class APIClient:
     """Manages OpenAI API client"""
 
@@ -1663,6 +1684,7 @@ class APIClient:
         token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
+        content_field, reasoning_field = delta_field_names_for(self.model)
         debug_chunks = [] if self.debug_trace else None
         completion_token_ids: Optional[List[int]] = [] if self.debug_trace else None
         prompt_token_ids: Optional[List[int]] = None
@@ -1707,8 +1729,8 @@ class APIClient:
                                     pass
                     if chunk.choices:
                         delta = chunk.choices[0].delta
-                        content_text = delta.content or ""
-                        reasoning_text = getattr(delta, 'reasoning_content', None) or ""
+                        content_text = getattr(delta, content_field, None) or ""
+                        reasoning_text = getattr(delta, reasoning_field, None) or ""
                         chunk_text = content_text or reasoning_text
                         if not chunk_text:
                             continue
@@ -1742,8 +1764,9 @@ class APIClient:
                 complete_time = first_token_time
 
                 if response.choices:
-                    response_text = response.choices[0].message.content or ""
-                    reasoning_text_full = getattr(response.choices[0].message, 'reasoning_content', None) or ""
+                    msg = response.choices[0].message
+                    response_text = getattr(msg, content_field, None) or ""
+                    reasoning_text_full = getattr(msg, reasoning_field, None) or ""
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
                     # For non-streaming, all tokens are attributed to completion time
                     token_timestamps.append(complete_time)
