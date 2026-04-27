@@ -2764,6 +2764,10 @@ class TestOrchestrator:
         # Warmup: pre-send one request per advanced user before metrics start
         if self.config.warmup_enabled:
             await self.warmup_advanced_users()
+            # Quiesce: let any lingering server-side prefill/decode from the
+            # warmup batch finish draining before metrics collection begins,
+            # so the first assessment period isn't contaminated.
+            await asyncio.sleep(5)
             self.test_start_time = time.time()
             self.current_period_start = time.time()
 
