@@ -18,6 +18,13 @@ import json
 import logging
 import os
 import sys
+
+# Silence the per-call "Calling super().encode with {...}" warning emitted
+# from Moonshot's tokenization_kimi.py (line 209) on every encode(...) call
+# with kwargs. We re-encode every logprobs token per chunk under
+# --debug-trace, which would otherwise produce ~10K+ warnings per request.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+logging.getLogger("tokenization_kimi").setLevel(logging.ERROR)
 import time
 import random
 from dataclasses import dataclass, asdict, field
