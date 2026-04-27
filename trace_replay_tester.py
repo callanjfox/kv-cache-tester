@@ -1743,10 +1743,16 @@ class APIClient:
                             # Signal that prefill is complete (first token received)
                             if on_first_token:
                                 on_first_token()
-                        # Only add content (not reasoning) to response text for conversation history
+                        # Append both content and reasoning to response_text. With
+                        # ignore_eos=True + max_tokens=N, the server is generating
+                        # exactly N tokens against a single budget that spans
+                        # reasoning + content + harmony framing — so to keep the
+                        # next turn's prompt size faithful to the trace we have to
+                        # carry whatever channel(s) were actually used.
                         if content_text:
                             response_text += content_text
                         if reasoning_text:
+                            response_text += reasoning_text
                             reasoning_text_full += reasoning_text
                         # Count all generated tokens (content + reasoning) for metrics
                         chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
@@ -1770,6 +1776,8 @@ class APIClient:
                     msg = response.choices[0].message
                     response_text = getattr(msg, content_field, None) or ""
                     reasoning_text_full = getattr(msg, reasoning_field, None) or ""
+                    if reasoning_text_full:
+                        response_text += reasoning_text_full
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
                 if response.usage:
                     server_prompt_tokens = response.usage.prompt_tokens
