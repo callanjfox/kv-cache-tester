@@ -1580,11 +1580,13 @@ class UserSession:
 # The OpenAI-compatible spec only standardizes `content`; reasoning/CoT models
 # put their thinking tokens in different model-specific fields. Map model-id
 # substrings to the (content_field, reasoning_field) pair on the delta object.
-# Default works for DeepSeek-R1, Qwen reasoning, etc.; gpt-oss via vLLM's
-# harmony parser uses `reasoning` instead of `reasoning_content`.
+# Default works for DeepSeek-R1, Qwen reasoning, etc.; gpt-oss and Kimi-K2.5
+# via vLLM's harmony-style reasoning parsers use `reasoning` instead of
+# `reasoning_content`.
 _DEFAULT_DELTA_FIELDS = ("content", "reasoning_content")
 _MODEL_DELTA_FIELDS = {
     "gpt-oss": ("content", "reasoning"),
+    "kimi": ("content", "reasoning"),
 }
 
 
