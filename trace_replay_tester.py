@@ -276,15 +276,12 @@ class AssessmentPeriodMetrics:
     ttft_p99: float
     avg_cache_hit_rate: float
     working_set_blocks: int
-    users_added: int
     users_completed: int
     total_request_time: float  # Sum of all request durations (ttlt)
     idle_time_pct: float  # Percentage of period users were idle
     new_tokens_ingested: int = 0  # Cache miss tokens this period
     rate_limited_users: int = 0  # Users in rate_limited state at assessment time
-    rate_limit_events: int = 0  # Total rate-limit events this period
-    # Admission control metrics
-    admission_blocked_events: int = 0  # Times dispatch was blocked this period
+    # Dispatch-delay metrics (ready_at vs actual dispatch)
     dispatch_delay_avg: float = 0.0  # Avg seconds behind schedule
     dispatch_delay_max: float = 0.0  # Max seconds behind schedule
     in_flight_prefilling: int = 0  # Requests awaiting/in prefill at assessment time
@@ -1874,8 +1871,6 @@ class TestOrchestrator:
         self.test_start_time: Optional[float] = None
         self.current_period_start: Optional[float] = None
         self.period_metrics: List[RequestMetrics] = []
-        self.period_users_added: int = 0  # Users added this period
-        self.period_rate_limit_events: int = 0  # Rate-limit events this period
         self.peak_working_set_tokens: int = 0  # Track peak working set
         self.peak_users: int = 0  # Track peak concurrent users
 
@@ -1888,7 +1883,6 @@ class TestOrchestrator:
         # Admission control
         self.in_flight_requests: int = 0  # Current count of requests in flight
         self.in_flight_decoding: int = 0  # Requests that have received first token (in decode phase)
-        self.period_admission_blocked: int = 0  # Times dispatch was blocked this period
         self.period_dispatch_delays: List[float] = []  # Dispatch delays this period
         self.all_dispatch_delays: List[float] = []  # Dispatch delays across all periods (cumulative)
         self.conversations_finished: int = 0  # Cumulative count of users that reached 'completed' state
@@ -2367,14 +2361,11 @@ class TestOrchestrator:
             ttft_p99=np.percentile(ttfts, 99) if ttfts else 0,
             avg_cache_hit_rate=cache_hits / cache_total if cache_total > 0 else 0,
             working_set_blocks=working_set_blocks,
-            users_added=self.period_users_added,
             users_completed=0,  # Could track this if needed
             total_request_time=total_request_time,
             idle_time_pct=idle_time_pct,
             new_tokens_ingested=new_tokens,
             rate_limited_users=rate_limited_users,
-            rate_limit_events=self.period_rate_limit_events,
-            admission_blocked_events=self.period_admission_blocked,
             dispatch_delay_avg=np.mean(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             dispatch_delay_max=max(self.period_dispatch_delays) if self.period_dispatch_delays else 0.0,
             in_flight_prefilling=self.in_flight_requests - self.in_flight_decoding,
@@ -2841,7 +2832,6 @@ class TestOrchestrator:
                     # Admission control check
                     if (self.config.max_concurrent_requests and
                         self.in_flight_requests >= self.config.max_concurrent_requests):
-                        self.period_admission_blocked += 1
                         continue  # At capacity, skip this user
 
                     # Check if rate-limiting is needed before dispatching
@@ -2853,7 +2843,6 @@ class TestOrchestrator:
                         user.rate_limit_until = now + actual_backoff
                         user.rate_limit_count += 1
                         user.total_rate_limit_count += 1
-                        self.period_rate_limit_events += 1
                         logger.info(f"  ⏱️ {user.user_id} rate-limited "
                                    f"(backoff: {actual_backoff:.1f}s, attempt #{user.rate_limit_count})")
                         continue
@@ -2946,9 +2935,6 @@ class TestOrchestrator:
 
                     # Reset period counters - use period_end_time to maintain contiguous periods
                     self.current_period_start = period_end_time
-                    self.period_users_added = users_added  # Store for next period's metrics
-                    self.period_rate_limit_events = 0  # Reset rate-limit counter
-                    self.period_admission_blocked = 0  # Reset admission control counter
                     self.period_dispatch_delays = []  # Reset dispatch delay tracking
 
         except KeyboardInterrupt:
