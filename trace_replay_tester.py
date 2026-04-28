@@ -848,6 +848,16 @@ class SyntheticMessageGenerator:
             )
             if hasattr(self.tokenizer, 'model_max_length'):
                 self.tokenizer.model_max_length = 1_000_000
+            # Silence noisy per-call warnings from custom tokenizer modules
+            # loaded via trust_remote_code (e.g. moonshotai/Kimi-K2.5's
+            # tokenization_kimi.py emits a logger.warning on every encode()
+            # call with kwargs). HF registers these under dynamic module
+            # names like transformers_modules.<repo>__<sha>.tokenization_kimi
+            # which a static logger lookup at module-import time can't match.
+            # Resolve the actual module name via the loaded class and silence.
+            tok_module = type(self.tokenizer).__module__
+            if tok_module:
+                logging.getLogger(tok_module).setLevel(logging.ERROR)
 
     def _ensure_user_text_pool(self):
         """Pre-generate content pool for user text messages using diverse vocabulary."""
