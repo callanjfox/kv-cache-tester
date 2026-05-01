@@ -315,6 +315,21 @@ class AssessmentPeriodMetrics:
     # Infinite-cache hit rate over all completed requests so far.
     cumulative_cache_hit_rate: float = 0.0
 
+    # Running throughput percentiles across completed assessment periods
+    # (each period contributes one sample of tokens/s for that window).
+    cumulative_input_tps_avg: float = 0.0
+    cumulative_input_tps_p50: float = 0.0
+    cumulative_input_tps_p95: float = 0.0
+    cumulative_input_tps_p99: float = 0.0
+    cumulative_output_tps_avg: float = 0.0
+    cumulative_output_tps_p50: float = 0.0
+    cumulative_output_tps_p95: float = 0.0
+    cumulative_output_tps_p99: float = 0.0
+    cumulative_total_tps_avg: float = 0.0
+    cumulative_total_tps_p50: float = 0.0
+    cumulative_total_tps_p95: float = 0.0
+    cumulative_total_tps_p99: float = 0.0
+
     # Cumulative interactivity (1/TPOT, tokens/sec)
     cumulative_interactivity_avg: float = 0.0
     cumulative_interactivity_p50: float = 0.0
@@ -2366,6 +2381,20 @@ class TestOrchestrator:
 
         ttft_avg_c, ttft_p50_c, ttft_p95_c, ttft_p99_c = _percentile_stats(all_ttfts)
         intvty_avg, intvty_p50, intvty_p95, intvty_p99 = _percentile_stats(all_interactivity)
+
+        # Per-period throughput samples (each completed assessment period
+        # contributes one tokens/s sample). Each period has the same fixed
+        # duration, so avg-of-samples equals total-tokens / total-elapsed.
+        cur_in_tps = input_tokens / duration if duration > 0 else 0.0
+        cur_out_tps = output_tokens / duration if duration > 0 else 0.0
+        prior_in_tps = [p.input_tokens_per_second for p in self.assessment_periods]
+        prior_out_tps = [p.output_tokens_per_second for p in self.assessment_periods]
+        in_tps_samples = prior_in_tps + [cur_in_tps]
+        out_tps_samples = prior_out_tps + [cur_out_tps]
+        total_tps_samples = [a + b for a, b in zip(in_tps_samples, out_tps_samples)]
+        in_tps_avg, in_tps_p50, in_tps_p95, in_tps_p99 = _percentile_stats(in_tps_samples)
+        out_tps_avg, out_tps_p50, out_tps_p95, out_tps_p99 = _percentile_stats(out_tps_samples)
+        tot_tps_avg, tot_tps_p50, tot_tps_p95, tot_tps_p99 = _percentile_stats(total_tps_samples)
         # Inter-turn time = trace's per-request think_time (delay_expected),
         # restricted to non-first-turn successful requests where it's meaningful.
         inter_turn_samples = [m.delay_expected for m in self.all_metrics if m.success and m.delay_expected > 0]
@@ -2415,6 +2444,18 @@ class TestOrchestrator:
             cumulative_input_tokens_per_second=cum_total_input / total_elapsed,
             cumulative_output_tokens_per_second=cum_total_output / total_elapsed,
             cumulative_cache_hit_rate=cum_cache_hits / cum_cache_total if cum_cache_total > 0 else 0,
+            cumulative_input_tps_avg=in_tps_avg,
+            cumulative_input_tps_p50=in_tps_p50,
+            cumulative_input_tps_p95=in_tps_p95,
+            cumulative_input_tps_p99=in_tps_p99,
+            cumulative_output_tps_avg=out_tps_avg,
+            cumulative_output_tps_p50=out_tps_p50,
+            cumulative_output_tps_p95=out_tps_p95,
+            cumulative_output_tps_p99=out_tps_p99,
+            cumulative_total_tps_avg=tot_tps_avg,
+            cumulative_total_tps_p50=tot_tps_p50,
+            cumulative_total_tps_p95=tot_tps_p95,
+            cumulative_total_tps_p99=tot_tps_p99,
             cumulative_interactivity_avg=intvty_avg,
             cumulative_interactivity_p50=intvty_p50,
             cumulative_interactivity_p95=intvty_p95,
@@ -2464,7 +2505,7 @@ class TestOrchestrator:
 
         in_flight = metrics.in_flight_prefilling + metrics.in_flight_decoding
 
-        label_width = 24
+        label_width = 26
         col_width = 12
 
         def _row(label: str, avg, p50, p95, p99, num_fmt: str) -> str:
@@ -2503,6 +2544,15 @@ class TestOrchestrator:
             _row("OSL (tokens)",
                  metrics.cumulative_osl_avg, metrics.cumulative_osl_p50,
                  metrics.cumulative_osl_p95, metrics.cumulative_osl_p99, tok_fmt),
+            _row("Input throughput (tok/s)",
+                 metrics.cumulative_input_tps_avg, metrics.cumulative_input_tps_p50,
+                 metrics.cumulative_input_tps_p95, metrics.cumulative_input_tps_p99, tok_fmt),
+            _row("Output throughput (tok/s)",
+                 metrics.cumulative_output_tps_avg, metrics.cumulative_output_tps_p50,
+                 metrics.cumulative_output_tps_p95, metrics.cumulative_output_tps_p99, tok_fmt),
+            _row("Total throughput (tok/s)",
+                 metrics.cumulative_total_tps_avg, metrics.cumulative_total_tps_p50,
+                 metrics.cumulative_total_tps_p95, metrics.cumulative_total_tps_p99, tok_fmt),
         ]
 
         if metrics.server_gpu_cache_hit_rate_avg is not None:
