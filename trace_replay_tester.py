@@ -46,7 +46,7 @@ import random
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Literal, Set
+from typing import Any, List, Dict, Optional, Tuple, Literal, Set
 from collections import defaultdict, deque
 import numpy as np
 import pandas as pd
@@ -257,6 +257,14 @@ class RequestMetrics:
     # Token chunk timing for proportional output attribution
     token_timestamps: List[float] = field(default_factory=list)
     tokens_per_chunk: List[int] = field(default_factory=list)
+    # Actual per-request KV/prefix cache stats when exposed by the OpenAI-compatible API.
+    # Current SGLang responses may leave these unavailable; the fields are kept
+    # nullable so downstream analysis can distinguish "not reported" from 0 hits.
+    actual_kv_cache_hit_tokens: Optional[int] = None
+    actual_kv_cache_miss_tokens: Optional[int] = None
+    actual_kv_cache_query_tokens: Optional[int] = None
+    actual_kv_cache_hit_rate: Optional[float] = None
+    actual_kv_cache_source: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1647,6 +1655,124 @@ def delta_field_names_for(model: str) -> Tuple[str, str]:
     return _DEFAULT_DELTA_FIELDS
 
 
+def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+    """Convert OpenAI SDK usage objects to a plain dict, preserving extras."""
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return usage
+    if hasattr(usage, "model_dump"):
+        try:
+            return usage.model_dump()
+        except Exception:
+            pass
+    result = {}
+    for name in dir(usage):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(usage, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool, dict, list, tuple, type(None))):
+            result[name] = value
+    return result
+
+
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _nested_get(data: Dict[str, Any], path: str) -> Any:
+    cur: Any = data
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def extract_api_cache_stats(usage: Any) -> Dict[str, Any]:
+    """Extract per-request cache stats from OpenAI-compatible usage metadata.
+
+    Providers that expose automatic prefix-cache accounting usually place the
+    cached prompt token count in one of these fields:
+      - prompt_tokens_details.cached_tokens
+      - input_tokens_details.cached_tokens
+      - cached_tokens
+
+    SGLang currently returns prompt_tokens_details=null on this deployment, so
+    this helper will mark stats unavailable until the server exposes such data.
+    """
+    usage_dict = _usage_to_dict(usage)
+    prompt_tokens = _to_optional_int(
+        usage_dict.get("prompt_tokens", usage_dict.get("input_tokens"))
+    )
+
+    hit_candidates = [
+        "prompt_tokens_details.cached_tokens",
+        "input_tokens_details.cached_tokens",
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "prompt_cache_hit_tokens",
+        "prefix_cache_hit_tokens",
+        "cache_hit_tokens",
+    ]
+    miss_candidates = [
+        "prompt_tokens_details.uncached_tokens",
+        "input_tokens_details.uncached_tokens",
+        "cache_creation_input_tokens",
+        "prompt_cache_miss_tokens",
+        "prefix_cache_miss_tokens",
+        "cache_miss_tokens",
+    ]
+
+    hit_tokens = None
+    hit_source = None
+    for key in hit_candidates:
+        value = _nested_get(usage_dict, key) if "." in key else usage_dict.get(key)
+        hit_tokens = _to_optional_int(value)
+        if hit_tokens is not None:
+            hit_source = key
+            break
+
+    miss_tokens = None
+    for key in miss_candidates:
+        value = _nested_get(usage_dict, key) if "." in key else usage_dict.get(key)
+        miss_tokens = _to_optional_int(value)
+        if miss_tokens is not None:
+            break
+
+    query_tokens = None
+    if hit_tokens is not None:
+        explicit_total = hit_tokens + (miss_tokens or 0)
+        if prompt_tokens is not None:
+            query_tokens = max(prompt_tokens, explicit_total)
+        elif explicit_total > 0:
+            query_tokens = explicit_total
+
+    hit_rate = None
+    if hit_tokens is not None and query_tokens and query_tokens > 0:
+        hit_rate = hit_tokens / query_tokens
+
+    return {
+        "usage": usage_dict,
+        "hit_tokens": hit_tokens,
+        "miss_tokens": miss_tokens,
+        "query_tokens": query_tokens,
+        "hit_rate": hit_rate,
+        "source": hit_source,
+        "available": hit_tokens is not None and query_tokens is not None,
+    }
+
+
 class APIClient:
     """Manages OpenAI API client"""
 
@@ -1755,6 +1881,8 @@ class APIClient:
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
         server_prompt_tokens: Optional[int] = None
+        server_usage = None
+        server_cache_stats: Dict[str, Any] = extract_api_cache_stats(None)
         content_field, reasoning_field = delta_field_names_for(self.model)
         debug_chunks = [] if self.debug_trace else None
         completion_token_ids: Optional[List[int]] = [] if self.debug_trace else None
@@ -1786,7 +1914,11 @@ class APIClient:
                         except Exception:
                             debug_chunks.append({'_repr': repr(chunk)})
                     if getattr(chunk, 'usage', None) is not None:
-                        server_prompt_tokens = chunk.usage.prompt_tokens
+                        server_usage = chunk.usage
+                        server_cache_stats = extract_api_cache_stats(chunk.usage)
+                        server_prompt_tokens = _to_optional_int(
+                            server_cache_stats.get('usage', {}).get('prompt_tokens')
+                        )
                     if completion_token_ids is not None and chunk.choices:
                         chunk_logprobs = getattr(chunk.choices[0], 'logprobs', None)
                         if chunk_logprobs is not None and tokenizer is not None:
@@ -1850,7 +1982,11 @@ class APIClient:
                         response_text += reasoning_text_full
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
                 if response.usage:
-                    server_prompt_tokens = response.usage.prompt_tokens
+                    server_usage = response.usage
+                    server_cache_stats = extract_api_cache_stats(response.usage)
+                    server_prompt_tokens = _to_optional_int(
+                        server_cache_stats.get('usage', {}).get('prompt_tokens')
+                    )
                     # For non-streaming, all tokens are attributed to completion time
                     token_timestamps.append(complete_time)
                     tokens_per_chunk.append(token_count)
@@ -1864,6 +2000,12 @@ class APIClient:
                 'ttlt': ttlt,
                 'output_tokens': token_count,
                 'server_prompt_tokens': server_prompt_tokens,
+                'server_usage': server_cache_stats.get('usage') or _usage_to_dict(server_usage),
+                'server_cache_hit_tokens': server_cache_stats.get('hit_tokens'),
+                'server_cache_miss_tokens': server_cache_stats.get('miss_tokens'),
+                'server_cache_query_tokens': server_cache_stats.get('query_tokens'),
+                'server_cache_hit_rate': server_cache_stats.get('hit_rate'),
+                'server_cache_source': server_cache_stats.get('source'),
                 'error_type': None,
                 'start_time': start_time,
                 'first_token_time': first_token_time or start_time,
@@ -1889,6 +2031,14 @@ class APIClient:
                         'output_tokens': token_count,
                         'ttft': ttft,
                         'ttlt': ttlt,
+                        'usage': server_cache_stats.get('usage') or _usage_to_dict(server_usage),
+                        'cache_stats': {
+                            'hit_tokens': server_cache_stats.get('hit_tokens'),
+                            'miss_tokens': server_cache_stats.get('miss_tokens'),
+                            'query_tokens': server_cache_stats.get('query_tokens'),
+                            'hit_rate': server_cache_stats.get('hit_rate'),
+                            'source': server_cache_stats.get('source'),
+                        },
                         'completion_token_ids': completion_token_ids,
                         'completion_token_count': len(completion_token_ids) if completion_token_ids is not None else None,
                     },
@@ -1932,6 +2082,12 @@ class APIClient:
                 'ttlt': 0,
                 'output_tokens': 0,
                 'server_prompt_tokens': None,
+                'server_usage': {},
+                'server_cache_hit_tokens': None,
+                'server_cache_miss_tokens': None,
+                'server_cache_query_tokens': None,
+                'server_cache_hit_rate': None,
+                'server_cache_source': None,
                 'error_type': error_type,
                 'start_time': start_time,
                 'first_token_time': start_time,
@@ -2672,6 +2828,11 @@ class TestOrchestrator:
         ttlt = result['ttlt']
         actual_output = result['output_tokens']
         server_prompt_tokens = result.get('server_prompt_tokens')
+        actual_kv_cache_hit_tokens = result.get('server_cache_hit_tokens')
+        actual_kv_cache_miss_tokens = result.get('server_cache_miss_tokens')
+        actual_kv_cache_query_tokens = result.get('server_cache_query_tokens')
+        actual_kv_cache_hit_rate = result.get('server_cache_hit_rate')
+        actual_kv_cache_source = result.get('server_cache_source')
         error_type = result['error_type']
         request_start_time = result['start_time']
         prefill_complete_time = result['first_token_time']
@@ -2750,7 +2911,12 @@ class TestOrchestrator:
             prefill_complete_time=prefill_complete_time,
             request_complete_time=request_complete_time,
             token_timestamps=token_timestamps,
-            tokens_per_chunk=tokens_per_chunk
+            tokens_per_chunk=tokens_per_chunk,
+            actual_kv_cache_hit_tokens=actual_kv_cache_hit_tokens,
+            actual_kv_cache_miss_tokens=actual_kv_cache_miss_tokens,
+            actual_kv_cache_query_tokens=actual_kv_cache_query_tokens,
+            actual_kv_cache_hit_rate=actual_kv_cache_hit_rate,
+            actual_kv_cache_source=actual_kv_cache_source,
         )
 
         if record_user_metrics:
@@ -3285,6 +3451,50 @@ def save_results(orchestrator: TestOrchestrator, config: TestConfig):
         df = pd.DataFrame([m.to_dict() for m in orchestrator.all_metrics])
         df.to_csv(output_path / "detailed_results.csv", index=False)
         logger.info(f"Saved detailed results: {len(df)} requests")
+
+        # Save a narrow per-turn KV cache CSV for downstream analysis. These
+        # columns combine the existing trace-hash theoretical hit model with
+        # actual per-request cache fields when the OpenAI-compatible server
+        # exposes them (for example prompt_tokens_details.cached_tokens).
+        cache_rows = []
+        for m in orchestrator.all_metrics:
+            theoretical_total_blocks = m.cache_hit_blocks + m.cache_miss_blocks
+            actual_available = (
+                m.actual_kv_cache_hit_tokens is not None
+                and m.actual_kv_cache_query_tokens is not None
+                and m.actual_kv_cache_query_tokens > 0
+            )
+            cache_rows.append({
+                "user_id": m.user_id,
+                "request_idx": m.request_idx,
+                "trace_id": m.trace_id,
+                "timestamp": m.timestamp,
+                "request_start_time": m.request_start_time,
+                "prefill_complete_time": m.prefill_complete_time,
+                "request_complete_time": m.request_complete_time,
+                "success": m.success,
+                "input_tokens": m.input_tokens,
+                "output_tokens_actual": m.output_tokens_actual,
+                "theoretical_cache_hit_blocks": m.cache_hit_blocks,
+                "theoretical_cache_miss_blocks": m.cache_miss_blocks,
+                "theoretical_cache_hit_rate": (
+                    m.cache_hit_blocks / theoretical_total_blocks
+                    if theoretical_total_blocks > 0 else 0.0
+                ),
+                "actual_kv_cache_available": actual_available,
+                "actual_kv_cache_hit_tokens": m.actual_kv_cache_hit_tokens,
+                "actual_kv_cache_miss_tokens": m.actual_kv_cache_miss_tokens,
+                "actual_kv_cache_query_tokens": m.actual_kv_cache_query_tokens,
+                "actual_kv_cache_hit_rate": m.actual_kv_cache_hit_rate,
+                "actual_kv_cache_source": m.actual_kv_cache_source,
+            })
+        cache_df = pd.DataFrame(cache_rows)
+        cache_df.to_csv(output_path / "kv_cache_turn_metrics.csv", index=False)
+        available_count = int(cache_df["actual_kv_cache_available"].sum()) if not cache_df.empty else 0
+        logger.info(
+            "Saved per-turn KV cache metrics: "
+            f"{len(cache_df)} requests ({available_count} with API-reported actual cache stats)"
+        )
 
     # Save assessment periods
     if orchestrator.assessment_periods:
