@@ -203,8 +203,9 @@ class TestConfig:
     tokenizer_id: str
     min_requests: int = 1
     seed: Optional[int] = None  # Random seed for reproducibility
-    # Generation parameters (None = use model defaults or auto-detect)
-    temperature: Optional[float] = None
+    # Generation parameters. Default to greedy sampling to avoid top-p/top-k
+    # filtering effects during stability/debug runs.
+    temperature: Optional[float] = 0.0
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
@@ -222,7 +223,9 @@ class TestConfig:
     hash_block_mode: bool = False
     debug_trace: bool = False  # Store full request/response bodies to JSONL
     metrics_output_prefix: Optional[str] = None  # Enable server metrics collection
+    metrics_endpoint: Optional[str] = None  # Comma-separated /metrics endpoints or base URLs
     warmup_enabled: bool = False  # Pre-send one request per advanced user before metrics start
+    request_rate: float = float("inf")  # Initial dispatch Poisson rate; inf = dispatch immediately
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1936,7 +1939,7 @@ class APIClient:
                         delta = chunk.choices[0].delta
                         content_text = getattr(delta, content_field, None) or ""
                         reasoning_text = getattr(delta, reasoning_field, None) or ""
-                        chunk_text = content_text or reasoning_text
+                        chunk_text = reasoning_text + content_text
                         if not chunk_text:
                             continue
                         chunk_time = time.time()
@@ -1951,11 +1954,11 @@ class APIClient:
                         # reasoning + content + harmony framing — so to keep the
                         # next turn's prompt size faithful to the trace we have to
                         # carry whatever channel(s) were actually used.
-                        if content_text:
-                            response_text += content_text
                         if reasoning_text:
                             response_text += reasoning_text
                             reasoning_text_full += reasoning_text
+                        if content_text:
+                            response_text += content_text
                         # Count all generated tokens (content + reasoning) for metrics
                         chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
                         token_count += chunk_token_count
@@ -1976,10 +1979,9 @@ class APIClient:
 
                 if response.choices:
                     msg = response.choices[0].message
-                    response_text = getattr(msg, content_field, None) or ""
+                    content_text = getattr(msg, content_field, None) or ""
                     reasoning_text_full = getattr(msg, reasoning_field, None) or ""
-                    if reasoning_text_full:
-                        response_text += reasoning_text_full
+                    response_text = reasoning_text_full + content_text
                     token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
                 if response.usage:
                     server_usage = response.usage
@@ -2153,6 +2155,7 @@ class TestOrchestrator:
         if config.metrics_output_prefix and MetricsCollector is not None:
             self.metrics_collector = MetricsCollector(
                 base_url=config.api_endpoint,
+                metrics_endpoints=config.metrics_endpoint,
                 poll_interval=1.0,
             )
 
@@ -3024,10 +3027,34 @@ class TestOrchestrator:
 
         if self.metrics_collector:
             self.metrics_collector.start()
-            logger.info(f"Server metrics collector started (polling {self.config.api_endpoint}/metrics)")
+            logger.info(f"Server metrics collector started (polling {self.metrics_collector.describe_endpoints()})")
 
         # Track in-flight tasks: maps task -> (user_id, start_time)
         pending_tasks: Dict[asyncio.Task, Tuple[str, float]] = {}
+
+        if self.config.request_rate != float("inf"):
+            rate = self.config.request_rate
+            if rate <= 0:
+                raise ValueError("--request-rate must be positive or inf")
+            logger.info(f"Staggered first dispatch: Poisson rate={rate} req/s")
+            for user_id, user in list(self.users.items()):
+                if user.state != "idle":
+                    continue
+
+                self.process_subagent_markers(user)
+                if user.current_idx >= len(user.requests) and not user.pending_subagents:
+                    user.state = "completed"
+                    continue
+                if user.pending_subagents:
+                    continue
+                if (self.config.max_concurrent_requests and
+                    self.in_flight_requests >= self.config.max_concurrent_requests):
+                    break
+
+                self.in_flight_requests += 1
+                task = asyncio.create_task(self.run_user_request(user))
+                pending_tasks[task] = (user_id, time.time())
+                await asyncio.sleep(float(np.random.exponential(1.0 / rate)))
 
         try:
             while self.running:
@@ -3621,10 +3648,20 @@ def parse_arguments():
                              "results/metrics_plots.png). Polls the server /metrics endpoint "
                              "during the test and generates plots/CSVs with both server and "
                              "client metrics.")
+    parser.add_argument("--metrics-endpoint", type=str, default=None,
+                        help="Comma-separated server metrics endpoints. Each entry may be a "
+                             "base URL (http://host:port) or a full /metrics URL. Defaults to "
+                             "the API endpoint when omitted.")
 
-    # Generation parameter overrides (None = use model-specific defaults if available)
-    parser.add_argument("--temperature", type=float, default=None,
-                        help="Override temperature for generation (e.g., 0.7)")
+    parser.add_argument("--request-rate", type=float, default=float("inf"),
+                        help="Initial request dispatch rate in requests/sec. Use inf to dispatch "
+                             "the first batch immediately; finite values use Poisson inter-arrival "
+                             "times to avoid a synchronized first burst.")
+
+    # Generation parameter overrides. The default temperature=0.0 selects greedy
+    # sampling in SGLang, which normalizes internally to top_k=1.
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Override temperature for generation (default: 0.0 greedy; e.g., 0.7)")
     parser.add_argument("--top-p", type=float, default=None,
                         help="Override top_p for generation (e.g., 0.8)")
     parser.add_argument("--top-k", type=int, default=None,
@@ -3754,7 +3791,9 @@ async def main():
         hash_block_mode=args.hash_block_mode,
         debug_trace=args.debug_trace,
         metrics_output_prefix=args.metrics_output_prefix,
+        metrics_endpoint=args.metrics_endpoint,
         warmup_enabled=args.warmup_enabled,
+        request_rate=args.request_rate,
     )
 
     # Print header
@@ -3810,6 +3849,13 @@ async def main():
         logger.info(f"  Test Duration: {config.test_duration}s")
     if config.max_concurrent_requests:
         logger.info(f"  Max Concurrent Requests: {config.max_concurrent_requests}")
+    if config.request_rate != float("inf"):
+        logger.info(f"  Initial Request Rate: {config.request_rate} req/s")
+    logger.info(
+        f"  Sampling: temperature={config.temperature}, "
+        f"top_p={config.top_p}, top_k={config.top_k}, "
+        f"repetition_penalty={config.repetition_penalty}"
+    )
     if config.warm_prefix_pct > 0:
         warm_tokens = int(config.warm_prefix_pct * stats.max_shared_prefix_tokens) if stats.max_shared_prefix_tokens > 0 else 0
         logger.info(f"  Warm Prefix: {config.warm_prefix_pct:.0%} of tool+system ({warm_tokens:,} tokens)")

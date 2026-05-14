@@ -45,6 +45,21 @@ class MetricsSnapshot:
     # Prefill KV computed tokens (cumulative sum from histogram)
     prefill_kv_computed_tokens_sum: int = 0
     prefill_kv_computed_tokens_count: int = 0
+    # SGLang PD KV transfer metrics (cumulative, from histograms _sum/_count)
+    kv_transfer_latency_ms_sum: float = 0.0
+    kv_transfer_latency_ms_count: int = 0
+    kv_transfer_total_mb_sum: float = 0.0
+    kv_transfer_total_mb_count: int = 0
+    kv_transfer_speed_gb_s_sum: float = 0.0
+    kv_transfer_speed_gb_s_count: int = 0
+    # SGLang HiCache host-tier metrics
+    hicache_host_used_tokens: int = 0
+    hicache_host_total_tokens: int = 0
+    # SGLang per-tier cache hit tokens (cumulative counters)
+    cache_hit_tokens_l1: int = 0  # GPU/device cache
+    cache_hit_tokens_l2: int = 0  # host/DRAM cache
+    cache_hit_tokens_l3: int = 0  # storage (UMBP/SSD)
+    cache_miss_tokens: int = 0
 
 
 # =============================================================================
@@ -55,6 +70,16 @@ def _get_value(text: str, pattern: str, default: float = 0.0) -> float:
     """Extract a gauge/counter value from Prometheus text using a regex."""
     match = re.search(pattern, text)
     return float(match.group(1)) if match else default
+
+
+def _get_values(text: str, pattern: str) -> list[float]:
+    """Extract all values matching a Prometheus text regex."""
+    return [float(match.group(1)) for match in re.finditer(pattern, text)]
+
+
+def _sum_values(text: str, pattern: str) -> float:
+    """Sum all values matching a Prometheus text regex."""
+    return sum(_get_values(text, pattern))
 
 
 class VLLMMetricsParser:
@@ -112,42 +137,132 @@ class SGLangMetricsParser:
         snapshot = MetricsSnapshot(timestamp=time.time())
         g = lambda p, d=0.0: _get_value(text, p, d)
 
+        has_prefill_engine = 'engine_type="prefill"' in text
+        has_decode_engine = 'engine_type="decode"' in text
+        prefill_only = has_prefill_engine and not has_decode_engine
+        decode_only = has_decode_engine and not has_prefill_engine
+
         # KV cache usage — sglang reports token_usage as a ratio (0-1)
-        snapshot.kv_cache_usage = g(r'sglang:token_usage\{[^}]*\}\s+([\d.e+-]+)')
-        # Fallback: compute from num_used_tokens / max_total_num_tokens
-        if snapshot.kv_cache_usage == 0.0:
-            used = g(r'sglang:num_used_tokens\{[^}]*\}\s+([\d.e+-]+)')
-            total = g(r'sglang:max_total_num_tokens\{[^}]*\}\s+([\d.e+-]+)')
-            if total > 0:
-                snapshot.kv_cache_usage = used / total
+        full_token_usage = g(r'sglang:full_token_usage\{[^}]*\}\s+([\d.e+-]+)')
+        token_usage = g(r'sglang:token_usage\{[^}]*\}\s+([\d.e+-]+)')
+        used = g(r'sglang:num_used_tokens\{[^}]*\}\s+([\d.e+-]+)')
+        total = g(r'sglang:max_total_num_tokens\{[^}]*\}\s+([\d.e+-]+)')
+        computed_token_usage = used / total if total > 0 else 0.0
+        gpu_occupancy = g(r'sglang:gpu_kv_cache_occupancy\{[^}]*\}\s+([\d.e+-]+)')
+        for value in (full_token_usage, token_usage, computed_token_usage, gpu_occupancy):
+            if value > 0:
+                snapshot.kv_cache_usage = value
+                break
+
+        host_used = g(r'sglang:hicache_host_used_tokens\{[^}]*\}\s+([\d.e+-]+)')
+        host_total = g(r'sglang:hicache_host_total_tokens\{[^}]*\}\s+([\d.e+-]+)')
+        snapshot.hicache_host_used_tokens = int(host_used)
+        snapshot.hicache_host_total_tokens = int(host_total)
+        if host_total > 0:
+            snapshot.cpu_kv_cache_usage = host_used / host_total
 
         snapshot.num_requests_running = int(g(r'sglang:num_running_reqs\{[^}]*\}\s+([\d.e+-]+)'))
         snapshot.num_requests_waiting = int(g(r'sglang:num_queue_reqs\{[^}]*\}\s+([\d.e+-]+)'))
 
-        snapshot.prompt_tokens = int(g(r'sglang:prompt_tokens_total\{[^}]*\}\s+([\d.e+-]+)'))
-        snapshot.generation_tokens = int(g(r'sglang:generation_tokens_total\{[^}]*\}\s+([\d.e+-]+)'))
+        raw_prompt_tokens = int(g(r'sglang:prompt_tokens_total\{[^}]*\}\s+([\d.e+-]+)'))
+        raw_generation_tokens = int(g(r'sglang:generation_tokens_total\{[^}]*\}\s+([\d.e+-]+)'))
+        snapshot.prompt_tokens = 0 if decode_only else raw_prompt_tokens
+        snapshot.generation_tokens = 0 if prefill_only else raw_generation_tokens
 
         # Preemptions — sglang calls them "retractions"
         snapshot.num_preemptions = int(g(r'sglang:num_retracted_reqs\{[^}]*\}\s+([\d.e+-]+)'))
 
-        snapshot.request_success = int(g(r'sglang:num_requests_total\{[^}]*\}\s+([\d.e+-]+)'))
+        snapshot.request_success = 0 if prefill_only else int(g(r'sglang:num_requests_total\{[^}]*\}\s+([\d.e+-]+)'))
 
         # Token source breakdown from realtime_tokens_total (cumulative)
-        snapshot.prompt_tokens_local_compute = int(g(
-            r'sglang:realtime_tokens_total\{[^}]*mode="prefill_compute"[^}]*\}\s+([\d.e+-]+)'))
-        snapshot.prompt_tokens_local_cache_hit = int(g(
-            r'sglang:realtime_tokens_total\{[^}]*mode="prefill_cache"[^}]*\}\s+([\d.e+-]+)'))
+        if not decode_only:
+            snapshot.prompt_tokens_local_compute = int(g(
+                r'sglang:realtime_tokens_total\{[^}]*mode="prefill_compute"[^}]*\}\s+([\d.e+-]+)'))
+            realtime_cache_hit = int(g(
+                r'sglang:realtime_tokens_total\{[^}]*mode="prefill_cache"[^}]*\}\s+([\d.e+-]+)'))
+            device_cache_hit = int(g(
+                r'sglang:cached_tokens_total\{[^}]*cache_source="device"[^}]*\}\s+([\d.e+-]+)'))
+            host_cache_hit = int(g(
+                r'sglang:cached_tokens_total\{[^}]*cache_source="host"[^}]*\}\s+([\d.e+-]+)'))
+
+            if device_cache_hit > 0 or host_cache_hit > 0:
+                snapshot.prompt_tokens_local_cache_hit = device_cache_hit
+                snapshot.prompt_tokens_external_kv_transfer = host_cache_hit
+            else:
+                snapshot.prompt_tokens_local_cache_hit = realtime_cache_hit
+
+            snapshot.cache_hit_tokens_l1 = int(_sum_values(
+                text,
+                r'sglang:cache_hit_tokens_l1_total\{[^}]*\}\s+([\d.e+-]+)',
+            ))
+            snapshot.cache_hit_tokens_l2 = int(_sum_values(
+                text,
+                r'sglang:cache_hit_tokens_l2_total\{[^}]*\}\s+([\d.e+-]+)',
+            ))
+            snapshot.cache_hit_tokens_l3 = int(_sum_values(
+                text,
+                r'sglang:cache_hit_tokens_l3_total\{[^}]*\}\s+([\d.e+-]+)',
+            ))
+            snapshot.cache_miss_tokens = int(_sum_values(
+                text,
+                r'sglang:cache_miss_tokens_total\{[^}]*\}\s+([\d.e+-]+)',
+            ))
+            if not any((
+                snapshot.cache_hit_tokens_l1,
+                snapshot.cache_hit_tokens_l2,
+                snapshot.cache_hit_tokens_l3,
+                snapshot.cache_miss_tokens,
+            )):
+                snapshot.cache_hit_tokens_l1 = device_cache_hit
+                snapshot.cache_hit_tokens_l2 = host_cache_hit
+                snapshot.cache_miss_tokens = snapshot.prompt_tokens_local_compute
 
         # Derive cumulative hits/queries from the per-source token counters.
         # This is the correct cumulative cache hit ratio — unlike sglang's
         # instantaneous `cache_hit_rate` gauge, which is 0 during decode-only
         # periods and thus yielded spurious 0% hit rates when sampled at
         # benchmark shutdown.
-        snapshot.prefix_cache_hits = snapshot.prompt_tokens_local_cache_hit
-        snapshot.prefix_cache_queries = (
+        snapshot.prefix_cache_hits = (
             snapshot.prompt_tokens_local_cache_hit
+            + snapshot.prompt_tokens_external_kv_transfer
+        )
+        snapshot.prefix_cache_queries = (
+            snapshot.prefix_cache_hits
             + snapshot.prompt_tokens_local_compute
         )
+
+        snapshot.kv_offload_bytes_gpu_to_cpu = _sum_values(
+            text,
+            r'sglang:evicted_bytes_total\{[^}]*\}\s+([\d.e+-]+)',
+        )
+        snapshot.kv_offload_bytes_cpu_to_gpu = _sum_values(
+            text,
+            r'sglang:load_back_bytes_total\{[^}]*\}\s+([\d.e+-]+)',
+        )
+        snapshot.kv_transfer_latency_ms_sum = _sum_values(
+            text,
+            r'sglang:kv_transfer_latency_ms_sum\{[^}]*\}\s+([\d.e+-]+)',
+        )
+        snapshot.kv_transfer_latency_ms_count = int(_sum_values(
+            text,
+            r'sglang:kv_transfer_latency_ms_count\{[^}]*\}\s+([\d.e+-]+)',
+        ))
+        snapshot.kv_transfer_total_mb_sum = _sum_values(
+            text,
+            r'sglang:kv_transfer_total_mb_sum\{[^}]*\}\s+([\d.e+-]+)',
+        )
+        snapshot.kv_transfer_total_mb_count = int(_sum_values(
+            text,
+            r'sglang:kv_transfer_total_mb_count\{[^}]*\}\s+([\d.e+-]+)',
+        ))
+        snapshot.kv_transfer_speed_gb_s_sum = _sum_values(
+            text,
+            r'sglang:kv_transfer_speed_gb_s_sum\{[^}]*\}\s+([\d.e+-]+)',
+        )
+        snapshot.kv_transfer_speed_gb_s_count = int(_sum_values(
+            text,
+            r'sglang:kv_transfer_speed_gb_s_count\{[^}]*\}\s+([\d.e+-]+)',
+        ))
 
         return snapshot
 
@@ -170,37 +285,126 @@ def get_parser(backend: str):
 
 @dataclass
 class MetricsCollector:
-    base_url: str
+    base_url: str | None = None
     poll_interval: float = 1.0
+    metrics_endpoints: str | list[str] | None = None
     snapshots: list[MetricsSnapshot] = field(default_factory=list)
     _running: bool = False
     _task: asyncio.Task | None = None
-    _parser: VLLMMetricsParser | SGLangMetricsParser | None = None
-    _backend: str = ""
+    _metrics_urls: list[str] = field(default_factory=list, init=False)
+    _parsers: dict[str, VLLMMetricsParser | SGLangMetricsParser] = field(default_factory=dict, init=False)
+    _backends: dict[str, str] = field(default_factory=dict, init=False)
     gpu_transfer_collector: object = None
 
-    def _parse_metrics(self, text: str) -> MetricsSnapshot:
+    def __post_init__(self) -> None:
+        self._metrics_urls = self._normalize_metrics_endpoints(
+            self.metrics_endpoints if self.metrics_endpoints else self.base_url
+        )
+
+    @staticmethod
+    def _normalize_metrics_endpoints(endpoints: str | list[str] | None) -> list[str]:
+        if endpoints is None:
+            return []
+
+        if isinstance(endpoints, str):
+            entries = endpoints.split(',')
+        else:
+            entries = endpoints
+
+        metrics_urls = []
+        for entry in entries:
+            endpoint = str(entry).strip().rstrip('/')
+            if not endpoint:
+                continue
+            if not endpoint.endswith('/metrics'):
+                endpoint = f"{endpoint}/metrics"
+            metrics_urls.append(endpoint)
+        return metrics_urls
+
+    def describe_endpoints(self) -> str:
+        return ', '.join(self._metrics_urls) if self._metrics_urls else '<none>'
+
+    def _parse_metrics(self, text: str, metrics_url: str) -> MetricsSnapshot:
         """Parse Prometheus metrics text, auto-detecting backend on first call."""
-        if self._parser is None:
-            self._backend = detect_backend(text)
-            self._parser = get_parser(self._backend)
-            if self._backend != 'unknown':
-                logger.info(f"Auto-detected metrics backend: {self._backend}")
-        return self._parser.parse(text)
+        parser = self._parsers.get(metrics_url)
+        if parser is None:
+            backend = detect_backend(text)
+            parser = get_parser(backend)
+            self._parsers[metrics_url] = parser
+            self._backends[metrics_url] = backend
+            if backend != 'unknown':
+                logger.info(f"Auto-detected metrics backend for {metrics_url}: {backend}")
+        return parser.parse(text)
+
+    async def _fetch_snapshot(
+        self,
+        session: aiohttp.ClientSession,
+        metrics_url: str,
+    ) -> MetricsSnapshot | None:
+        try:
+            async with session.get(metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Metrics poll error from {metrics_url}: HTTP {resp.status}")
+                    return None
+                text = await resp.text()
+                return self._parse_metrics(text, metrics_url)
+        except Exception as e:
+            logger.warning(f"Metrics poll error from {metrics_url}: {e}")
+            return None
+
+    @staticmethod
+    def _combine_snapshots(snapshots: list[MetricsSnapshot]) -> MetricsSnapshot:
+        combined = MetricsSnapshot(timestamp=time.time())
+        combined.kv_cache_usage = max(s.kv_cache_usage for s in snapshots)
+        combined.cpu_kv_cache_usage = max(s.cpu_kv_cache_usage for s in snapshots)
+        combined.num_requests_running = sum(s.num_requests_running for s in snapshots)
+        combined.num_requests_waiting = sum(s.num_requests_waiting for s in snapshots)
+        combined.prefix_cache_hits = sum(s.prefix_cache_hits for s in snapshots)
+        combined.prefix_cache_queries = sum(s.prefix_cache_queries for s in snapshots)
+        combined.cpu_prefix_cache_hits = sum(s.cpu_prefix_cache_hits for s in snapshots)
+        combined.cpu_prefix_cache_queries = sum(s.cpu_prefix_cache_queries for s in snapshots)
+        combined.prompt_tokens = sum(s.prompt_tokens for s in snapshots)
+        combined.generation_tokens = sum(s.generation_tokens for s in snapshots)
+        combined.num_preemptions = sum(s.num_preemptions for s in snapshots)
+        combined.request_success = sum(s.request_success for s in snapshots)
+        combined.kv_offload_bytes_gpu_to_cpu = sum(s.kv_offload_bytes_gpu_to_cpu for s in snapshots)
+        combined.kv_offload_bytes_cpu_to_gpu = sum(s.kv_offload_bytes_cpu_to_gpu for s in snapshots)
+        combined.kv_offload_time_gpu_to_cpu = sum(s.kv_offload_time_gpu_to_cpu for s in snapshots)
+        combined.kv_offload_time_cpu_to_gpu = sum(s.kv_offload_time_cpu_to_gpu for s in snapshots)
+        combined.prompt_tokens_local_compute = sum(s.prompt_tokens_local_compute for s in snapshots)
+        combined.prompt_tokens_local_cache_hit = sum(s.prompt_tokens_local_cache_hit for s in snapshots)
+        combined.prompt_tokens_external_kv_transfer = sum(s.prompt_tokens_external_kv_transfer for s in snapshots)
+        combined.prefill_kv_computed_tokens_sum = sum(s.prefill_kv_computed_tokens_sum for s in snapshots)
+        combined.prefill_kv_computed_tokens_count = sum(s.prefill_kv_computed_tokens_count for s in snapshots)
+        combined.kv_transfer_latency_ms_sum = sum(s.kv_transfer_latency_ms_sum for s in snapshots)
+        combined.kv_transfer_latency_ms_count = sum(s.kv_transfer_latency_ms_count for s in snapshots)
+        combined.kv_transfer_total_mb_sum = sum(s.kv_transfer_total_mb_sum for s in snapshots)
+        combined.kv_transfer_total_mb_count = sum(s.kv_transfer_total_mb_count for s in snapshots)
+        combined.kv_transfer_speed_gb_s_sum = sum(s.kv_transfer_speed_gb_s_sum for s in snapshots)
+        combined.kv_transfer_speed_gb_s_count = sum(s.kv_transfer_speed_gb_s_count for s in snapshots)
+        combined.hicache_host_used_tokens = max(s.hicache_host_used_tokens for s in snapshots)
+        combined.hicache_host_total_tokens = max(s.hicache_host_total_tokens for s in snapshots)
+        combined.cache_hit_tokens_l1 = sum(s.cache_hit_tokens_l1 for s in snapshots)
+        combined.cache_hit_tokens_l2 = sum(s.cache_hit_tokens_l2 for s in snapshots)
+        combined.cache_hit_tokens_l3 = sum(s.cache_hit_tokens_l3 for s in snapshots)
+        combined.cache_miss_tokens = sum(s.cache_miss_tokens for s in snapshots)
+        return combined
 
     async def _poll_loop(self) -> None:
         """Background polling loop."""
-        metrics_url = f"{self.base_url}/metrics"
+        if not self._metrics_urls:
+            logger.warning("No metrics endpoints configured")
+            return
+
         async with aiohttp.ClientSession() as session:
             while self._running:
-                try:
-                    async with session.get(metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            snapshot = self._parse_metrics(text)
-                            self.snapshots.append(snapshot)
-                except Exception as e:
-                    logger.warning(f"Metrics poll error: {e}")
+                results = await asyncio.gather(
+                    *(self._fetch_snapshot(session, url) for url in self._metrics_urls),
+                    return_exceptions=True,
+                )
+                snapshots = [s for s in results if isinstance(s, MetricsSnapshot)]
+                if snapshots:
+                    self.snapshots.append(self._combine_snapshots(snapshots))
 
                 await asyncio.sleep(self.poll_interval)
 
@@ -262,7 +466,7 @@ class MetricsCollector:
         # Create figure with subplots
         num_rows = 6 if client_metrics else 4
         fig, axes = plt.subplots(num_rows, 2, figsize=(14, 4 * num_rows))
-        fig.suptitle("vLLM Server Metrics During Benchmark", fontsize=14)
+        fig.suptitle("Server Metrics During Benchmark", fontsize=14)
 
         # 1. KV Cache Usage vs Time
         ax = axes[0, 0]
@@ -437,42 +641,70 @@ class MetricsCollector:
         ax.set_title("Throughput (Total & Decode)")
         ax.grid(True, alpha=0.3)
 
-        # 5. KV Offload Transfer Rate (from vLLM metrics)
+        # 5. KV Transfer Rate
         ax = axes[2, 0]
-        gpu_to_cpu_rates = []
-        cpu_to_gpu_rates = []
-        for i in range(1, len(self.snapshots)):
-            dt = self.snapshots[i].timestamp - self.snapshots[i-1].timestamp
-            if dt > 0:
-                delta_g2c = self.snapshots[i].kv_offload_bytes_gpu_to_cpu - self.snapshots[i-1].kv_offload_bytes_gpu_to_cpu
-                delta_c2g = self.snapshots[i].kv_offload_bytes_cpu_to_gpu - self.snapshots[i-1].kv_offload_bytes_cpu_to_gpu
-                gpu_to_cpu_rates.append(delta_g2c / dt / 1e6)  # MB/s
-                cpu_to_gpu_rates.append(delta_c2g / dt / 1e6)  # MB/s
-            else:
-                gpu_to_cpu_rates.append(0)
-                cpu_to_gpu_rates.append(0)
-        if any(r > 0 for r in gpu_to_cpu_rates) or any(r > 0 for r in cpu_to_gpu_rates):
-            ax.scatter(times[1:], gpu_to_cpu_rates, alpha=0.15, s=3, c='blue')
-            ax.scatter(times[1:], cpu_to_gpu_rates, alpha=0.15, s=3, c='red')
-            xfer_window = min(30, len(gpu_to_cpu_rates) // 10) if len(gpu_to_cpu_rates) > 10 else 1
-            if xfer_window > 1:
-                rolling_g2c = [
-                    sum(gpu_to_cpu_rates[max(0, i - xfer_window):i + 1]) / len(gpu_to_cpu_rates[max(0, i - xfer_window):i + 1])
-                    for i in range(len(gpu_to_cpu_rates))
-                ]
-                rolling_c2g = [
-                    sum(cpu_to_gpu_rates[max(0, i - xfer_window):i + 1]) / len(cpu_to_gpu_rates[max(0, i - xfer_window):i + 1])
-                    for i in range(len(cpu_to_gpu_rates))
-                ]
-                ax.plot(times[1:], rolling_g2c, 'b-', linewidth=1.5, label=f'GPU→CPU (avg n={xfer_window})')
-                ax.plot(times[1:], rolling_c2g, 'r-', linewidth=1.5, label=f'CPU→GPU (avg n={xfer_window})')
-            else:
-                ax.plot(times[1:], gpu_to_cpu_rates, 'b-', linewidth=1, alpha=0.8, label='GPU→CPU')
-                ax.plot(times[1:], cpu_to_gpu_rates, 'r-', linewidth=1, alpha=0.8, label='CPU→GPU')
-            ax.legend(fontsize=8)
+        has_pd_transfer = any(s.kv_transfer_total_mb_count > 0 for s in self.snapshots)
+        if has_pd_transfer:
+            interval_speeds = []
+            interval_mb = []
+            for i in range(1, len(self.snapshots)):
+                dc = self.snapshots[i].kv_transfer_speed_gb_s_count - self.snapshots[i-1].kv_transfer_speed_gb_s_count
+                ds = self.snapshots[i].kv_transfer_speed_gb_s_sum - self.snapshots[i-1].kv_transfer_speed_gb_s_sum
+                dm = self.snapshots[i].kv_transfer_total_mb_sum - self.snapshots[i-1].kv_transfer_total_mb_sum
+                interval_speeds.append(ds / dc if dc > 0 else 0)
+                interval_mb.append(dm)
+            if any(v > 0 for v in interval_speeds):
+                ax.scatter(times[1:], interval_speeds, alpha=0.15, s=3, c='blue')
+                xfer_window = max(3, min(30, len(interval_speeds) // 5)) if len(interval_speeds) >= 3 else len(interval_speeds)
+                if xfer_window > 1:
+                    rolling = [
+                        sum(interval_speeds[max(0, i - xfer_window):i + 1]) / len(interval_speeds[max(0, i - xfer_window):i + 1])
+                        for i in range(len(interval_speeds))
+                    ]
+                    ax.plot(times[1:], rolling, 'b-', linewidth=1.5, label=f'Rolling avg (n={xfer_window})')
+                ax.legend(fontsize=8)
+                ax2 = ax.twinx()
+                width = max(0.5, (times[-1] - times[0]) / max(1, len(times)) * 0.8)
+                ax2.bar(times[1:], interval_mb, width=width, alpha=0.15, color='orange', label='MB transferred')
+                ax2.set_ylabel("MB/interval", color='orange')
+                ax2.legend(fontsize=7, loc='upper left')
+            ax.set_ylabel("Avg Speed (GB/s)")
+            ax.set_title("KV Transfer Speed (PD Disagg)")
+        else:
+            gpu_to_cpu_rates = []
+            cpu_to_gpu_rates = []
+            for i in range(1, len(self.snapshots)):
+                dt = self.snapshots[i].timestamp - self.snapshots[i-1].timestamp
+                if dt > 0:
+                    delta_g2c = self.snapshots[i].kv_offload_bytes_gpu_to_cpu - self.snapshots[i-1].kv_offload_bytes_gpu_to_cpu
+                    delta_c2g = self.snapshots[i].kv_offload_bytes_cpu_to_gpu - self.snapshots[i-1].kv_offload_bytes_cpu_to_gpu
+                    gpu_to_cpu_rates.append(delta_g2c / dt / 1e6)  # MB/s
+                    cpu_to_gpu_rates.append(delta_c2g / dt / 1e6)  # MB/s
+                else:
+                    gpu_to_cpu_rates.append(0)
+                    cpu_to_gpu_rates.append(0)
+            if any(r > 0 for r in gpu_to_cpu_rates) or any(r > 0 for r in cpu_to_gpu_rates):
+                ax.scatter(times[1:], gpu_to_cpu_rates, alpha=0.15, s=3, c='blue')
+                ax.scatter(times[1:], cpu_to_gpu_rates, alpha=0.15, s=3, c='red')
+                xfer_window = min(30, len(gpu_to_cpu_rates) // 10) if len(gpu_to_cpu_rates) > 10 else 1
+                if xfer_window > 1:
+                    rolling_g2c = [
+                        sum(gpu_to_cpu_rates[max(0, i - xfer_window):i + 1]) / len(gpu_to_cpu_rates[max(0, i - xfer_window):i + 1])
+                        for i in range(len(gpu_to_cpu_rates))
+                    ]
+                    rolling_c2g = [
+                        sum(cpu_to_gpu_rates[max(0, i - xfer_window):i + 1]) / len(cpu_to_gpu_rates[max(0, i - xfer_window):i + 1])
+                        for i in range(len(cpu_to_gpu_rates))
+                    ]
+                    ax.plot(times[1:], rolling_g2c, 'b-', linewidth=1.5, label=f'GPU→CPU (avg n={xfer_window})')
+                    ax.plot(times[1:], rolling_c2g, 'r-', linewidth=1.5, label=f'CPU→GPU (avg n={xfer_window})')
+                else:
+                    ax.plot(times[1:], gpu_to_cpu_rates, 'b-', linewidth=1, alpha=0.8, label='GPU→CPU')
+                    ax.plot(times[1:], cpu_to_gpu_rates, 'r-', linewidth=1, alpha=0.8, label='CPU→GPU')
+                ax.legend(fontsize=8)
+            ax.set_ylabel("Transfer Rate (MB/s)")
+            ax.set_title("KV Offload Transfer Rate")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Transfer Rate (MB/s)")
-        ax.set_title("KV Offload Transfer Rate")
         ax.grid(True, alpha=0.3)
 
         # 6. Prompt Token Sources Over Time (cumulative percentage)
@@ -505,30 +737,69 @@ class MetricsCollector:
         ax.set_ylim(0, 105)
         ax.grid(True, alpha=0.3)
 
-        # 7. Cumulative KV Offload Transfers
+        # 7. HiCache / Cumulative KV Offload Transfers
         initial = self.snapshots[0]
-        # GPU → CPU cumulative
+        has_hicache = any(s.hicache_host_total_tokens > 0 for s in self.snapshots)
+        has_tier_cache = any(
+            s.cache_hit_tokens_l1 > 0
+            or s.cache_hit_tokens_l2 > 0
+            or s.cache_hit_tokens_l3 > 0
+            or s.cache_miss_tokens > 0
+            for s in self.snapshots
+        )
+
         ax = axes[3, 0]
-        cum_g2c = [(s.kv_offload_bytes_gpu_to_cpu - initial.kv_offload_bytes_gpu_to_cpu) / 1e9
-                    for s in self.snapshots]
-        if any(v > 0 for v in cum_g2c):
-            ax.plot(times, cum_g2c, 'b-', linewidth=1.5)
-            ax.fill_between(times, cum_g2c, alpha=0.2, color='blue')
+        if has_hicache:
+            host_usage = [
+                100.0 * s.hicache_host_used_tokens / s.hicache_host_total_tokens
+                if s.hicache_host_total_tokens > 0 else 0.0
+                for s in self.snapshots
+            ]
+            host_used = [s.hicache_host_used_tokens / 1e6 for s in self.snapshots]
+            ax.plot(times, host_usage, 'g-', linewidth=1.5, label='Host tier usage')
+            ax.fill_between(times, host_usage, alpha=0.15, color='green')
+            ax2 = ax.twinx()
+            ax2.plot(times, host_used, 'b--', linewidth=1, alpha=0.7, label='Used tokens')
+            ax2.set_ylabel("Used Tokens (M)", color='blue')
+            ax2.tick_params(axis='y', labelcolor='blue')
+            ax.set_ylabel("Host KV Usage (%)", color='green')
+            ax.tick_params(axis='y', labelcolor='green')
+            ax.set_title("HiCache Host-Tier Usage")
+        else:
+            cum_g2c = [(s.kv_offload_bytes_gpu_to_cpu - initial.kv_offload_bytes_gpu_to_cpu) / 1e9
+                        for s in self.snapshots]
+            if any(v > 0 for v in cum_g2c):
+                ax.plot(times, cum_g2c, 'b-', linewidth=1.5)
+                ax.fill_between(times, cum_g2c, alpha=0.2, color='blue')
+            ax.set_ylabel("Cumulative Transfer (GB)")
+            ax.set_title("KV Offload: GPU → CPU (Cumulative)")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Cumulative Transfer (GB)")
-        ax.set_title("KV Offload: GPU → CPU (Cumulative)")
         ax.grid(True, alpha=0.3)
 
-        # CPU → GPU cumulative
         ax = axes[3, 1]
-        cum_c2g = [(s.kv_offload_bytes_cpu_to_gpu - initial.kv_offload_bytes_cpu_to_gpu) / 1e9
-                    for s in self.snapshots]
-        if any(v > 0 for v in cum_c2g):
-            ax.plot(times, cum_c2g, 'r-', linewidth=1.5)
-            ax.fill_between(times, cum_c2g, alpha=0.2, color='red')
+        if has_tier_cache:
+            l1 = [max(0, s.cache_hit_tokens_l1 - initial.cache_hit_tokens_l1) for s in self.snapshots]
+            l2 = [max(0, s.cache_hit_tokens_l2 - initial.cache_hit_tokens_l2) for s in self.snapshots]
+            l3 = [max(0, s.cache_hit_tokens_l3 - initial.cache_hit_tokens_l3) for s in self.snapshots]
+            miss = [max(0, s.cache_miss_tokens - initial.cache_miss_tokens) for s in self.snapshots]
+            ax.stackplot(
+                times, l1, l2, l3, miss,
+                labels=['L1 GPU', 'L2 Host', 'L3 Storage', 'Miss'],
+                colors=['steelblue', 'mediumseagreen', 'gold', 'coral'],
+                alpha=0.75,
+            )
+            ax.legend(fontsize=8, loc='upper left')
+            ax.set_ylabel("Cumulative Tokens")
+            ax.set_title("Cache Hit/Miss Breakdown by Tier")
+        else:
+            cum_c2g = [(s.kv_offload_bytes_cpu_to_gpu - initial.kv_offload_bytes_cpu_to_gpu) / 1e9
+                        for s in self.snapshots]
+            if any(v > 0 for v in cum_c2g):
+                ax.plot(times, cum_c2g, 'r-', linewidth=1.5)
+                ax.fill_between(times, cum_c2g, alpha=0.2, color='red')
+            ax.set_ylabel("Cumulative Transfer (GB)")
+            ax.set_title("KV Offload: CPU → GPU (Cumulative)")
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Cumulative Transfer (GB)")
-        ax.set_title("KV Offload: CPU → GPU (Cumulative)")
         ax.grid(True, alpha=0.3)
 
         # 8 & 9. Client metrics plots (TTFT and Latency vs Time)
@@ -691,6 +962,36 @@ class MetricsCollector:
             lines.append(f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB in {g2c_time:.2f}s ({g2c_bytes/g2c_time/1e9:.1f} GB/s)" if g2c_time > 0 else f"  GPU→CPU: {g2c_bytes/1e9:.2f} GB")
             lines.append(f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB in {c2g_time:.2f}s ({c2g_bytes/c2g_time/1e9:.1f} GB/s)" if c2g_time > 0 else f"  CPU→GPU: {c2g_bytes/1e9:.2f} GB")
 
+        kv_transfer_count = final.kv_transfer_total_mb_count - initial.kv_transfer_total_mb_count
+        if kv_transfer_count > 0:
+            kv_transfer_mb = final.kv_transfer_total_mb_sum - initial.kv_transfer_total_mb_sum
+            speed_count = final.kv_transfer_speed_gb_s_count - initial.kv_transfer_speed_gb_s_count
+            speed_sum = final.kv_transfer_speed_gb_s_sum - initial.kv_transfer_speed_gb_s_sum
+            latency_count = final.kv_transfer_latency_ms_count - initial.kv_transfer_latency_ms_count
+            latency_sum = final.kv_transfer_latency_ms_sum - initial.kv_transfer_latency_ms_sum
+            lines.append(f"SGLang PD KV transfers:")
+            lines.append(f"  Total: {kv_transfer_mb:.1f} MB across {kv_transfer_count:,} transfers")
+            if speed_count > 0:
+                lines.append(f"  Avg speed: {speed_sum/speed_count:.2f} GB/s")
+            if latency_count > 0:
+                lines.append(f"  Avg latency: {latency_sum/latency_count:.2f} ms")
+
+        if final.hicache_host_total_tokens > 0:
+            host_usage = 100.0 * final.hicache_host_used_tokens / final.hicache_host_total_tokens
+            lines.append(f"HiCache host tier: {final.hicache_host_used_tokens:,}/{final.hicache_host_total_tokens:,} tokens ({host_usage:.1f}%)")
+
+        delta_l1 = final.cache_hit_tokens_l1 - initial.cache_hit_tokens_l1
+        delta_l2 = final.cache_hit_tokens_l2 - initial.cache_hit_tokens_l2
+        delta_l3 = final.cache_hit_tokens_l3 - initial.cache_hit_tokens_l3
+        delta_miss = final.cache_miss_tokens - initial.cache_miss_tokens
+        tier_total = delta_l1 + delta_l2 + delta_l3 + delta_miss
+        if tier_total > 0:
+            lines.append(f"Cache tier token breakdown:")
+            lines.append(f"  - L1 GPU:     {delta_l1:>12,} ({100*delta_l1/tier_total:.1f}%)")
+            lines.append(f"  - L2 Host:    {delta_l2:>12,} ({100*delta_l2/tier_total:.1f}%)")
+            lines.append(f"  - L3 Storage: {delta_l3:>12,} ({100*delta_l3/tier_total:.1f}%)")
+            lines.append(f"  - Miss:       {delta_miss:>12,} ({100*delta_miss/tier_total:.1f}%)")
+
         delta_kv_sum = final.prefill_kv_computed_tokens_sum - initial.prefill_kv_computed_tokens_sum
         delta_kv_count = final.prefill_kv_computed_tokens_count - initial.prefill_kv_computed_tokens_count
         if delta_kv_count > 0:
@@ -758,6 +1059,20 @@ class MetricsCollector:
                     # Prefill KV computed
                     'prefill_kv_computed_tokens_sum',
                     'prefill_kv_computed_tokens_count',
+                    # SGLang PD KV transfer histograms
+                    'kv_transfer_latency_ms_sum',
+                    'kv_transfer_latency_ms_count',
+                    'kv_transfer_total_mb_sum',
+                    'kv_transfer_total_mb_count',
+                    'kv_transfer_speed_gb_s_sum',
+                    'kv_transfer_speed_gb_s_count',
+                    # SGLang HiCache / cache tiers
+                    'hicache_host_used_tokens',
+                    'hicache_host_total_tokens',
+                    'cache_hit_tokens_l1',
+                    'cache_hit_tokens_l2',
+                    'cache_hit_tokens_l3',
+                    'cache_miss_tokens',
                     # Computed per-interval metrics
                     'interval_cache_hit_rate_pct',
                     'interval_throughput_tok_per_sec',
@@ -805,6 +1120,18 @@ class MetricsCollector:
                         s.prompt_tokens_external_kv_transfer,
                         s.prefill_kv_computed_tokens_sum,
                         s.prefill_kv_computed_tokens_count,
+                        f"{s.kv_transfer_latency_ms_sum:.6f}",
+                        s.kv_transfer_latency_ms_count,
+                        f"{s.kv_transfer_total_mb_sum:.6f}",
+                        s.kv_transfer_total_mb_count,
+                        f"{s.kv_transfer_speed_gb_s_sum:.6f}",
+                        s.kv_transfer_speed_gb_s_count,
+                        s.hicache_host_used_tokens,
+                        s.hicache_host_total_tokens,
+                        s.cache_hit_tokens_l1,
+                        s.cache_hit_tokens_l2,
+                        s.cache_hit_tokens_l3,
+                        s.cache_miss_tokens,
                         f"{cache_hit_rate:.2f}",
                         f"{throughput:.2f}",
                     ])
