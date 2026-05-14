@@ -2823,9 +2823,9 @@ class TestOrchestrator:
             on_chunk=on_chunk,
             tokenizer=self.generator.tokenizer,
             trace_headers={
-                "x-mori-session-id": user.user_id,
-                "x-mori-trace-id": user.trace_id,
-                "x-mori-request-idx": str(user.current_idx + 1),
+                "x-mori-session-id": user.trace_id,
+                "x-mori-request-id": str(user.current_idx + 1),
+                "x-mori-user-id": user.user_id,
             }
         )
 
