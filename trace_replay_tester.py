@@ -1824,7 +1824,8 @@ class APIClient:
 
         return self.model
 
-    def _build_request_params(self, messages: List[dict], max_tokens: Optional[int], stream: bool) -> dict:
+    def _build_request_params(self, messages: List[dict], max_tokens: Optional[int], stream: bool,
+                              trace_headers: Optional[Dict[str, str]] = None) -> dict:
         """Build request parameters including model-specific settings."""
         params = {
             "model": self.model,
@@ -1835,6 +1836,8 @@ class APIClient:
             params["max_tokens"] = max_tokens
         if stream:
             params["stream_options"] = {"include_usage": True}
+        if trace_headers:
+            params["extra_headers"] = trace_headers
 
         # Add generation parameters (vLLM supports all of these directly)
         extra_body = {}
@@ -1862,7 +1865,8 @@ class APIClient:
     async def send_request(self, messages: List[dict], max_tokens: Optional[int], stream: bool = True,
                            on_first_token: Optional[callable] = None,
                            on_chunk: Optional[callable] = None,
-                           tokenizer=None) -> dict:
+                           tokenizer=None,
+                           trace_headers: Optional[Dict[str, str]] = None) -> dict:
         """
         Send request and return metrics.
 
@@ -1902,7 +1906,7 @@ class APIClient:
                 prompt_token_ids = None
 
         try:
-            params = self._build_request_params(messages, max_tokens, stream)
+            params = self._build_request_params(messages, max_tokens, stream, trace_headers=trace_headers)
 
             if stream:
                 response = await self.client.chat.completions.create(**params)
@@ -2817,7 +2821,12 @@ class TestOrchestrator:
             stream=stream,
             on_first_token=on_first_token,
             on_chunk=on_chunk,
-            tokenizer=self.generator.tokenizer
+            tokenizer=self.generator.tokenizer,
+            trace_headers={
+                "x-mori-session-id": user.user_id,
+                "x-mori-trace-id": user.trace_id,
+                "x-mori-request-idx": str(user.current_idx + 1),
+            }
         )
 
         # Decrement decode counter if first token was received
