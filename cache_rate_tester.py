@@ -4864,13 +4864,13 @@ async def main():
 
         if all_aggregated_results:
             logger.info("")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
             logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
 
             # Header
-            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6}{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6} {'EvalAcc':>9}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*132}{Colors.ENDC}")
 
             # Calculate grand totals
             grand_total_input = 0
@@ -4889,16 +4889,18 @@ async def main():
                 grand_total_output += est_output_tokens
                 grand_total_requests += m.total_requests
 
+                eval_str = f"{m.eval_accuracy*100:.1f}%" if m.eval_accuracy is not None else "-"
+                eval_color = Colors.WARNING if (m.eval_accuracy is not None and m.eval_accuracy < 1.0) else ""
                 logger.info(f"{m.context_size:>10,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
                            f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
                            f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
-                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
+                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6} {eval_color}{eval_str:>9}{Colors.ENDC}")
 
             # Grand totals
-            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*132}{Colors.ENDC}")
             logger.info(f"{Colors.SUCCESS}{'TOTAL':>10} {'':>8} {grand_total_requests:>10,} "
                        f"{grand_total_input/1e6:>11.2f}M {grand_total_output/1e6:>11.2f}M{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
 
     else:
         # Count continuous mode tests from period files
@@ -4907,13 +4909,13 @@ async def main():
 
         if continuous_aggregated_results:
             logger.info("")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
             logger.info(f"{Colors.PHASE}{Colors.BOLD}Final Summary - All Test Results{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
 
             # Header
-            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6}{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'Context':>10} {'Cache%':>8} {'Requests':>10} {'Input Tok':>12} {'Output Tok':>12} {'Input/s':>12} {'Output/s':>12} {'Avg TTFT':>10} {'Conc':>6} {'EvalAcc':>9}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*132}{Colors.ENDC}")
 
             # Calculate grand totals
             grand_total_input = 0
@@ -4932,16 +4934,18 @@ async def main():
                 grand_total_output += est_output_tokens
                 grand_total_requests += m.total_requests
 
+                eval_str = f"{m.eval_accuracy*100:.1f}%" if m.eval_accuracy is not None else "-"
+                eval_color = Colors.WARNING if (m.eval_accuracy is not None and m.eval_accuracy < 1.0) else ""
                 logger.info(f"{m.context_size:>10,} {m.cache_hit_rate:>7}% {m.total_requests:>10,} "
                            f"{est_input_tokens/1e6:>11.2f}M {est_output_tokens/1e6:>11.2f}M "
                            f"{m.input_tokens_per_sec:>11,.0f} {m.output_tokens_per_sec:>11,.0f} "
-                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6}")
+                           f"{m.avg_ttft:>9.3f}s {m.peak_concurrency:>6} {eval_color}{eval_str:>9}{Colors.ENDC}")
 
             # Grand totals
-            logger.info(f"{Colors.PHASE}{'-'*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'-'*132}{Colors.ENDC}")
             logger.info(f"{Colors.SUCCESS}{'TOTAL':>10} {'':>8} {grand_total_requests:>10,} "
                        f"{grand_total_input/1e6:>11.2f}M {grand_total_output/1e6:>11.2f}M{Colors.ENDC}")
-            logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
+            logger.info(f"{Colors.PHASE}{'='*132}{Colors.ENDC}")
 
     # Brief mode output
     if brief_mode:
