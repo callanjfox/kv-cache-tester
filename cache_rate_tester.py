@@ -540,6 +540,9 @@ class AggregatedMetrics:
     peak_concurrency: int
     total_requests: int
     test_duration: float
+    eval_total: int = 0
+    eval_passed: int = 0
+    eval_accuracy: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -2485,6 +2488,9 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
             )
         )
 
+    # Keep full list for eval aggregation (eval probes run at all concurrency levels)
+    all_metrics = metrics
+
     # Filter to only peak concurrency requests (matching what's shown in Retry Summary)
     # This ensures the final aggregated metrics match what the user sees in the summary table
     peak_metrics = [m for m in metrics if m.concurrency_level == peak_concurrency]
@@ -2662,6 +2668,13 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
     ]
     avg_output_tokens_per_sec = np.mean(output_tokens_per_sec_per_request) if output_tokens_per_sec_per_request else 0
 
+    # Aggregate eval accuracy across ALL requests (not just peak concurrency) so that
+    # eval probes from every stage of the ramp are counted.
+    all_eval = [m for m in all_metrics if m.eval_passed is not None]
+    agg_eval_total = len(all_eval)
+    agg_eval_passed = sum(1 for m in all_eval if m.eval_passed)
+    agg_eval_accuracy = (agg_eval_passed / agg_eval_total) if agg_eval_total > 0 else None
+
     return AggregatedMetrics(
         context_size=context_size,
         cache_hit_rate=cache_hit_rate,
@@ -2683,7 +2696,10 @@ def calculate_aggregated_metrics(metrics: List[RequestMetrics], context_size: in
         p99_itl=p99_itl,
         peak_concurrency=peak_concurrency,
         total_requests=len(metrics),
-        test_duration=test_duration
+        test_duration=test_duration,
+        eval_total=agg_eval_total,
+        eval_passed=agg_eval_passed,
+        eval_accuracy=agg_eval_accuracy,
     )
 
 
