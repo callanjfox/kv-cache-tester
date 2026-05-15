@@ -448,6 +448,7 @@ class TestConfig:
     eval_mode: str = "none"  # "none" or "niah" - output correctness eval
     eval_fraction: float = 0.1  # Fraction of working set to be eval prompts when eval_mode != none
     eval_passkey_digits: int = 7  # Digits in NIAH passkey
+    eval_output_tokens: int = 512  # Output token budget for eval prompts (thinking models need more)
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -1138,6 +1139,11 @@ def parse_arguments() -> argparse.Namespace:
                             "Only used when --mode=fixed")
     parser.add_argument("--output-tokens", type=int, default=256,
                        help="Output tokens per request (default: 256)")
+    parser.add_argument("--eval-output-tokens", type=int, default=512,
+                       help="Output tokens for NIAH eval prompts (default: 512). Thinking models like Qwen3 "
+                            "consume most of a 200-token budget in <think> reasoning before writing the "
+                            "answer, so eval prompts need a higher budget than regular requests. "
+                            "Only used when --eval-mode != none. Regular requests always use --output-tokens.")
     parser.add_argument("--max-ttft", type=float, default=None,
                        help="TTFT threshold in seconds (e.g., 2.0). Optional if --min-tokens-per-req is specified. "
                             "Limits Time To First Token to ensure good prefill performance.")
@@ -1323,6 +1329,7 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         eval_mode=args.eval_mode,
         eval_fraction=args.eval_fraction,
         eval_passkey_digits=args.eval_passkey_digits,
+        eval_output_tokens=args.eval_output_tokens,
     )
 
 
@@ -1673,10 +1680,13 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                 else:
                     endpoint_index = None
 
-                # Launch request
+                # Launch request (eval prompts get a larger output budget)
+                req_output_tokens = (
+                    config.eval_output_tokens if eval_metadata else config.output_tokens
+                )
                 task = asyncio.create_task(
                     run_single_request(
-                        api_client, prompt, config.output_tokens, cache_hit_rate,
+                        api_client, prompt, req_output_tokens, cache_hit_rate,
                         context_size, cached_tok, unique_tok, concurrency, request_id, phase_id,
                         tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id,
                         eval_metadata=eval_metadata,
@@ -2047,10 +2057,13 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     else:
                         endpoint_index = None
 
-                    # Launch request
+                    # Launch request (eval prompts get a larger output budget)
+                    req_output_tokens = (
+                        config.eval_output_tokens if eval_metadata else config.output_tokens
+                    )
                     task = asyncio.create_task(
                         run_single_request(
-                            api_client, prompt, config.output_tokens, cache_hit_rate,
+                            api_client, prompt, req_output_tokens, cache_hit_rate,
                             context_size, cached_tok, unique_tok, current_concurrency, request_id, phase_id,
                             tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id,
                             eval_metadata=eval_metadata,
