@@ -2963,6 +2963,11 @@ def save_run_command(args: argparse.Namespace, output_dir: str):
         command_parts.append(f"  --kv-cache-quantization {args.kv_cache_quantization}")
     if hasattr(args, 'strict_time_window') and args.strict_time_window:
         command_parts.append(f"  --strict-time-window")
+    if hasattr(args, 'eval_mode') and args.eval_mode != "none":
+        command_parts.append(f"  --eval-mode {args.eval_mode}")
+        command_parts.append(f"  --eval-fraction {args.eval_fraction}")
+        command_parts.append(f"  --eval-passkey-digits {args.eval_passkey_digits}")
+        command_parts.append(f"  --eval-output-tokens {args.eval_output_tokens}")
 
     command_str = " \\\n".join(command_parts)
 
