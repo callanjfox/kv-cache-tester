@@ -143,6 +143,154 @@ QUESTION_BANK = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Needle-in-a-haystack (NIAH) eval prompts
+# ---------------------------------------------------------------------------
+# A pool of coherent English sentences used as filler when constructing NIAH
+# prompts. The passkey is embedded at a random position inside the haystack;
+# the trailing question asks the model to retrieve it. Substring-match grading
+# detects both wrong answers and structurally garbage output (e.g., when KV
+# cache corruption produces token loops or gibberish).
+
+NIAH_FILLER_SENTENCES = [
+    "The old library on the corner contained thousands of books, each one carefully catalogued by the head librarian.",
+    "Researchers gathered every Tuesday morning to discuss the latest experimental results from the high-energy physics lab.",
+    "In the garden behind the cottage, roses and lavender grew side by side in carefully maintained beds.",
+    "The conference room overlooked a wide river, and many speakers paused mid-sentence to watch the boats drift past.",
+    "Engineers debated for hours whether the new bridge should use steel cables or reinforced concrete piers.",
+    "During the long winter evenings, the family read aloud from old novels gathered from second-hand bookshops.",
+    "The mountain trail wound through forests of pine and birch before opening onto a wide alpine meadow.",
+    "Programmers at the startup spent the weekend rewriting the storage layer to handle ten times the previous load.",
+    "Travellers stopping at the inn always commented on the unusual collection of antique maps lining the walls.",
+    "The chef insisted that the soup needed two more hours of simmering before the flavours would properly combine.",
+    "Astronomers tracked the unusual comet for several weeks before publishing their preliminary findings online.",
+    "Schoolchildren in the small town walked along the canal each morning, watching ducks paddle in the shallows.",
+    "The architect sketched three different facade options on tracing paper before settling on the simplest design.",
+    "Veterans of the company recalled the early years when the entire operation fit inside a single rented warehouse.",
+    "Musicians rehearsed the new symphony every afternoon, paying particular attention to the difficult third movement.",
+    "Hikers reaching the summit at dawn were rewarded with a sweeping view of the valleys below and the distant sea.",
+    "The bookshop owner arranged the new arrivals in the front window, hoping passers-by would stop and look in.",
+    "Farmers in the region had been cultivating the same varieties of apple for more than a hundred years.",
+    "Scientists at the marine station tagged sea turtles every spring to track their migration patterns across the ocean.",
+    "The clockmaker's shop smelled of oil and brass, and the constant ticking made conversation almost impossible.",
+    "Travellers reported that the small village at the foot of the mountain had the best bread in the entire region.",
+    "Software teams reviewed the deployment plan three times, looking for any step that might cause an outage at peak hours.",
+    "The painter spent the entire summer working on a single landscape, returning to the same hillside each morning.",
+    "Children raced their bicycles down the long, gentle slope that led from the school gates to the river path.",
+    "Geologists found unusual mineral deposits in the cliffs along the coast, prompting a series of follow-up expeditions.",
+    "The orchestra's annual outdoor concert always drew large crowds, who arrived with picnic baskets and folding chairs.",
+    "Mechanics at the rally repaired three engines in the small hours of the morning before the race resumed at dawn.",
+    "Linguists spent decades documenting the rapidly disappearing dialects spoken in remote highland villages.",
+    "The bakery opened before sunrise, and the smell of warm bread spread along the cobbled street within minutes.",
+    "Engineers monitored the dam's water levels every hour, especially after the heavy rains in the foothills upstream.",
+    "Photographers visiting the lighthouse competed for the best angle as the autumn sun set behind the distant headlands.",
+    "Volunteers cleaned up the beach every Saturday morning, separating the recyclable material from the general waste.",
+    "The pottery workshop welcomed new students each season, providing clay, wheels, and patient hands-on guidance.",
+    "Historians examined the old letters carefully, looking for clues about the small town's founding two centuries earlier.",
+    "The repair shop on the main street had been run by the same family for four generations without interruption.",
+    "Birdwatchers gathered at the reservoir every weekend in spring, hoping to spot the migrating species passing through.",
+    "Sailors checked the rigging twice before leaving harbour, knowing the weather forecast predicted strong evening winds.",
+    "The gardener carefully labeled each row of seedlings, recording planting dates and expected harvest times in a notebook.",
+    "Translators worked late into the night to finish the manuscript before the publisher's strict morning deadline.",
+    "Cyclists travelling the long-distance route stopped at the village square to refill water bottles and rest their legs.",
+    "The film crew set up cameras along the riverbank, hoping the morning mist would create the atmosphere they wanted.",
+    "Beekeepers in the valley reported a record honey harvest, attributing it to the unusually warm and dry summer.",
+    "Mountaineers studied the weather reports closely before deciding whether to attempt the final push to the summit.",
+    "The university library kept its rare manuscripts in a temperature-controlled vault deep beneath the main reading room.",
+    "Carpenters working on the old barn discovered timber that had been cut and shaped well over two centuries ago.",
+    "Runners training for the marathon met at the park every morning, regardless of the temperature or weather forecast.",
+    "The market square filled with stalls on Saturday mornings, selling cheese, bread, vegetables, and handmade crafts.",
+    "Engineers reviewed the simulation results overnight and presented their recommendations at the early morning briefing.",
+    "Children in the coastal town learned to swim before they could read, taught by older siblings in the calm harbour waters.",
+    "The astronomer's notebook contained dense columns of figures alongside small, careful sketches of distant nebulae.",
+]
+
+
+def _generate_niah_prompt_text(target_tokens: int, tokenizer: 'TokenizerManager',
+                                passkey_digits: int = 7,
+                                rng: Optional[np.random.RandomState] = None) -> Tuple[List[int], str]:
+    """
+    Generate a NIAH (needle-in-a-haystack) prompt of approximately ``target_tokens`` tokens.
+
+    Layout:
+      <instruction>
+      <filler sentences>
+      ... at random position: The secret pass key is XXXXX. Remember it. ...
+      <more filler>
+      <retrieval question>
+
+    Returns: (token_ids truncated/padded to target_tokens, expected_passkey_string)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    low = 10 ** (passkey_digits - 1)
+    high = 10 ** passkey_digits
+    passkey = str(rng.randint(low, high))
+
+    instruction = ("You are given a long document. Hidden somewhere inside it is a "
+                   "secret pass key — a sequence of digits. Read the document and "
+                   "then answer the question at the end.\n\n")
+    needle = f"\n\nThe secret pass key is {passkey}. Please remember it.\n\n"
+    question = ("\n\nQuestion: What is the secret pass key embedded in the document above? "
+                f"Reply with just the {passkey_digits}-digit number, nothing else.")
+
+    instruction_tokens = tokenizer.encode(instruction)
+    needle_tokens = tokenizer.encode(needle)
+    question_tokens = tokenizer.encode(question)
+
+    fixed_token_count = len(instruction_tokens) + len(needle_tokens) + len(question_tokens)
+    filler_budget = max(0, target_tokens - fixed_token_count)
+
+    # Generate enough filler to exceed budget, then truncate
+    filler_parts: List[str] = []
+    filler_token_count = 0
+    while filler_token_count < filler_budget + 50:
+        sentence = NIAH_FILLER_SENTENCES[rng.randint(0, len(NIAH_FILLER_SENTENCES))]
+        filler_parts.append(sentence)
+        filler_token_count += len(tokenizer.encode(sentence + " "))
+
+    filler_text = " ".join(filler_parts)
+    filler_tokens = tokenizer.encode(filler_text)[:filler_budget]
+
+    # Pick a needle insertion position (avoid the very start/end so the model
+    # cannot game it by reading just the head or tail).
+    if len(filler_tokens) > 200:
+        min_pos = int(len(filler_tokens) * 0.1)
+        max_pos = int(len(filler_tokens) * 0.9)
+        split_pos = rng.randint(min_pos, max_pos)
+    else:
+        split_pos = len(filler_tokens) // 2
+
+    prefix_filler = tokenizer.decode(filler_tokens[:split_pos])
+    suffix_filler = tokenizer.decode(filler_tokens[split_pos:])
+
+    full_text = instruction + prefix_filler + needle + suffix_filler + question
+    full_tokens = tokenizer.encode(full_text)
+
+    if len(full_tokens) > target_tokens:
+        # Truncate from the middle of the filler to preserve instruction/needle/question.
+        excess = len(full_tokens) - target_tokens
+        # Recompute and trim filler tokens to shed `excess` from the prefix side.
+        new_prefix_tokens = filler_tokens[: max(0, split_pos - excess)]
+        prefix_filler = tokenizer.decode(new_prefix_tokens)
+        full_text = instruction + prefix_filler + needle + suffix_filler + question
+        full_tokens = tokenizer.encode(full_text)
+        # Final hard truncate as a safety net (extremely rare). Cut from the START so the
+        # retrieval question at the tail survives — the model can skim leading noise.
+        if len(full_tokens) > target_tokens:
+            full_tokens = full_tokens[-target_tokens:]
+
+    return full_tokens, passkey
+
+
+def grade_niah_response(response_text: str, expected_passkey: str) -> bool:
+    """Substring-match grading: passes if the expected passkey appears anywhere in the response."""
+    if not response_text or not expected_passkey:
+        return False
+    return expected_passkey in response_text
+
+
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors for console output"""
 
@@ -297,6 +445,9 @@ class TestConfig:
     strict_time_window: bool = False  # Only include requests completed within duration window
     fixed_concurrency_levels: Optional[List[int]] = None  # For fixed mode
     endpoint_selection: str = "round-robin"  # "round-robin" or "pinned" for multi-endpoint routing
+    eval_mode: str = "none"  # "none" or "niah" - output correctness eval
+    eval_fraction: float = 0.1  # Fraction of working set to be eval prompts when eval_mode != none
+    eval_passkey_digits: int = 7  # Digits in NIAH passkey
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -330,6 +481,11 @@ class RequestMetrics:
     prefill_complete_time: float  # When input tokens are processed (TTFT)
     token_timestamps: List[float]  # Timestamp of each output token/chunk
     tokens_per_chunk: List[int]    # Estimated tokens in each chunk
+    # Output-correctness eval (populated only for eval prompts; None otherwise)
+    eval_type: Optional[str] = None
+    eval_expected: Optional[str] = None
+    eval_passed: Optional[bool] = None
+    eval_response_excerpt: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -421,6 +577,10 @@ class AssessmentPeriodMetrics:
     measured_ttft: float  # The TTFT metric used for decision (p95/avg/max)
     decision: str  # "RAMP_UP", "RAMP_DOWN", "STAY", "MAX_REACHED", "MIN_REACHED"
     next_concurrency: int  # Concurrency for next period
+    # Eval stats (only populated when --eval-mode != none; 0/0/None otherwise)
+    eval_total: int = 0
+    eval_passed: int = 0
+    eval_accuracy: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -613,12 +773,17 @@ class WorkingSet:
     """Manages the working set of pre-warmed prompts"""
 
     def __init__(self, context_size: int, working_set_size: int,
-                 tokenizer: TokenizerManager, chunk_size: int = 256, seed: Optional[int] = None):
+                 tokenizer: TokenizerManager, chunk_size: int = 256, seed: Optional[int] = None,
+                 eval_mode: str = "none", eval_fraction: float = 0.0,
+                 eval_passkey_digits: int = 7):
         self.context_size = context_size
         self.working_set_size = working_set_size
         self.tokenizer = tokenizer
         self.chunk_size = chunk_size
         self.seed = seed
+        self.eval_mode = eval_mode
+        self.eval_fraction = eval_fraction
+        self.eval_passkey_digits = eval_passkey_digits
 
         # Round up context size to nearest chunk boundary
         self.rounded_context_size = int(np.ceil(context_size / chunk_size) * chunk_size)
@@ -642,18 +807,59 @@ class WorkingSet:
 
         self.prompts: List[List[int]] = []
         self.current_index = 0
+        # Map prompt index -> {"expected_passkey": str, "type": "niah"} for eval prompts
+        self.eval_metadata: Dict[int, Dict[str, str]] = {}
+
+    def get_eval_metadata(self, idx: int) -> Optional[Dict[str, str]]:
+        """Return eval metadata for prompt index ``idx`` (None if not an eval prompt)."""
+        return self.eval_metadata.get(idx)
+
+    def _pick_eval_indices(self) -> List[int]:
+        """Choose which working-set indices become eval prompts."""
+        if self.eval_mode == "none" or self.eval_fraction <= 0.0:
+            return []
+        n_eval = max(1, int(round(self.num_prompts * self.eval_fraction)))
+        n_eval = min(n_eval, self.num_prompts)
+        # Deterministic, seed-driven selection so reruns are reproducible.
+        rng = np.random.RandomState(self.seed if self.seed is not None else 0)
+        return sorted(rng.choice(self.num_prompts, size=n_eval, replace=False).tolist())
 
     def generate_prompts(self):
         """Generate all working set prompts"""
         logger.info(f"Generating working set: {self.num_prompts} prompts of {self.rounded_context_size} tokens each")
 
+        eval_indices = set(self._pick_eval_indices())
+        if eval_indices:
+            logger.info(f"  Eval mode '{self.eval_mode}': {len(eval_indices)}/{self.num_prompts} prompts "
+                        f"will be NIAH eval prompts (indices: {sorted(eval_indices)[:10]}"
+                        f"{'...' if len(eval_indices) > 10 else ''})")
+
         self.prompts = []
+        self.eval_metadata = {}
         for i in range(self.num_prompts):
             # Use different seed for each prompt to ensure uniqueness
             prompt_seed = (self.seed + i) if self.seed is not None else None
-            # Add prompt number for clarity in logs
-            tokens = self.tokenizer.generate_dummy_tokens(self.rounded_context_size, seed=prompt_seed, prompt_number=i)
-            self.prompts.append(tokens)
+
+            if i in eval_indices and self.eval_mode == "niah":
+                rng = np.random.RandomState(prompt_seed if prompt_seed is not None else i)
+                tokens, passkey = _generate_niah_prompt_text(
+                    self.rounded_context_size, self.tokenizer,
+                    passkey_digits=self.eval_passkey_digits, rng=rng
+                )
+                # If NIAH came up short due to tokenizer round-trip slippage, PREPEND
+                # dummy padding so the retrieval question stays at the very end of the
+                # prompt (otherwise the model responds to the trailing gibberish instead
+                # of the embedded question).
+                if len(tokens) < self.rounded_context_size:
+                    pad = self.tokenizer.generate_dummy_tokens(
+                        self.rounded_context_size - len(tokens), seed=prompt_seed
+                    )
+                    tokens = pad + tokens
+                self.prompts.append(tokens[:self.rounded_context_size])
+                self.eval_metadata[i] = {"type": "niah", "expected_passkey": passkey}
+            else:
+                tokens = self.tokenizer.generate_dummy_tokens(self.rounded_context_size, seed=prompt_seed, prompt_number=i)
+                self.prompts.append(tokens)
 
             if (i + 1) % 10 == 0:
                 logger.info(f"  Generated {i + 1}/{self.num_prompts} prompts")
@@ -997,6 +1203,21 @@ def parse_arguments() -> argparse.Namespace:
                        help="Brief output mode for agents - minimal, parseable output")
     parser.add_argument("--no-color", action="store_true",
                        help="Disable colored output (useful for light terminal backgrounds)")
+    parser.add_argument("--eval-mode", type=str, default="none",
+                       choices=["none", "niah"],
+                       help="Output correctness eval mode (default: none). "
+                            "'niah' = needle-in-a-haystack: a fraction of working-set prompts are replaced "
+                            "with English haystacks containing a random passkey; the tester checks whether "
+                            "the model retrieves the passkey from its output. Useful for detecting garbage "
+                            "output caused by KV cache corruption under high concurrency. "
+                            "Only applies at cache_hit_rate=100 (eval prompts at mixed cache rates "
+                            "would have their retrieval question stripped by the unique-suffix logic).")
+    parser.add_argument("--eval-fraction", type=float, default=0.1,
+                       help="Fraction of working-set prompts to replace with eval prompts when --eval-mode != none "
+                            "(default: 0.1). E.g., 0.1 with a 30-prompt working set yields 3 eval prompts.")
+    parser.add_argument("--eval-passkey-digits", type=int, default=7,
+                       help="Number of digits in the NIAH passkey (default: 7). Larger values reduce the chance "
+                            "of an incidental substring match in unrelated model output.")
 
     return parser.parse_args()
 
@@ -1051,6 +1272,16 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
     else:
         cache_hit_rates = sorted(args.cache_hit_rates)
 
+    # Validate eval flags
+    if args.eval_mode != "none":
+        if not (0.0 < args.eval_fraction <= 1.0):
+            raise ValueError(f"--eval-fraction must be in (0, 1] (got {args.eval_fraction})")
+        if args.eval_passkey_digits < 3 or args.eval_passkey_digits > 12:
+            raise ValueError(f"--eval-passkey-digits must be between 3 and 12 (got {args.eval_passkey_digits})")
+        if 100 not in cache_hit_rates:
+            logger.warning("--eval-mode is enabled but cache_hit_rates does not include 100. "
+                           "Eval prompts are only graded at cache_hit_rate=100; no eval will run.")
+
     # Ensure api_endpoint is a list (backwards compatibility if single endpoint passed)
     api_endpoints = args.api_endpoint if isinstance(args.api_endpoint, list) else [args.api_endpoint]
 
@@ -1088,7 +1319,10 @@ def create_test_config(args: argparse.Namespace) -> TestConfig:
         kv_cache_bytes=args.kv_cache_quantization,
         strict_time_window=args.strict_time_window,
         fixed_concurrency_levels=fixed_concurrency_levels,
-        endpoint_selection=args.endpoint_selection
+        endpoint_selection=args.endpoint_selection,
+        eval_mode=args.eval_mode,
+        eval_fraction=args.eval_fraction,
+        eval_passkey_digits=args.eval_passkey_digits,
     )
 
 
@@ -1230,15 +1464,19 @@ async def initialize_working_set(api_client: APIClient, working_set: WorkingSet,
 def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
                      cache_hit_rate: int, context_size: int, random_selection: bool,
                      request_seed: Optional[int] = None, question_index: int = 0,
-                     endpoint_request_counts: Optional[List[int]] = None) -> Tuple[str, int, int, Optional[int]]:
+                     endpoint_request_counts: Optional[List[int]] = None) -> Tuple[str, int, int, Optional[int], Optional[Dict[str, str]]]:
     """
     Construct a prompt with the specified cache hit rate
-    Returns: (prompt_text, cached_tokens, unique_tokens, session_id)
+    Returns: (prompt_text, cached_tokens, unique_tokens, session_id, eval_metadata)
 
     The session_id is the prompt index from the working set, used for endpoint pinning
     when multiple API endpoints are configured. Requests with the same session_id should
     go to the same endpoint to benefit from KV cache hits. For 0% cache rate, session_id
     is None since there's no cached prefix to pin to.
+
+    eval_metadata is non-None only when the selected working-set prompt is a NIAH eval
+    prompt AND cache_hit_rate == 100 (since mixed/zero cache rates replace the prompt's
+    retrieval question with dummy tokens, breaking the eval).
 
     Args:
         endpoint_request_counts: Optional list of current request counts per endpoint.
@@ -1255,6 +1493,7 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
     unique_tokens = context_size - cached_tokens
 
     session_id = None  # Will be set if we use a working set prompt
+    eval_metadata: Optional[Dict[str, str]] = None
 
     # Helper function to get prompt with appropriate selection method
     def get_prompt():
@@ -1270,6 +1509,7 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
     elif cache_hit_rate == 100:
         # 100% cache: use complete working set prompt (already rounded)
         tokens, session_id = get_prompt()
+        eval_metadata = working_set.get_eval_metadata(session_id)
     else:
         # Mixed: cache prefix + unique suffix
         base_prompt, session_id = get_prompt()
@@ -1280,24 +1520,30 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
     # Convert to text
     prompt_text = tokenizer.decode(tokens)
 
-    # Append a question from the bank to encourage long responses
-    # Rotate through questions using question_index
-    question = QUESTION_BANK[question_index % len(QUESTION_BANK)]
-    prompt_text = prompt_text + "\n\n" + question
+    # For eval prompts, the retrieval question is already embedded; do not append
+    # QUESTION_BANK or the model will respond to the wrong question.
+    if eval_metadata is None:
+        # Append a question from the bank to encourage long responses
+        # Rotate through questions using question_index
+        question = QUESTION_BANK[question_index % len(QUESTION_BANK)]
+        prompt_text = prompt_text + "\n\n" + question
 
-    return prompt_text, cached_tokens, unique_tokens, session_id
+    return prompt_text, cached_tokens, unique_tokens, session_id, eval_metadata
 
 
 async def run_single_request(api_client: APIClient, prompt: str, max_tokens: int,
                             cache_hit_rate: int, context_size: int, cached_tokens: int,
                             unique_tokens: int, concurrency_level: int,
                             request_id: str, phase_id: str, tokenizer=None, verbose: bool = False,
-                            session_id: Optional[int] = None) -> RequestMetrics:
+                            session_id: Optional[int] = None,
+                            eval_metadata: Optional[Dict[str, str]] = None) -> RequestMetrics:
     """Run a single request and return metrics with streaming token tracking
 
     Args:
         session_id: Optional session ID for endpoint pinning. When using multiple API endpoints,
                    requests with the same session_id will be routed to the same endpoint.
+        eval_metadata: If non-None, this is an eval prompt and the response is graded against
+                   the expected answer (e.g., expected_passkey for NIAH).
     """
     launch_time = time.time()
 
@@ -1333,6 +1579,24 @@ async def run_single_request(api_client: APIClient, prompt: str, max_tokens: int
             logger.debug(f"      [{request_id}] Output tokens: {completion_tok}/{max_tokens} ({token_ratio:.1f}%) - "
                        f"TTFT: {ttft:.3f}s, TTLT: {ttlt:.3f}s, ITL: {itl*1000:.2f}ms, Chunks: {len(chunk_timestamps)}")
 
+        eval_type = None
+        eval_expected = None
+        eval_passed = None
+        eval_response_excerpt = None
+        if eval_metadata is not None:
+            eval_type = eval_metadata.get("type")
+            eval_expected = eval_metadata.get("expected_passkey")
+            if eval_type == "niah":
+                eval_passed = grade_niah_response(response_text or "", eval_expected or "")
+            else:
+                eval_passed = False
+            # Keep a short excerpt for post-hoc debugging when the eval fails.
+            if response_text:
+                eval_response_excerpt = response_text[:300]
+            if not eval_passed:
+                logger.warning(f"      [{request_id}] EVAL FAIL: expected '{eval_expected}' not found in response "
+                              f"(excerpt: {repr(eval_response_excerpt[:120]) if eval_response_excerpt else 'empty'})")
+
         return RequestMetrics(
             request_id=request_id,
             phase_id=phase_id,
@@ -1351,7 +1615,11 @@ async def run_single_request(api_client: APIClient, prompt: str, max_tokens: int
             itl=itl,
             prefill_complete_time=prefill_complete_time,
             token_timestamps=chunk_timestamps,
-            tokens_per_chunk=tokens_per_chunk
+            tokens_per_chunk=tokens_per_chunk,
+            eval_type=eval_type,
+            eval_expected=eval_expected,
+            eval_passed=eval_passed,
+            eval_response_excerpt=eval_response_excerpt,
         )
     except Exception as e:
         logger.error(f"Request {request_id} failed: {e}")
@@ -1389,7 +1657,7 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                 # Construct prompt with rotating question
                 # Pass endpoint counts for balanced random selection when using pinned endpoints
                 endpoint_counts_for_selection = endpoint_active_counts if config.endpoint_selection == "pinned" else None
-                prompt, cached_tok, unique_tok, session_id = construct_prompt(
+                prompt, cached_tok, unique_tok, session_id, eval_metadata = construct_prompt(
                     working_set, tokenizer, cache_hit_rate, context_size,
                     config.random_selection, request_seed, question_index=request_counter,
                     endpoint_request_counts=endpoint_counts_for_selection
@@ -1410,7 +1678,8 @@ async def run_concurrency_level(api_client: APIClient, working_set: WorkingSet,
                     run_single_request(
                         api_client, prompt, config.output_tokens, cache_hit_rate,
                         context_size, cached_tok, unique_tok, concurrency, request_id, phase_id,
-                        tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id
+                        tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id,
+                        eval_metadata=eval_metadata,
                     )
                 )
                 active_tasks.append(task)
@@ -1760,7 +2029,7 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
 
                     # Construct prompt with endpoint counts for balanced random selection
                     endpoint_counts_for_selection = endpoint_active_counts if config.endpoint_selection == "pinned" else None
-                    prompt, cached_tok, unique_tok, session_id = construct_prompt(
+                    prompt, cached_tok, unique_tok, session_id, eval_metadata = construct_prompt(
                         working_set, tokenizer, cache_hit_rate, context_size,
                         config.random_selection, request_seed, question_index=request_counter,
                         endpoint_request_counts=endpoint_counts_for_selection
@@ -1783,7 +2052,8 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                         run_single_request(
                             api_client, prompt, config.output_tokens, cache_hit_rate,
                             context_size, cached_tok, unique_tok, current_concurrency, request_id, phase_id,
-                            tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id
+                            tokenizer=tokenizer, verbose=config.verbose, session_id=effective_session_id,
+                            eval_metadata=eval_metadata,
                         )
                     )
                     active_tasks.append(task)
@@ -2083,11 +2353,24 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
                     if headroom_details:
                         logger.info(f"      Headroom: {' | '.join(headroom_details)} | Using minimum: {min_headroom:.1%}")
 
+        # Aggregate eval stats over requests that completed in this period.
+        # We attribute an eval result to the period in which its request finished.
+        period_eval_requests = [
+            r for r in all_requests[requests_before_period:]
+            if r.eval_passed is not None
+        ]
+        eval_total = len(period_eval_requests)
+        eval_passed_count = sum(1 for r in period_eval_requests if r.eval_passed)
+        eval_accuracy = (eval_passed_count / eval_total) if eval_total > 0 else None
+
         # Print period summary (streaming-based counts)
         logger.info(f"{Colors.METRIC}    Prefills: {len(prefill_requests)}, Contributing: {num_contributing}, Launched: {num_launched}{Colors.ENDC}")
         logger.info(f"{Colors.METRIC}    Input: {input_tps:,.0f} tok/s | Output: {output_tps:,.0f} tok/s (streaming-based){Colors.ENDC}")
         logger.info(f"{Colors.METRIC}    Avg TTFT: {avg_ttft:.3f}s | P95 TTFT: {p95_ttft:.3f}s | P99 TTFT: {p99_ttft:.3f}s{Colors.ENDC}")
         logger.info(f"{Colors.METRIC}    Avg ITL: {avg_itl*1000:.2f}ms | {tokens_metric_name}: {measured_tokens_per_req:.1f} tok/s{Colors.ENDC}")
+        if eval_total > 0:
+            eval_color = Colors.METRIC if eval_accuracy == 1.0 else Colors.WARNING
+            logger.info(f"{eval_color}    Eval: {eval_passed_count}/{eval_total} passed ({eval_accuracy*100:.1f}%){Colors.ENDC}")
 
         # Create period record
         period_record = AssessmentPeriodMetrics(
@@ -2119,7 +2402,10 @@ async def run_continuous_mode(config: TestConfig, api_client: APIClient,
             avg_output_tokens_per_request=avg_output_per_request,
             measured_ttft=measured_ttft,
             decision=decision,
-            next_concurrency=next_concurrency
+            next_concurrency=next_concurrency,
+            eval_total=eval_total,
+            eval_passed=eval_passed_count,
+            eval_accuracy=eval_accuracy,
         )
 
         all_periods.append(period_record)
@@ -4292,7 +4578,12 @@ async def main():
         logger.info(f"  Found {len(remaining_tests)} remaining tests: {remaining_tests}")
 
         # Initialize working set for this context size
-        working_set = WorkingSet(context_size, config.working_set_size, tokenizer, config.chunk_size, config.seed)
+        working_set = WorkingSet(
+            context_size, config.working_set_size, tokenizer, config.chunk_size, config.seed,
+            eval_mode=config.eval_mode,
+            eval_fraction=config.eval_fraction,
+            eval_passkey_digits=config.eval_passkey_digits,
+        )
         working_set.generate_prompts()
 
         # Initialize working set with API (pre-warm cache)

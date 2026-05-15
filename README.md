@@ -26,6 +26,20 @@ uv run python cache_rate_tester.py \
     --max-ttft 2.0 \
     --output-dir output
 
+# Same run, but also verify output correctness via in-band needle-in-a-haystack
+# probes — catches garbage/incorrect output caused by KV cache corruption under
+# high concurrency. See "Output Correctness Eval (NIAH)" below.
+uv run python cache_rate_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --context-sizes 32000 \
+    --working-set-size 2000000 \
+    --cache-hit-rates 100 \
+    --max-ttft 2.0 \
+    --eval-mode niah \
+    --eval-fraction 0.1 \
+    --eval-passkey-digits 7 \
+    --output-dir output
+
 # Test performance across different memory tiers
 uv run python working_set_tester.py \
     --api-endpoint http://localhost:8000 \
@@ -124,6 +138,43 @@ uv run python single_prompt_tester.py --help
 - **TTLT (Time To Last Token):** Total request completion time
 - **ITL (Inter-Token Latency):** Time between generated tokens
 - **Input/Output Throughput:** Tokens processed/generated per second
+- **Eval Accuracy (only with `--eval-mode niah`):** Fraction of in-band NIAH probes whose embedded passkey was retrieved correctly by the model. A value below 100% indicates wrong or garbage output — typically a sign of KV cache corruption under load. Reported per assessment period; below 100% the line is colored as a warning.
+
+## Output Correctness Eval (NIAH)
+
+`cache_rate_tester.py` supports an optional in-band correctness eval based on
+the [needle-in-a-haystack](https://github.com/gkamradt/LLMTest_NeedleInAHaystack)
+pattern. It is intended for catching KV cache corruption or other bugs that
+produce wrong or garbage output under high concurrency — failures that are
+otherwise invisible in pure throughput/latency metrics.
+
+When enabled with `--eval-mode niah`:
+
+- A configurable fraction (default 10%) of the working-set prompts are
+  replaced with NIAH probes: an English haystack of the same context length,
+  with a random N-digit passkey embedded at a random position inside the
+  haystack, followed by a retrieval question.
+- Eval probes are interleaved with the regular synthetic prompts in the test
+  load, so they exercise the same cache behavior and the same concurrency —
+  they are real requests, not a separate phase.
+- Each response is graded by substring match against the expected passkey.
+  With greedy decoding and a healthy cache, a modern model trivially retrieves
+  the passkey, so any drop below 100% is a strong signal that something is
+  wrong with the inference path.
+- Per-period eval accuracy is logged during the run; per-request results
+  (`eval_expected`, `eval_passed`, `eval_response_excerpt`) land in the
+  detailed CSV for post-hoc inspection of any failures.
+
+Eval grading only activates at `cache_hit_rate=100`. At mixed cache rates the
+tester replaces the prompt's trailing tokens with random gibberish to drive the
+desired cache-miss fraction, which would clobber the retrieval question and
+break the eval; the gate is enforced automatically.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--eval-mode {none,niah}` | `none` | Set to `niah` to enable. `none` (default) preserves the pre-existing tester behavior. |
+| `--eval-fraction FLOAT` | `0.1` | Fraction of the working set replaced with eval probes (e.g., `0.1` with 30 prompts → 3 probes). |
+| `--eval-passkey-digits INT` | `7` | Digits in each random passkey. Higher reduces the chance of an incidental substring match in unrelated output. Must be in `[3, 12]`. |
 
 ## Testing Methodology
 
