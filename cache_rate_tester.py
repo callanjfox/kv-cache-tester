@@ -448,7 +448,7 @@ class TestConfig:
     eval_mode: str = "none"  # "none" or "niah" - output correctness eval
     eval_fraction: float = 0.1  # Fraction of working set to be eval prompts when eval_mode != none
     eval_passkey_digits: int = 7  # Digits in NIAH passkey
-    eval_output_tokens: int = 512  # Output token budget for eval prompts (thinking models need more)
+    eval_output_tokens: int = 1024  # Output token budget for eval prompts (thinking models need more)
 
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -1142,7 +1142,7 @@ def parse_arguments() -> argparse.Namespace:
                             "Only used when --mode=fixed")
     parser.add_argument("--output-tokens", type=int, default=256,
                        help="Output tokens per request (default: 256)")
-    parser.add_argument("--eval-output-tokens", type=int, default=512,
+    parser.add_argument("--eval-output-tokens", type=int, default=1024,
                        help="Output tokens for NIAH eval prompts (default: 512). Thinking models like Qwen3 "
                             "consume most of a 200-token budget in <think> reasoning before writing the "
                             "answer, so eval prompts need a higher budget than regular requests. "
