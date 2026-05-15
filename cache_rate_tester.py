@@ -4813,7 +4813,12 @@ async def main():
                     p99_itl=df_periods['p99_itl'].mean(),
                     peak_concurrency=int(df_periods['concurrency_level'].max()),
                     total_requests=int(df_periods['num_requests_completed'].sum()),
-                    test_duration=df_periods['duration'].sum()
+                    test_duration=df_periods['duration'].sum(),
+                    eval_total=int(df_periods['eval_total'].sum()) if 'eval_total' in df_periods.columns else 0,
+                    eval_passed=int(df_periods['eval_passed'].sum()) if 'eval_passed' in df_periods.columns else 0,
+                    eval_accuracy=(df_periods['eval_passed'].sum() / df_periods['eval_total'].sum()
+                                   if 'eval_total' in df_periods.columns and df_periods['eval_total'].sum() > 0
+                                   else None),
                 )
                 continuous_aggregated_results.append(aggregated)
 
