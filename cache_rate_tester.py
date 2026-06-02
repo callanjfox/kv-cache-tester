@@ -502,12 +502,24 @@ class ProgressTracker:
             json.dump(self.state, f, indent=2)
 
 
+# Unique-token pool configuration (see construct_prompt / ensure_unique_pool).
+# The pool is generated once at warmup; per-request prompts slice a window from it
+# instead of regenerating tokens (which costs ~0.75-1.5s per 100k request).
+UNIQUE_POOL_MULTIPLE = 4        # pool size = max(context_size) * this
+UNIQUE_POOL_FLOOR = 500_000     # but never smaller than this
+UNIQUE_POOL_SEED_OFFSET = 7919  # offset from config.seed so pool != working-set content
+
+
 class TokenizerManager:
     """Manages tokenizer loading and caching"""
 
     def __init__(self, tokenizer_id: str):
         self.tokenizer_id = tokenizer_id
         self.tokenizer = None
+        # Pre-generated pool of diverse "unique" tokens, sliced per-request by
+        # get_unique_tokens(). Built lazily/once via ensure_unique_pool().
+        self._unique_pool_tokens: Optional[List[int]] = None
+        self._unique_pool_size = 0
         self._load_tokenizer()
 
     def _load_tokenizer(self):
@@ -606,6 +618,49 @@ class TokenizerManager:
             text = f"# PROMPT_{prompt_number}\n" + text
 
         tokens = self.encode(text)
+        return tokens[:num_tokens]
+
+    def ensure_unique_pool(self, min_size: int, seed: Optional[int] = None):
+        """Pre-generate (once) a large pool of diverse tokens to slice unique
+        request content from. Reused across context sizes and cache hit rates;
+        only regenerated if a larger pool is later required.
+        """
+        if self._unique_pool_tokens is not None and self._unique_pool_size >= min_size:
+            return
+
+        logger.info(f"Pre-generating unique-token pool ({min_size:,} tokens)...")
+        t0 = time.time()
+        # Reuse the diverse MoE-friendly generator; offset the seed so pool content
+        # never coincides with the working-set (cached) prompts.
+        pool_seed = (seed + UNIQUE_POOL_SEED_OFFSET) % (2**32) if seed is not None else None
+        self._unique_pool_tokens = self.generate_dummy_tokens(min_size, seed=pool_seed)
+        self._unique_pool_size = len(self._unique_pool_tokens)
+        logger.info(f"Unique-token pool ready: {self._unique_pool_size:,} tokens "
+                    f"in {time.time() - t0:.1f}s")
+
+    def get_unique_tokens(self, num_tokens: int, seed: Optional[int] = None) -> List[int]:
+        """Return `num_tokens` tokens whose leading chunk is unique to `seed`.
+
+        Slices a window from the pre-generated pool at a deterministic, seed-derived
+        offset and prepends a tiny seed-unique marker. The unique leading chunk
+        guarantees a prefix-cache MISS regardless of how pool windows overlap, so
+        cache-hit-rate semantics are preserved (no accidental cross-request hits).
+        """
+        pool = self._unique_pool_tokens
+        # Safety net: pool missing or too small for this window -> generate directly.
+        if pool is None or num_tokens >= self._unique_pool_size:
+            return self.generate_dummy_tokens(num_tokens, seed=seed)
+
+        # Deterministic offset via a LOCAL RNG (don't disturb global numpy state).
+        max_offset = self._unique_pool_size - num_tokens
+        if seed is not None:
+            offset = int(np.random.RandomState(seed % (2**32)).randint(0, max_offset + 1))
+            marker = self.encode(f"REQ{seed} ")
+        else:
+            offset = int(np.random.randint(0, max_offset + 1))
+            marker = self.encode(f"REQ{offset} ")
+
+        tokens = marker + pool[offset:offset + num_tokens]
         return tokens[:num_tokens]
 
 
@@ -1265,16 +1320,20 @@ def construct_prompt(working_set: WorkingSet, tokenizer: TokenizerManager,
             return working_set.get_next_prompt(random_selection)
 
     if cache_hit_rate == 0:
-        # 0% cache: all unique tokens, no session pinning needed
-        tokens = tokenizer.generate_dummy_tokens(context_size, seed=request_seed)
+        # 0% cache: all unique tokens, no session pinning needed.
+        # Slice from the pre-generated pool (with a seed-unique leading chunk) instead
+        # of regenerating per request; the unique prefix guarantees a cache miss.
+        tokens = tokenizer.get_unique_tokens(context_size, seed=request_seed)
     elif cache_hit_rate == 100:
         # 100% cache: use complete working set prompt (already rounded)
         tokens, session_id = get_prompt()
     else:
-        # Mixed: cache prefix + unique suffix
+        # Mixed: cache prefix + unique suffix. The suffix's seed-unique leading chunk
+        # forces divergence right at the cached boundary, so the cached region is
+        # exactly `cached_tokens` (no accidental full-prompt cache hits).
         base_prompt, session_id = get_prompt()
         cached_prefix = base_prompt[:cached_tokens]
-        unique_suffix = tokenizer.generate_dummy_tokens(unique_tokens, seed=request_seed)
+        unique_suffix = tokenizer.get_unique_tokens(unique_tokens, seed=request_seed)
         tokens = cached_prefix + unique_suffix
 
     # Convert to text
@@ -4271,6 +4330,13 @@ async def main():
             logger.info(f"Keeping {len(all_aggregated_results)} completed results")
         else:
             logger.info(f"All {len(all_aggregated_results)} loaded results are marked as completed")
+
+    # Pre-generate the unique-token pool once, sized for the largest context so it
+    # serves every context size in the sweep. Per-request prompts slice from this pool
+    # instead of regenerating tokens (which cost ~0.75-1.5s per 100k request). Paid here,
+    # before any timed phase, so it never contaminates measurements.
+    pool_size = max(max(config.context_sizes) * UNIQUE_POOL_MULTIPLE, UNIQUE_POOL_FLOOR)
+    tokenizer.ensure_unique_pool(pool_size, seed=config.seed)
 
     # Main test loop - iterate through context sizes
     all_detailed_results = []
