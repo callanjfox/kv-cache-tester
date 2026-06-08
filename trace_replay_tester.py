@@ -14,6 +14,7 @@ __date__ = "2025-01-21"
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,17 @@ except ImportError as e:
     print(f"Missing required dependency: {e}")
     print("Please install: pip install openai transformers plotly pandas numpy")
     sys.exit(1)
+
+
+def stable_seed(key: str) -> int:
+    """Derive a deterministic 32-bit seed from a string key.
+
+    Uses hashlib instead of Python's built-in ``hash()`` because the latter is
+    randomized per process (via ``PYTHONHASHSEED``). Relying on ``hash()`` would
+    make synthetic content non-reproducible across runs even when ``--seed`` is
+    set, so all content seeds are derived through this helper instead.
+    """
+    return int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
 
 
 # =============================================================================
@@ -1053,7 +1065,7 @@ class SyntheticMessageGenerator:
             return ""
 
         # Use fixed seed for reproducibility (no user_id salt)
-        seed = hash("canonical_warm_prefix_v1") % (2**32)
+        seed = stable_seed("canonical_warm_prefix_v1")
         self._canonical_prefix_content = self.generate_user_text(num_tokens, seed)
         self._canonical_prefix_tokens = num_tokens
         logger.info(f"{Colors.OKCYAN}Generated canonical warm prefix: {num_tokens:,} tokens{Colors.ENDC}")
@@ -1366,7 +1378,7 @@ class UserSession:
 
             if remaining_tokens > 0:
                 # Generate user-specific content for the remainder
-                seed = hash(f"{self.user_id}_{self.current_idx}_remainder_{remaining_tokens}") % (2**32)
+                seed = stable_seed(f"{self.user_id}_{self.current_idx}_remainder_{remaining_tokens}")
                 msg_type = self._get_user_message_type(request)
                 user_content = self.generator.generate_user_text(remaining_tokens, seed)
 
@@ -1418,7 +1430,7 @@ class UserSession:
             # Now treat the new blocks like normal growth
             tokens_to_generate = max(0, current_input_tokens - kept_tokens)
             if tokens_to_generate > 0:
-                seed = hash(f"{self.user_id}_{self.current_idx}_pullback_{tokens_to_generate}") % (2**32)
+                seed = stable_seed(f"{self.user_id}_{self.current_idx}_pullback_{tokens_to_generate}")
                 msg_type = self._get_user_message_type(request)
                 new_user_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
                 self.conversation.append(new_user_msg)
@@ -1437,7 +1449,7 @@ class UserSession:
             self.stored_response_tokens = 0  # Reset after using
 
             if tokens_to_generate > 0:
-                seed = hash(f"{self.user_id}_{self.current_idx}_{tokens_to_generate}") % (2**32)
+                seed = stable_seed(f"{self.user_id}_{self.current_idx}_{tokens_to_generate}")
                 msg_type = self._get_user_message_type(request)
                 new_user_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
                 self.conversation.append(new_user_msg)
@@ -1449,7 +1461,7 @@ class UserSession:
         # Safety: ensure conversation is never empty
         if not self.conversation:
             logger.warning(f"{self.user_id} req {self.current_idx}: Empty conversation after build, generating minimal message")
-            seed = hash(f"{self.user_id}_{self.current_idx}_fallback") % (2**32)
+            seed = stable_seed(f"{self.user_id}_{self.current_idx}_fallback")
             self.conversation.append(self.generator.build_user_message(max(100, current_input_tokens), 'text', seed))
 
         return list(self.conversation), max_tokens
@@ -1471,7 +1483,7 @@ class UserSession:
         if self.current_idx == 0:
             # First request: regenerate entirely
             self.conversation.clear()
-            seed = hash(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{current_input_tokens}") % (2**32)
+            seed = stable_seed(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{current_input_tokens}")
             new_msg = self.generator.build_user_message(current_input_tokens, msg_type, seed)
             self.conversation.append(new_msg)
             logger.warning(f"  🔄 {self.user_id} req {self.current_idx}: Regenerating first message (retry {retry_num}, seed={seed})")
@@ -1481,7 +1493,7 @@ class UserSession:
                 self.conversation.pop()
             token_delta = current_input_tokens - self.prev_input_tokens
             tokens_to_generate = max(100, token_delta)  # At least 100 tokens
-            seed = hash(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{tokens_to_generate}") % (2**32)
+            seed = stable_seed(f"{self.user_id}_{self.current_idx}_retry{retry_num}_{tokens_to_generate}")
             new_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
             self.conversation.append(new_msg)
             logger.warning(f"  🔄 {self.user_id} req {self.current_idx}: Regenerating last user message (retry {retry_num}, seed={seed}, {tokens_to_generate} tokens)")
@@ -1906,10 +1918,9 @@ class TestOrchestrator:
             # across runs regardless of call-order timing. Derived from
             # trace_selection_seed so --seed alone controls reproducibility.
             # Note: Python's built-in hash() is randomized per-process, so we
-            # use hashlib for a stable per-user seed.
-            import hashlib
+            # use stable_seed() (hashlib-based) for a stable per-user seed.
             seed_base = self.config.trace_selection_seed if self.config.trace_selection_seed is not None else 0
-            user_hash = int(hashlib.sha256(user_id.encode()).hexdigest()[:8], 16)
+            user_hash = stable_seed(user_id)
             advance_rng = random.Random(seed_base ^ user_hash)
             start_idx = calculate_start_index(
                 trace['requests'], advance_rng,
@@ -1918,7 +1929,7 @@ class TestOrchestrator:
             start_idx = skip_subagent_markers(trace['requests'], start_idx)
 
             if start_idx > 0 and start_idx < len(trace['requests']):
-                seed = hash(f"{user_id}_advanced_{start_idx}") % (2**32)
+                seed = stable_seed(f"{user_id}_advanced_{start_idx}")
                 user.reconstruct_state_at_index(start_idx, seed)
                 advancement_pct = (start_idx / len(trace['requests'])) * 100
 
