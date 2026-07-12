@@ -56,7 +56,7 @@ uv run python trace_replay_tester.py \
 
 ### Included Traces
 
-The `traces/` directory contains **739 traces** with **59,204 requests**, including 19 traces with nested sub-agent conversations (70 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/resources/solution-brief/weka-augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
+The `traces/` directory contains **739 traces** with **59,204 requests**, including 19 traces with nested sub-agent conversations (70 sub-agents total). Generated from real Claude Code sessions captured via [claude-code-proxy](https://github.com/seifghazi/claude-code-proxy) as part of research at [WEKA](https://www.weka.io/) on the [Augmented Memory Grid](https://www.weka.io/product/augmented-memory-grid/) product. See [agentic-coding-analysis](https://github.com/callanjfox/agentic-coding-analysis) for the trace generation tools.
 
 Traces include:
 - **Local hash_ids** (`hash_id_scope: "local"`) — hash IDs are scoped per conversation, with sub-agents sharing the parent's namespace
