@@ -313,6 +313,9 @@ class TestConfig:
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
     advance_all_users: bool = False  # If True, advance all users; if False, only initial users
+    # Circuit breaker: abort the run only when the server is genuinely down
+    max_consecutive_errors: int = 10  # Consecutive connection errors before aborting (0 = disabled)
+    circuit_breaker_window: float = 30.0  # Only trip if no successful request completes within this many seconds
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1756,7 +1759,17 @@ class APIClient:
 
         except Exception as e:
             error_str = str(e).lower()
-            if "connection" in error_str or "connect" in error_str or "refused" in error_str:
+            is_connection = "connection" in error_str or "connect" in error_str or "refused" in error_str
+            if is_connection and first_token_time is not None:
+                # Stream died mid-response after the first token was received.
+                # This is a transient drop (e.g. a backend worker was killed) and
+                # the surviving capacity is likely still healthy, so it is treated
+                # as a soft/retryable error that does NOT feed the circuit breaker.
+                error_type = "stream_disconnect"
+                logger.warning(f"Stream disconnected mid-response: {e}")
+            elif is_connection:
+                # Failed before the first token (e.g. connection refused) — the
+                # endpoint is unreachable, a genuine signal for the circuit breaker.
                 error_type = "connection"
                 logger.error(f"Connection error: {e}")
             else:
@@ -1853,7 +1866,9 @@ class TestOrchestrator:
         # Error tracking
         self.consecutive_connection_errors: int = 0
         self.total_connection_errors: int = 0
-        self.max_consecutive_errors: int = 10  # Fail test after this many consecutive errors
+        self.max_consecutive_errors: int = config.max_consecutive_errors  # Consecutive errors before aborting (0 = disabled)
+        self.circuit_breaker_window: float = config.circuit_breaker_window  # Only trip if no success within this window
+        self.last_success_time: float = time.time()  # Timestamp of last successful request
 
         # Warm prefix for cross-conversation cache sharing
         self.canonical_prefix_content: str = ""
@@ -2616,16 +2631,31 @@ class TestOrchestrator:
         if error_type == "connection":
             self.consecutive_connection_errors += 1
             self.total_connection_errors += 1
-            if self.consecutive_connection_errors >= self.max_consecutive_errors:
+            # Circuit breaker: trip only if enabled, the threshold is exceeded,
+            # AND no successful request has completed within the rolling window.
+            # A simultaneous burst of mid-stream drops (e.g. one backend worker
+            # killed) cannot abort the run while surviving capacity keeps
+            # completing requests.
+            time_since_success = time.time() - self.last_success_time
+            if (self.max_consecutive_errors > 0 and
+                    self.consecutive_connection_errors >= self.max_consecutive_errors and
+                    time_since_success >= self.circuit_breaker_window):
                 logger.error(
-                    f"{Colors.FAIL}FATAL: {self.consecutive_connection_errors} consecutive connection errors. "
+                    f"{Colors.FAIL}FATAL: {self.consecutive_connection_errors} consecutive connection errors "
+                    f"and no successful request in {time_since_success:.0f}s. "
                     f"Server appears to be down. Stopping test.{Colors.ENDC}"
                 )
                 self.running = False
                 return None
+        elif error_type == "stream_disconnect":
+            # Mid-stream disconnect after the first token: transient and expected
+            # when a backend worker is killed. Counted for reporting, but it does
+            # NOT feed the circuit breaker and does not reset the counter.
+            self.total_connection_errors += 1
         elif error_type is None:
             # Successful request resets consecutive error counter
             self.consecutive_connection_errors = 0
+            self.last_success_time = time.time()
             logger.debug(f"  📥 {user.user_id} req {user.current_idx + 1}: complete (TTFT: {ttft:.2f}s, {actual_output} output tokens, {ttlt:.2f}s total)")
 
         # Store actual assistant response for use in subsequent requests' history
@@ -3557,6 +3587,16 @@ def parse_arguments():
     parser.add_argument("--advance-all-users", action="store_true", default=False,
                         help="Advance all users (including ramp-up). Default: only initial users are advanced")
 
+    # Circuit breaker
+    parser.add_argument("--max-consecutive-errors", type=int, default=10,
+                        help="Consecutive connection errors before aborting the run. "
+                             "Set to 0 to disable, or a high value (e.g. 1000) for chaos/"
+                             "resilience tests where killing a worker is expected. Default: 10")
+    parser.add_argument("--circuit-breaker-window", type=float, default=30.0,
+                        help="Circuit breaker only trips if no successful request completes "
+                             "within this many seconds, so a burst of simultaneous mid-stream "
+                             "drops can't abort a run while surviving capacity is healthy. Default: 30")
+
     return parser.parse_args()
 
 
@@ -3621,6 +3661,8 @@ async def main():
         slo_decode_tps=args.slo_decode_tps,
         fairness_window=args.fairness_window,
         cache_max_age=args.cache_max_age,
+        max_consecutive_errors=args.max_consecutive_errors,
+        circuit_breaker_window=args.circuit_breaker_window,
     )
 
     # Print header
