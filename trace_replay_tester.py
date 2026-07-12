@@ -1651,7 +1651,8 @@ class APIClient:
     async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
                            on_first_token: Optional[callable] = None,
                            on_chunk: Optional[callable] = None,
-                           tokenizer=None) -> dict:
+                           tokenizer=None,
+                           session_id: Optional[str] = None) -> dict:
         """
         Send request and return metrics.
 
@@ -1660,6 +1661,9 @@ class APIClient:
             max_tokens: Maximum tokens to generate
             stream: Whether to use streaming (default True)
             on_first_token: Optional callback invoked when first token arrives (prefill complete)
+            session_id: Optional session identifier sent as the X-Session-ID header. Enables
+                the vLLM Router's consistent_hash policy to pin all requests of a session to
+                the same worker, maximizing KV-cache reuse.
 
         Returns dict with: response_text, ttft, ttlt, actual_output_tokens, error_type,
                           start_time, first_token_time, complete_time (absolute timestamps),
@@ -1674,6 +1678,8 @@ class APIClient:
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
+            if session_id is not None:
+                params["extra_headers"] = {"X-Session-ID": session_id}
 
             if stream:
                 response = await self.client.chat.completions.create(**params)
@@ -2561,7 +2567,8 @@ class TestOrchestrator:
                 stream=stream,
                 on_first_token=on_first_token,
                 on_chunk=on_chunk,
-                tokenizer=self.generator.tokenizer
+                tokenizer=self.generator.tokenizer,
+                session_id=user.trace_id
             )
 
             # Decrement decode counter if first token was received
